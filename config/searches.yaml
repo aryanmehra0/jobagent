@@ -1,0 +1,20 @@
+target_domains:
+- Senior Distributed Systems Engineer
+- Cloud Infrastructure Engineer
+desired_experience_years: 4.0
+locations:
+- Remote
+- San Francisco
+- CA
+is_remote: true
+hours_old: 48
+job_boards:
+- linkedin
+- indeed
+- glassdoor
+- zip_recruiter
+country_indeed: usa
+min_salary: 175000
+max_results_per_board: 25
+ats_companies: {}
+proxy_url: null

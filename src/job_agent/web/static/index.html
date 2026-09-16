@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Job Agent Flow Console</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔎</text></svg>">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="app" id="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">🔎</div>
+      <div class="brand-text">
+        <strong>Job Agent</strong>
+        <span>Flow Console</span>
+      </div>
+    </div>
+
+    <span class="pill" id="pill-provider"><span class="dot"></span><span>LLM: checking…</span></span>
+    <span class="pill" id="pill-profile"><span class="dot"></span><span>Profile: checking…</span></span>
+
+    <div class="topbar-spacer"></div>
+
+    <label class="toggle" id="dry-toggle">
+      <input type="checkbox" id="dry-run" checked>
+      <span id="dry-label">Dry run (nothing is submitted)</span>
+    </label>
+
+    <button class="btn btn-icon" id="theme-btn" title="Toggle light / dark">🌗</button>
+    <button class="btn btn-danger" id="cancel-btn" disabled>Stop</button>
+    <button class="btn btn-primary" id="run-btn">▶ Run all phases</button>
+  </header>
+
+  <div class="banner" id="sample-banner" hidden>
+    <span class="banner-icon">⚠</span>
+    <span class="grow" id="sample-banner-text"></span>
+    <button class="btn btn-sm" id="banner-setup">Use my resume</button>
+    <button class="btn btn-sm btn-ghost" id="banner-dismiss" title="Hide until next reload">Dismiss</button>
+  </div>
+
+  <div class="body">
+    <main class="canvas">
+      <div class="flow" id="flow">
+        <svg class="flow-edges" id="edges" aria-hidden="true"></svg>
+        <!-- Nodes are injected here by app.js -->
+      </div>
+    </main>
+
+    <aside class="inspector">
+      <div class="tabs" role="tablist">
+        <button class="tab is-active" data-tab="details" role="tab">Details</button>
+        <button class="tab" data-tab="log" role="tab">Live log</button>
+        <button class="tab" data-tab="settings" role="tab">Settings</button>
+      </div>
+
+      <section class="panel" id="panel-details" role="tabpanel">
+        <p class="log-empty">Select a node in the flow to inspect it.</p>
+      </section>
+
+      <div class="log" id="panel-log" role="tabpanel" hidden>
+        <span class="log-empty">No activity yet. Press “Run all phases” to start.</span>
+      </div>
+
+      <section class="panel" id="panel-settings" role="tabpanel" hidden></section>
+    </aside>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<div id="modal-root"></div>
+<div id="setup-root"></div>
+
+<script>window.SESSION_TOKEN = "__SESSION_TOKEN__";</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

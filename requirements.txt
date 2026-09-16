@@ -1,0 +1,50 @@
+# ==============================================================================
+# Autonomous AI Job Search & Application Agent - Dependencies
+#
+# Every phase degrades gracefully if its optional extras are missing; run
+# `python main.py doctor` to see what is installed and what each gap costs you.
+# ==============================================================================
+
+# --- Core & configuration ---
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+email-validator>=2.1.0          # Backs pydantic's EmailStr; contact email validation
+pyyaml>=6.0.1
+python-dotenv>=1.0.1
+rich>=13.7.1
+click>=8.1.7
+
+# --- Phase 1: candidate intake & parsing ---
+pypdf>=4.2.0
+pdfplumber>=0.11.0              # Preferred extractor; pypdf is the fallback
+python-docx>=1.1.0              # Reads .docx resumes, including table-based templates
+llama-parse>=0.4.0              # Optional cloud parser, used when LLAMA_CLOUD_API_KEY is set
+
+# --- LLM providers (optional; deterministic fallbacks run without them) ---
+openai>=1.30.0
+anthropic>=0.28.0
+
+# --- Phase 2: omnichannel sourcing ---
+python-jobspy>=1.1.50
+pandas>=2.0.0                   # JobSpy returns DataFrames; used directly by the normalizer
+requests>=2.31.0
+
+# --- Phase 3: semantic evaluation ---
+sentence-transformers>=2.7.0
+scikit-learn>=1.4.0             # TF-IDF fallback when transformers are unavailable
+numpy>=1.26.0
+
+# --- Phase 4: dynamic resume tailoring ---
+typst>=0.11.0
+
+# --- Phase 5: browser automation ---
+# After installing, fetch the browser binary: python -m playwright install chromium
+playwright>=1.44.0
+playwright-stealth>=2.0.0
+
+# --- Phase 6: fallback tracking & formatting ---
+openpyxl>=3.1.2
+
+# --- Testing ---
+pytest>=8.2.0
+reportlab>=4.1.0                # Generates the sample resume PDF used by the tests

@@ -1,0 +1,34 @@
+# Secrets and local configuration
+.env
+
+# Generated pipeline artifacts
+data/outputs/
+data/profiles/
+data/browser_profile/
+data/proxies.txt
+
+# Candidate documents (personal data; do not commit)
+data/raw_resumes/*.pdf
+!data/raw_resumes/sample_resume.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
