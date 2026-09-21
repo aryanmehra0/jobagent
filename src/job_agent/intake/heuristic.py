@@ -969,12 +969,12 @@ _VISA_RE = re.compile(r"\b(H-?1B|L-?1|F-?1|OPT|CPT|TN visa|EAD|Green Card|Blue C
 def _infer_work_authorization(resume_text: str, location: Optional[str]) -> Dict[str, Any]:
     """Read work authorization from explicit statements only.
 
-    When the resume says nothing, `requires_sponsorship` stays False (the common
-    default) but `citizenship` is left empty rather than asserting a nationality the
-    document never stated. Run `python main.py configure --work-auth` to correct it.
+    Missing sponsorship and authorization information stays unknown. Residence
+    is recorded separately and never used as proof of eligibility.
     """
     visa_match = _VISA_RE.search(resume_text)
-    requires_sponsorship = bool(_SPONSORSHIP_RE.search(resume_text)) and not _NO_SPONSORSHIP_RE.search(resume_text)
+    requires_sponsorship = (False if _NO_SPONSORSHIP_RE.search(resume_text)
+                            else True if _SPONSORSHIP_RE.search(resume_text) else None)
 
     country = None
     if location:
@@ -1000,7 +1000,7 @@ def _infer_work_authorization(resume_text: str, location: Optional[str]) -> Dict
     return {
         "citizenship": [],
         "current_country": country or "Unspecified",
-        "authorized_countries": [country] if country else [],
+        "authorized_countries": [],
         "requires_sponsorship": requires_sponsorship,
         "visa_status": clean_text(visa_match.group(0)) if visa_match else None,
     }

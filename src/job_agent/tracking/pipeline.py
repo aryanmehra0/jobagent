@@ -15,6 +15,7 @@ one thing a user sorts by — carried no real information.
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,6 +24,7 @@ from rich.table import Table
 
 from job_agent.config.schema import EvaluatedJob, JobPosting
 from job_agent.config.settings import settings
+from job_agent.runtime import check_cancelled, exclusive_run
 from job_agent.intake.validator import load_and_verify_profile
 from job_agent.sourcing.delta_store import DeltaStore
 from job_agent.tracking.cold_email import ColdEmailGenerator
@@ -44,6 +46,7 @@ class FallbackTrackingPipeline:
         self.tracker = tracker or MasterTracker()
         self.delta_store = delta_store or DeltaStore()
 
+    @exclusive_run
     def process_fallbacks(
         self,
         application_results_path: Optional[Path] = None,
@@ -64,13 +67,20 @@ class FallbackTrackingPipeline:
 
         profile, is_valid = load_and_verify_profile(profile_path or settings.profile_path)
         if not is_valid:
-            console.print(
-                "[bold red]Profile fact verification failed.[/bold red] "
-                "Outreach emails may cite unverified achievements; review them before sending."
-            )
+            raise ValueError("Profile integrity failed. Re-run intake before generating outreach.")
 
         evaluations = self._load_evaluations(qualified_file)
         entries = self._collect_entries(results_file, qualified_file, evaluations, force_track_all)
+        candidate_id = hashlib.sha256(str(profile.contact.email).lower().encode()).hexdigest()
+        applied_ids = {row["job_id"] for row in self.delta_store.application_history(candidate_id)
+                       if row["status"] == "applied"}
+        if force_track_all:
+            for entry in entries:
+                if entry["job"].id in applied_ids:
+                    entry["status"] = "APPLIED"
+                    entry["reason"] = "Confirmed application recorded in durable history"
+        else:
+            entries = [entry for entry in entries if entry["job"].id not in applied_ids]
 
         if not entries:
             console.print(
@@ -82,12 +92,91 @@ class FallbackTrackingPipeline:
         console.print(f"Logging [bold yellow]{len(entries)}[/bold yellow] job(s) to the master spreadsheet.\n")
 
         logged: List[Dict[str, Any]] = []
+        try:
+            self._log_entries(profile, entries, logged)
+        finally:
+            # Saved even when stopped part-way, so rows already logged are kept.
+            self.tracker.save()
+        self._render_summary(logged)
+        return logged
+
+    def _outreach(self, profile, job: JobPosting, score: float, pdf_path: Optional[str], drafts: dict) -> str:
+        """Draft (or recall) this role's cold email, honouring the no-repeat ledger."""
+        from job_agent.tracking import outreach
+
+        plan = outreach.plan_outreach(self.delta_store, job)
+        existing = drafts.get(job.id)
+
+        if plan.status in (outreach.DRAFTED_BEFORE, outreach.HOLD) and plan.previous:
+            subject = plan.previous.get("subject") or ""
+            body = plan.previous.get("body") or ""
+            if plan.status == outreach.HOLD:
+                subject, body = "", ""
+            console.print(f"  [yellow]Outreach: {plan.note}[/yellow]")
+        elif existing and existing.get("body") and (existing.get("to") or None) == plan.recipient:
+            subject, body = existing.get("subject", ""), existing["body"]
+        else:
+            console.print("  Drafting cold email...")
+            text = self.email_gen.generate_email(profile, job, fit_score=score)
+            subject, body = outreach.split_subject(text)
+
+        eml_path = None
+        if plan.status == outreach.READY and body:
+            self.delta_store.record_outreach(plan.recipient, job, subject, body)
+            attachment = Path(pdf_path) if pdf_path else None
+            eml_path = outreach.write_eml(
+                settings.outputs_dir / "outreach" / f"{job.id}.eml",
+                profile, plan.recipient, subject, body, attachment,
+            )
+            console.print(f"  [green]Draft ready for {plan.recipient}:[/green] {eml_path.name}")
+            # A later run finds the ledger entry and reports it as drafted.
+            plan.note = f"Ready to send (drafted {outreach.datetime.now(outreach.timezone.utc).date()})"
+        elif plan.status == outreach.DRAFTED_BEFORE and plan.previous and plan.previous.get("job_id") == job.id and body:
+            # Same draft, same recipient: no new email is created, but the file is
+            # refreshed so it attaches the latest tailored resume.
+            attachment = Path(pdf_path) if pdf_path else None
+            eml_path = outreach.write_eml(
+                settings.outputs_dir / "outreach" / f"{job.id}.eml",
+                profile, plan.recipient, subject, body, attachment,
+            )
+
+        drafts[job.id] = {
+            "to": plan.recipient or "",
+            "status": plan.status,
+            "note": plan.note,
+            "subject": subject,
+            "body": body,
+            "eml": str(eml_path) if eml_path else "",
+            "company": job.company,
+            "title": job.title,
+            "updated_at": outreach.datetime.now(outreach.timezone.utc).isoformat(),
+        }
+        return (f"Subject: {subject}\n\n{body}" if subject else body) or plan.note
+
+    def _log_entries(self, profile, entries, logged) -> None:
+        """Draft outreach and write one tracker row per entry."""
+        from job_agent.tracking import outreach
+
+        drafts = outreach.load_drafts()
+        try:
+            self._log_entries_with(profile, entries, logged, drafts)
+        finally:
+            outreach.save_drafts(drafts)
+
+    def _log_entries_with(self, profile, entries, logged, drafts) -> None:
         for index, entry in enumerate(entries, start=1):
+            check_cancelled()
             job: JobPosting = entry["job"]
             score: float = entry["score"]
 
-            console.print(f"[{index}/{len(entries)}] Drafting outreach for {job.title} @ {job.company}...")
-            cold_email = self.email_gen.generate_email(profile, job, fit_score=score)
+            console.print(f"[{index}/{len(entries)}] Outreach for {job.title} @ {job.company}...")
+            pdf_path = entry.get("pdf_path")
+            if not pdf_path or not Path(pdf_path).is_file():
+                # Outcomes routed to manual apply carry no path; the tailored
+                # resume is still on disk under its job ID.
+                candidate = settings.outputs_dir / "tailored_resumes" / f"resume_{job.id}.pdf"
+                pdf_path = str(candidate) if candidate.is_file() else None
+            cold_email = self._outreach(profile, job, score, pdf_path, drafts)
 
             row = self.tracker.log_application(
                 job=job,
@@ -95,11 +184,14 @@ class FallbackTrackingPipeline:
                 status=entry["status"],
                 cold_email=cold_email,
                 failure_reason=entry["reason"],
-                pdf_path=entry.get("pdf_path"),
+                pdf_path=pdf_path,
                 # Saved once at the end instead of once per row.
                 autosave=False,
             )
-            self.delta_store.update_status(job.id, "fallback_logged")
+            if entry["status"] == "APPLIED":
+                self.delta_store.update_status(job.id, "applied")
+            elif entry["status"] != "DRY RUN":
+                self.delta_store.update_status(job.id, "fallback_logged")
 
             logged.append({
                 "job_id": job.id,
@@ -110,10 +202,6 @@ class FallbackTrackingPipeline:
                 "row": row,
                 "email_snippet": cold_email[:120].replace("\n", " "),
             })
-
-        self.tracker.save()
-        self._render_summary(logged)
-        return logged
 
     # --- Entry collection -----------------------------------------------------
 
@@ -147,6 +235,7 @@ class FallbackTrackingPipeline:
         """Build the list of jobs to log, with their real scores attached."""
         entries: List[Dict[str, Any]] = []
         seen_ids: set = set()
+        submitted_ids: set = set()
 
         if results_file.exists():
             try:
@@ -154,6 +243,12 @@ class FallbackTrackingPipeline:
             except json.JSONDecodeError as exc:
                 console.print(f"[yellow]Could not read {results_file.name}: {exc}[/yellow]")
                 results = {}
+
+            submitted_ids = {
+                item.get("job_id") or item.get("id")
+                for item in results.get("successful", [])
+                if item.get("status") == "applied"
+            }
 
             for outcome in results.get("failed", []):
                 built = self._entry_from_outcome(
@@ -187,7 +282,7 @@ class FallbackTrackingPipeline:
             if not evaluations and not qualified_file.exists():
                 return entries
             for job_id, evaluated in evaluations.items():
-                if job_id in seen_ids:
+                if job_id in seen_ids or (not force_track_all and job_id in submitted_ids):
                     continue
                 entries.append({
                     "job": evaluated.job,

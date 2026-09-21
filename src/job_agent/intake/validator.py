@@ -315,8 +315,14 @@ def describe_profile_gaps(profile: CandidateProfile) -> List[str]:
         gaps.append("no skills were extracted (Tier 1 matching will be unreliable)")
     if not profile.all_locked_facts():
         gaps.append("no quantifiable achievements were found to lock")
-    if profile.work_authorization.current_country in ("", "Unspecified"):
+    if profile.work_authorization.current_country in (None, "", "Unspecified"):
         gaps.append("work_authorization.current_country is unknown (screening answers will be skipped)")
+    if not profile.work_authorization.authorized_countries:
+        gaps.append("work authorization is not stated (eligibility answers will be skipped)")
+    if profile.work_authorization.requires_sponsorship is None:
+        gaps.append("sponsorship requirement is unknown (screening answer will be skipped)")
     if profile.desired_salary is None:
         gaps.append("desired_salary is not set (compensation questions will be left blank)")
+    if gaps and any("work_authorization" in gap or "sponsorship" in gap or "salary" in gap for gap in gaps):
+        gaps.append("set these once under Settings > Candidate preferences, or: python main.py preferences --help")
     return gaps

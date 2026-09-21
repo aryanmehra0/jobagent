@@ -35,6 +35,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import parse_qs, unquote, urlparse
 
+from pydantic import SecretStr
+
+import job_agent.config.settings as settings_module
 from job_agent.config.settings import settings
 from job_agent.web.runner import PipelineRunner
 from job_agent.web.state import build_snapshot
@@ -166,9 +169,21 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         elif route.startswith("/static/"):
             self._serve_static(route[len("/static/"):])
         elif route == "/api/state":
-            self._json(HTTPStatus.OK, {"state": build_snapshot(), "running": self.server.runner.is_running})
+            from job_agent.runtime import pipeline_busy
+            self._json(HTTPStatus.OK, {"state": build_snapshot(), "running": self.server.runner.is_running or pipeline_busy()})
         elif route == "/api/events":
             self._serve_events()
+        elif route == "/api/jobs":
+            from job_agent.tracking.export import JobsCsvExporter, _read_json
+            from job_agent.web.state import run_report_state
+            self._json(HTTPStatus.OK, {"jobs": list(JobsCsvExporter().load().values()),
+                       "csv_path": str(settings.outputs_dir / "jobs_master.csv"),
+                       "latest_csv_path": str(settings.outputs_dir / "jobs_latest.csv"),
+                       "ready_csv_path": str(settings.outputs_dir / "applications_ready.csv"),
+                       "outreach_dir": str(settings.outputs_dir / "outreach"),
+                       "manually_applied": list(_read_json(settings.outputs_dir / "manual_applications.json", {})),
+                       "run_report": run_report_state(),
+                       "coverage": _read_json(settings.outputs_dir / "source_coverage.json", {})})
         elif route == "/api/file":
             self._serve_artifact(parse_qs(parsed.query).get("path", [""])[0])
         else:
@@ -195,8 +210,13 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
             "/api/resume/delete": self._delete_resume,
             "/api/resume/check": self._check_resume,
             "/api/config": self._save_config,
+            "/api/llm": self._save_llm,
+            "/api/preferences": self._save_preferences,
+            "/api/outputs/archive": self._archive_outputs,
             "/api/run": self._start_run,
             "/api/cancel": self._cancel_run,
+            "/api/export/bundle": self._export_bundle,
+            "/api/jobs/applied": self._mark_applied,
         }
         handler = handlers.get(route)
         if handler is None:
@@ -243,12 +263,46 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.FORBIDDEN, "That file is outside the agent's data directory.")
             return
         content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        if target.suffix.lower() == ".csv":
+            content_type = "text/csv; charset=utf-8"
+        # Spreadsheets are for opening in Excel, not rendering as text in a tab.
+        disposition = "attachment" if target.suffix.lower() in (".csv", ".xlsx", ".zip", ".eml") else "inline"
         self._send(
             HTTPStatus.OK,
             target.read_bytes(),
             content_type,
-            {"Content-Disposition": f'inline; filename="{target.name}"'},
+            {"Content-Disposition": f'{disposition}; filename="{target.name}"'},
         )
+
+    def _export_bundle(self, body: bytes) -> None:
+        from job_agent.tracking.bundle import build_application_pack
+        if self.server.runner.is_running:
+            self._error(HTTPStatus.CONFLICT, "Wait for the current run to finish before downloading a pack.")
+            return
+        try:
+            path = build_application_pack()
+        except RuntimeError as exc:
+            self._error(HTTPStatus.CONFLICT, str(exc))
+            return
+        self._json(HTTPStatus.OK, {"path": str(path)})
+
+    def _mark_applied(self, body: bytes) -> None:
+        if self.server.runner.is_running:
+            self._error(HTTPStatus.CONFLICT, "Wait for the run to finish before updating applications.")
+            return
+        from job_agent.tracking.manual import mark_applied
+        try:
+            payload = json.loads(body or b"{}")
+            if not isinstance(payload, dict) or not isinstance(payload.get("job_id"), str) or not isinstance(payload.get("undo", False), bool):
+                raise ValueError("Supply a job ID and an optional boolean undo flag.")
+            result = mark_applied(payload["job_id"], undo=payload.get("undo", False))
+        except ValueError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except RuntimeError as exc:
+            self._error(HTTPStatus.CONFLICT, str(exc))
+            return
+        self._json(HTTPStatus.OK, result)
 
     # --- Server-sent events ---------------------------------------------------
 
@@ -390,6 +444,60 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         save_search_parameters(params, settings.searches_path)
         self._json(HTTPStatus.OK, {"ok": True, "state": build_snapshot()})
 
+    def _save_llm(self, body: bytes) -> None:
+        """Persist local LLM provider settings to .env and update this process."""
+        try:
+            payload = json.loads(body or b"{}")
+        except json.JSONDecodeError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, f"Invalid JSON: {exc}")
+            return
+        if self.server.runner.is_running:
+            self._error(HTTPStatus.CONFLICT, "Wait for the current run to finish before changing LLM settings.")
+            return
+
+        try:
+            provider = _save_llm_settings(payload)
+        except Exception as exc:
+            self._error(HTTPStatus.BAD_REQUEST, _format_validation_error(exc))
+            return
+        self._json(HTTPStatus.OK, {"ok": True, "provider": provider, "state": build_snapshot()})
+
+    def _save_preferences(self, body: bytes) -> None:
+        """Store country, sponsorship and salary preferences and apply them to the profile."""
+        from job_agent.intake.preferences import save_preferences
+
+        try:
+            payload = json.loads(body or b"{}")
+        except json.JSONDecodeError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, f"Invalid JSON: {exc}")
+            return
+        if self.server.runner.is_running:
+            self._error(HTTPStatus.CONFLICT, "Wait for the current run to finish before changing preferences.")
+            return
+        if not settings.profile_path.is_file():
+            self._error(HTTPStatus.BAD_REQUEST, "Build your profile from a resume first.")
+            return
+        try:
+            save_preferences(payload)
+        except Exception as exc:
+            self._error(HTTPStatus.BAD_REQUEST, _format_validation_error(exc))
+            return
+        self._json(HTTPStatus.OK, {"ok": True, "state": build_snapshot()})
+
+    def _archive_outputs(self, body: bytes) -> None:
+        """Move the last run's results to history so the flow starts clean.
+
+        The seen-jobs store, outreach ledger, jobs CSV and tracker are kept:
+        they are what stops a new run repeating jobs or emails.
+        """
+        from job_agent.runtime import invalidate_after
+
+        if self.server.runner.is_running:
+            self._error(HTTPStatus.CONFLICT, "Stop the current run before starting fresh.")
+            return
+        invalidate_after("intake", settings.outputs_dir)
+        self._json(HTTPStatus.OK, {"ok": True, "state": build_snapshot()})
+
     def _start_run(self, body: bytes) -> None:
         """Begin a run of the requested phases."""
         try:
@@ -435,6 +543,130 @@ def _format_validation_error(exc: Exception) -> str:
         )
     except Exception:
         return str(exc)
+
+
+def _save_llm_settings(payload: Dict[str, Any]) -> str:
+    """Write LLM settings to .env.
+
+    Blank key fields mean "keep the existing secret" so a user can switch models
+    without retyping an API key.
+    """
+    provider = str(payload.get("provider") or "").strip().lower()
+    valid = {"openai", "anthropic", "groq", "openai_compatible", "none"}
+    if provider not in valid:
+        raise ValueError(f"Provider must be one of {', '.join(sorted(valid))}.")
+
+    def text(name: str) -> str:
+        return str(payload.get(name) or "").strip()
+
+    updates: Dict[str, str] = {"DEFAULT_LLM_PROVIDER": provider}
+    if payload.get("llm_strict") is not None:
+        updates["LLM_STRICT"] = "true" if bool(payload.get("llm_strict")) else "false"
+
+    if provider == "groq":
+        key = text("groq_api_keys")
+        if key:
+            updates["GROQ_API_KEYS"] = key
+        if text("groq_model"):
+            updates["GROQ_MODEL"] = text("groq_model")
+        if text("groq_fallback_model"):
+            updates["GROQ_FALLBACK_MODEL"] = text("groq_fallback_model")
+        if not key and not settings.groq_keys:
+            raise ValueError("Add at least one Groq key, or choose a deterministic fallback.")
+    elif provider == "openai":
+        key = text("openai_api_key")
+        if key:
+            updates["OPENAI_API_KEY"] = key
+        if text("openai_model"):
+            updates["LLM_INTAKE_MODEL"] = text("openai_model")
+            updates["LLM_RERANK_MODEL"] = text("openai_model")
+            updates["LLM_TAILOR_MODEL"] = text("openai_model")
+        if not key and not settings.openai_api_key:
+            raise ValueError("Add an OpenAI key, or choose a deterministic fallback.")
+    elif provider == "anthropic":
+        key = text("anthropic_api_key")
+        if key:
+            updates["ANTHROPIC_API_KEY"] = key
+        if text("anthropic_model"):
+            updates["ANTHROPIC_MODEL"] = text("anthropic_model")
+        if not key and not settings.anthropic_api_key:
+            raise ValueError("Add an Anthropic key, or choose a deterministic fallback.")
+    elif provider == "openai_compatible":
+        key = text("openai_compatible_api_key")
+        base_url = text("openai_compatible_base_url")
+        model = text("openai_compatible_model")
+        if key:
+            updates["OPENAI_COMPATIBLE_API_KEY"] = key
+        if base_url:
+            updates["OPENAI_COMPATIBLE_BASE_URL"] = base_url.rstrip("/")
+        if model:
+            updates["OPENAI_COMPATIBLE_MODEL"] = model
+        if not (key or settings.openai_compatible_api_key):
+            raise ValueError("Add an OpenAI-compatible API key.")
+        if not (base_url or settings.openai_compatible_base_url):
+            raise ValueError("Add the OpenAI-compatible base URL.")
+        if not (model or settings.openai_compatible_model):
+            raise ValueError("Add the OpenAI-compatible model name.")
+
+    _merge_env(settings_module.dotenv_path, updates)
+    _apply_llm_updates(updates)
+    return settings.active_provider
+
+
+def _merge_env(path: Path, updates: Dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in line:
+            out.append(line)
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key in remaining:
+            out.append(f"{key}={_env_value(remaining.pop(key))}")
+        else:
+            out.append(line)
+    for key, value in remaining.items():
+        out.append(f"{key}={_env_value(value)}")
+    temporary = path.with_suffix(".env.tmp")
+    temporary.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def _env_value(value: str) -> str:
+    if any(ch.isspace() for ch in value) or "#" in value:
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    return value
+
+
+def _apply_llm_updates(updates: Dict[str, str]) -> None:
+    for key, value in updates.items():
+        os.environ[key] = value
+    mapping = {
+        "DEFAULT_LLM_PROVIDER": ("default_llm_provider", str),
+        "OPENAI_API_KEY": ("openai_api_key", str),
+        "ANTHROPIC_API_KEY": ("anthropic_api_key", str),
+        "GROQ_MODEL": ("groq_model", str),
+        "GROQ_FALLBACK_MODEL": ("groq_fallback_model", str),
+        "LLM_INTAKE_MODEL": ("llm_intake_model", str),
+        "LLM_RERANK_MODEL": ("llm_rerank_model", str),
+        "LLM_TAILOR_MODEL": ("llm_tailor_model", str),
+        "ANTHROPIC_MODEL": ("anthropic_model", str),
+        "OPENAI_COMPATIBLE_API_KEY": ("openai_compatible_api_key", str),
+        "OPENAI_COMPATIBLE_BASE_URL": ("openai_compatible_base_url", str),
+        "OPENAI_COMPATIBLE_MODEL": ("openai_compatible_model", str),
+        "LLM_STRICT": ("llm_strict", lambda v: v.lower() == "true"),
+    }
+    for key, value in updates.items():
+        if key == "GROQ_API_KEYS":
+            settings.groq_api_keys = SecretStr(value)
+            continue
+        if key in mapping:
+            attr, caster = mapping[key]
+            setattr(settings, attr, caster(value))
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = True) -> None:

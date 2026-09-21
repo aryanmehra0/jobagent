@@ -1,20 +1,48 @@
 target_domains:
-- Senior Distributed Systems Engineer
-- Cloud Infrastructure Engineer
+- Associate Product Manager
+- AI Product Manager
+- AI ML Engineer
 desired_experience_years: 4.0
 locations:
 - Remote
-- San Francisco
-- CA
+- Mumbai
+- Gurugram
+- Delhi
+- Noida
+- Bengaluru
+- Hyderabad
 is_remote: true
+work_modes:
+- remote
+- hybrid
+- onsite
+# Remote jobs anywhere in the world, plus on-site/hybrid jobs in these countries.
+onsite_countries:
+- india
 hours_old: 48
 job_boards:
 - linkedin
 - indeed
-- glassdoor
-- zip_recruiter
-country_indeed: usa
-min_salary: 175000
+- google
+public_sources:
+- remotive
+- arbeitnow
+- jobicy
+country_indeed: india
+min_salary: 800000
+salary_currency: INR
 max_results_per_board: 25
-ats_companies: {}
+ats_companies:
+  greenhouse:
+  - stripe
+  - figma
+  - dropbox
+  - databricks
+  ashby:
+  - linear
+  - notion
 proxy_url: null
+
+# Look up published HR / careers emails for each job (job post, company website,
+# and Hunter.io when HUNTER_API_KEY is set). Results go to data/outputs/jobs_master.csv.
+find_contacts: true

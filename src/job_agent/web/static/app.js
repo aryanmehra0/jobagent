@@ -564,6 +564,7 @@
             resume: currentResume(),
             dry_run: dryRun,
             track_all: true,
+            tailoring_mode: $("#resume-mode").value,
           },
         }),
       });
@@ -658,6 +659,7 @@
   function handleEvent(evt) {
     switch (evt.type) {
       case "run_start":
+        ranThisSession = true;
         running = true;
         logLines.length = 0;
         pushLog("evt", `Run started: ${evt.phases.join(" → ")}`);
@@ -680,10 +682,10 @@
         break;
 
       case "phase_end": {
-        const ok = evt.status === "ok";
-        runStatus[evt.phase] = ok ? "ready" : evt.status === "cancelled" ? "halted" : "error";
+        const ok = ["ok", "warning"].includes(evt.status);
+        runStatus[evt.phase] = evt.status === "warning" ? "warning" : ok ? "ready" : evt.status === "cancelled" ? "halted" : "error";
         runSummary[evt.phase] = evt.summary || {};
-        if (evt.summary && evt.summary.halt_reason) runStatus[evt.phase] = "halted";
+        if (evt.summary && evt.summary.halt_reason && evt.status !== "error") runStatus[evt.phase] = "halted";
 
         if (setupWatching === evt.phase) {
           setup.parsing = false;
@@ -714,6 +716,7 @@
           evt.status === "ok" ? "ok" : "err"
         );
         refreshState();
+        if ($("#jobs-dialog").open) openJobs();
         break;
     }
   }
@@ -729,6 +732,10 @@
   const title = (id) => state?.phases?.[id]?.title || id;
 
   function nodeStatus(id) {
+    const report = state?.run_report;
+    if (running && report?.active_phase === id) return "running";
+    if (report?.status === "interrupted" && report.active_phase === id) return "halted";
+    if (!running && ["error", "warning"].includes(report?.phases?.[id]?.status)) return report.phases[id].status;
     if (runStatus[id] === "pending") return "empty";
     if (runStatus[id]) return runStatus[id];
     return state?.phases?.[id]?.status || "empty";
@@ -740,6 +747,7 @@
     running: "Running",
     error: "Failed",
     halted: "Stopped",
+    warning: "Needs review",
   };
 
   function renderBanner() {
@@ -756,8 +764,30 @@
         + "parsed from the bundled sample resume. Upload your own resume before applying.";
   }
 
+  let runBannerDismissed = false;
+  let ranThisSession = false;
+
+  function renderRunBanner() {
+    const banner = $("#run-banner");
+    const last = state?.last_run;
+    if (!last || running || ranThisSession || runBannerDismissed) {
+      banner.hidden = true;
+      return;
+    }
+    const when = new Date(last.at);
+    const age = last.age_hours < 1 ? "less than an hour ago"
+      : last.age_hours < 48 ? `${Math.round(last.age_hours)} hours ago`
+      : `${Math.round(last.age_hours / 24)} days ago`;
+    banner.hidden = false;
+    $("#run-banner-text").textContent =
+      `These are results from your previous run (${when.toLocaleString()}, ${age}), not a new search. ` +
+      "Press Run all phases to refresh the search. Previously seen listings can appear in the latest CSV; processed applications are not repeated. " +
+      "Start fresh clears this view first.";
+  }
+
   function render() {
     renderBanner();
+    renderRunBanner();
     renderPills();
     renderNodes();
     // Deferred a frame: edge anchors are measured from the DOM, which only has
@@ -1022,6 +1052,18 @@
         const li = el("li");
         li.append(el("span", "score", Number(item.score).toFixed(1)));
         li.append(el("span", "grow", `${item.company} — ${item.title}`));
+        if (item.check) {
+          const badge = el("span", "metric", item.check_passed ? "✓ validated" : "✗ check failed");
+          badge.title = [item.check, ...(item.changes || [])].join("\n");
+          li.append(badge);
+        }
+        if (item.pdf_path) {
+          const open = el("a", "link", "Open PDF");
+          open.href = `/api/file?path=${encodeURIComponent(item.pdf_path)}`;
+          open.target = "_blank";
+          open.rel = "noopener";
+          li.append(open);
+        }
         if (item.blocked?.length) {
           const flag = el("span", "metric", `${item.blocked.length} blocked`);
           flag.title = `Fabricated metrics removed: ${item.blocked.join(", ")}`;
@@ -1130,11 +1172,101 @@
       panel.append(field);
     }
 
+    /* --- AI provider --- */
+    panel.append(el("h4", null, "AI provider"));
+    const llm = state.llm || {};
+    const llmBox = el("div", `callout ${llm.active_provider && llm.active_provider !== "none" ? "ok" : "warn"}`);
+    llmBox.textContent = llm.active_provider && llm.active_provider !== "none"
+      ? `Active LLM: ${llm.active_provider}. Keys are saved locally in .env and are never shown back in the browser.`
+      : "No LLM is active. The agent will use deterministic fallbacks until you add a provider key.";
+    panel.append(llmBox);
+
+    const llmForm = el("form");
+    llmForm.id = "llm-form";
+    const providerField = el("div", "field");
+    providerField.append(el("label", null, "Provider"));
+    const providerSelect = el("select");
+    providerSelect.name = "provider";
+    [
+      ["groq", "Groq"],
+      ["openai", "OpenAI"],
+      ["anthropic", "Anthropic"],
+      ["openai_compatible", "Other OpenAI-compatible API"],
+      ["none", "None / deterministic fallback"],
+    ].forEach(([value, label]) => {
+      const option = el("option", null, label);
+      option.value = value;
+      option.selected = (llm.default_provider || llm.active_provider || "none") === value;
+      providerSelect.append(option);
+    });
+    providerField.append(providerSelect);
+    providerField.append(el("div", "hint", "Changing provider affects intake, scoring, resume tailoring, form answers, and outreach drafts."));
+    llmForm.append(providerField);
+
+    const providerBlocks = el("div", "provider-blocks");
+    providerBlocks.append(providerPanel("groq", [
+      passwordField("groq_api_keys", "Groq key(s)", "", llm.has_keys?.groq ? "Saved. Leave blank to keep existing key(s)." : "Paste one key, or multiple keys separated by commas."),
+      textField("groq_model", "Groq model", llm.models?.groq || "openai/gpt-oss-120b"),
+      textField("groq_fallback_model", "Fallback model", llm.models?.groq_fallback || "openai/gpt-oss-20b"),
+    ]));
+    providerBlocks.append(providerPanel("openai", [
+      passwordField("openai_api_key", "OpenAI API key", "", llm.has_keys?.openai ? "Saved. Leave blank to keep existing key." : "Paste your OpenAI API key."),
+      textField("openai_model", "OpenAI model", llm.models?.openai_tailor || "gpt-4o"),
+    ]));
+    providerBlocks.append(providerPanel("anthropic", [
+      passwordField("anthropic_api_key", "Anthropic API key", "", llm.has_keys?.anthropic ? "Saved. Leave blank to keep existing key." : "Paste your Anthropic API key."),
+      textField("anthropic_model", "Anthropic model", llm.models?.anthropic || "claude-sonnet-5"),
+    ]));
+    providerBlocks.append(providerPanel("openai_compatible", [
+      passwordField("openai_compatible_api_key", "API key", "", llm.has_keys?.openai_compatible ? "Saved. Leave blank to keep existing key." : "Paste the provider key."),
+      textField("openai_compatible_base_url", "Base URL", llm.openai_compatible_base_url || "", "Example: https://api.example.com/v1"),
+      textField("openai_compatible_model", "Model", llm.models?.openai_compatible || "", "Use the model name from that provider."),
+    ]));
+    providerBlocks.append(providerPanel("none", [
+      el("div", "hint", "No key needed. Intake, scoring, tailoring, and outreach use deterministic fallback logic."),
+    ]));
+    llmForm.append(providerBlocks);
+
+    const strictLabel = el("label", "check");
+    const strictInput = el("input");
+    strictInput.type = "checkbox"; strictInput.name = "llm_strict";
+    strictInput.checked = !!llm.strict;
+    strictLabel.append(strictInput, el("span", null, "Stop the run when the LLM fails"));
+    const strictField = el("div", "field");
+    strictField.append(strictLabel);
+    strictField.append(el("div", "hint", "Usually leave this off so a bad key falls back to deterministic output."));
+    llmForm.append(strictField);
+
+    const saveLLM = el("button", "btn btn-primary", "Save AI provider");
+    saveLLM.type = "submit";
+    saveLLM.style.width = "100%";
+    llmForm.append(saveLLM);
+    const updateProviderPanels = () => {
+      providerBlocks.querySelectorAll("[data-provider-panel]").forEach((block) => {
+        block.hidden = block.dataset.providerPanel !== providerSelect.value;
+      });
+    };
+    providerSelect.addEventListener("change", updateProviderPanels);
+    llmForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      await saveLLMSettings(llmForm);
+    });
+    panel.append(llmForm);
+    updateProviderPanels();
+
     /* --- Search parameters --- */
     panel.append(el("h4", null, "Input: search parameters"));
     const cfg = state.config;
     if (cfg.status === "error") {
       const box = el("div", "callout err", cfg.error);
+      panel.append(box);
+    }
+    if (cfg.warnings?.length) {
+      const box = el("div", "callout warn");
+      box.append(el("strong", null, "Check these before running:"));
+      const list = el("ul");
+      cfg.warnings.forEach((warning) => list.append(el("li", null, warning)));
+      box.append(list);
       panel.append(box);
     }
     const values = cfg.values || {};
@@ -1154,13 +1286,39 @@
 
     const row2 = el("div", "field-row");
     row2.append(numberField("min_salary", "Minimum salary", values.min_salary ?? "", true));
-    row2.append(textField("country_indeed", "Indeed country", values.country_indeed || "usa"));
+    row2.append(textField("salary_currency", "Salary currency", values.salary_currency || "USD",
+      "e.g. INR or USD. The floor only applies to jobs listed in this currency."));
     form.append(row2);
+
+    form.append(textField("country_indeed", "Indeed / Glassdoor country", values.country_indeed || "usa",
+      "Must match your locations, e.g. india for Indian cities."));
+    form.append(textField("onsite_countries", "Countries for onsite / hybrid roles",
+      (values.onsite_countries || []).join(", "),
+      "Optional. Only confirmed locations in these countries are kept for onsite and hybrid roles."));
+
+    const modesField = el("div", "field");
+    modesField.append(el("label", null, "Work arrangements"));
+    const modeChecks = el("div", "checks");
+    const effectiveModes = values.work_modes ||
+      (values.is_remote !== false
+        ? ((values.onsite_countries || []).length ? ["remote", "hybrid", "onsite"] : ["remote"])
+        : ["remote", "hybrid", "onsite"]);
+    [["remote", "Remote"], ["hybrid", "Hybrid"], ["onsite", "Onsite"]].forEach(([mode, title]) => {
+      const label = el("label", "check");
+      const input = el("input");
+      input.type = "checkbox"; input.value = mode; input.name = "work_modes";
+      input.checked = effectiveModes.includes(mode);
+      label.append(input, el("span", null, title));
+      modeChecks.append(label);
+    });
+    modesField.append(modeChecks);
+    modesField.append(el("div", "hint", "Choose any combination. Worldwide remote eligibility is set below."));
+    form.append(modesField);
 
     const boardsField = el("div", "field");
     boardsField.append(el("label", null, "Job boards"));
     const checks = el("div", "checks");
-    ["linkedin", "indeed", "glassdoor", "zip_recruiter", "google"].forEach((board) => {
+    ["linkedin", "indeed", "glassdoor", "zip_recruiter", "google", "bayt", "naukri", "bdjobs"].forEach((board) => {
       const label = el("label", "check");
       const input = el("input");
       input.type = "checkbox"; input.value = board; input.name = "job_boards";
@@ -1172,14 +1330,40 @@
     boardsField.append(el("div", "hint", "Glassdoor and ZipRecruiter return 403 without a residential proxy."));
     form.append(boardsField);
 
-    const remoteField = el("div", "field");
-    const remoteLabel = el("label", "check");
-    const remoteInput = el("input");
-    remoteInput.type = "checkbox"; remoteInput.id = "is_remote";
-    remoteInput.checked = values.is_remote !== false;
-    remoteLabel.append(remoteInput, el("span", null, "Remote positions only"));
-    remoteField.append(remoteLabel);
-    form.append(remoteField);
+    const feedsField = el("div", "field");
+    feedsField.append(el("label", null, "Public job APIs"));
+    const feedChecks = el("div", "checks");
+    [["remotive", "Remotive (remote)"], ["arbeitnow", "Arbeitnow"], ["jobicy", "Jobicy (remote)"]].forEach(([source, title]) => {
+      const label = el("label", "check");
+      const input = el("input");
+      input.type = "checkbox"; input.value = source; input.name = "public_sources";
+      input.checked = (values.public_sources || []).includes(source);
+      label.append(input, el("span", null, title));
+      feedChecks.append(label);
+    });
+    feedsField.append(feedChecks);
+    feedsField.append(el("div", "hint", "Public JSON feeds add coverage without browser scraping or logins."));
+    form.append(feedsField);
+
+    form.append(el("h4", null, "Direct company career boards"));
+    form.append(el("div", "hint", "Optional board tokens, comma-separated. These use public Greenhouse, Lever, and Ashby endpoints."));
+    const atsRow = el("div", "field-row");
+    atsRow.append(textField("ats_greenhouse", "Greenhouse tokens", (values.ats_companies?.greenhouse || []).join(", ")));
+    atsRow.append(textField("ats_lever", "Lever tokens", (values.ats_companies?.lever || []).join(", ")));
+    form.append(atsRow);
+    form.append(textField("ats_ashby", "Ashby tokens", (values.ats_companies?.ashby || []).join(", ")));
+
+    const contactsField = el("div", "field");
+    const contactsLabel = el("label", "check");
+    const contactsInput = el("input");
+    contactsInput.type = "checkbox"; contactsInput.id = "find_contacts";
+    contactsInput.checked = values.find_contacts !== false;
+    contactsLabel.append(contactsInput, el("span", null, "Find published HR / careers emails"));
+    contactsField.append(contactsLabel);
+    contactsField.append(el("div", "hint",
+      "Checks each employer's own website (and Hunter.io if HUNTER_API_KEY is set). " +
+      "Only published addresses are kept; nothing is guessed. Results go to jobs_master.csv."));
+    form.append(contactsField);
 
     const save = el("button", "btn btn-primary", "Save search parameters");
     save.type = "submit";
@@ -1192,12 +1376,85 @@
     });
     panel.append(form);
 
+    /* --- Candidate preferences --- */
+    panel.append(el("h4", null, "Candidate preferences"));
+    panel.append(el("div", "hint",
+      "Not on a resume, but asked by application forms. Saved once and kept when you upload a new resume."));
+    const prefs = state.preferences?.values || {};
+    const prefForm = el("form");
+    prefForm.id = "prefs-form";
+    const prow1 = el("div", "field-row");
+    prow1.append(textField("current_country", "Country you live in", prefs.current_country || ""));
+    prow1.append(textField("authorized_countries", "Allowed to work in (no visa needed)",
+      (prefs.authorized_countries || []).join(", ")));
+    prefForm.append(prow1);
+
+    const choice = (name, label, value, yes, no) => {
+      const field = el("div", "field");
+      field.append(el("label", null, label));
+      const select = el("select");
+      select.name = name;
+      [["", "Not stated"], ["true", yes], ["false", no]].forEach(([v, text]) => {
+        const option = el("option", null, text);
+        option.value = v;
+        option.selected = String(value ?? "") === v;
+        select.append(option);
+      });
+      field.append(select);
+      return field;
+    };
+    prefForm.append(choice("requires_sponsorship", "Visa sponsorship", prefs.requires_sponsorship,
+      "Needed only to work in other countries", "Never needed"));
+    prefForm.append(choice("remote_worldwide", "Remote work", prefs.remote_worldwide,
+      "Open to remote jobs from any country", "Not open to foreign remote jobs"));
+
+    const prow2 = el("div", "field-row");
+    prow2.append(numberField("desired_salary", "Expected salary from (per year)", prefs.desired_salary ?? "", true));
+    prow2.append(numberField("desired_salary_max", "up to", prefs.desired_salary_max ?? "", true));
+    prow2.append(textField("pref_currency", "Currency", prefs.salary_currency || "INR"));
+    prefForm.append(prow2);
+    prefForm.append(el("div", "hint", "10–14 LPA is 1000000 to 1400000 INR."));
+
+    const savePrefs = el("button", "btn btn-primary", "Save preferences");
+    savePrefs.type = "submit";
+    savePrefs.style.width = "100%";
+    prefForm.append(savePrefs);
+    prefForm.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const data = new FormData(prefForm);
+      const bool = (key) => (data.get(key) === "" ? null : data.get(key) === "true");
+      const num = (key) => { const v = String(data.get(key) || "").trim(); return v === "" ? null : Number(v); };
+      const payload = {
+        current_country: String(data.get("current_country") || "").trim() || null,
+        authorized_countries: String(data.get("authorized_countries") || "").split(",").map((s) => s.trim()).filter(Boolean),
+        requires_sponsorship: bool("requires_sponsorship"),
+        remote_worldwide: bool("remote_worldwide"),
+        desired_salary: num("desired_salary"),
+        desired_salary_max: num("desired_salary_max"),
+        salary_currency: String(data.get("pref_currency") || "").trim() || null,
+      };
+      try {
+        const result = await api("/api/preferences", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        state = result.state;
+        render(); renderSettings();
+        toast("Preferences saved to your profile.", "ok");
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
+    panel.append(prefForm);
+
     /* --- Where things land --- */
     panel.append(el("h4", null, "Output locations"));
     const dl = el("dl", "kv");
     dl.append(el("dt", null, "Artifacts"), el("dd", null, state.paths.outputs));
     dl.append(el("dt", null, "Resumes"), el("dd", null, state.paths.resumes));
     dl.append(el("dt", null, "Tracker"), el("dd", null, state.paths.tracker));
+    dl.append(el("dt", null, "Jobs CSV"), el("dd", null, state.paths.jobs_csv));
     panel.append(dl);
   }
 
@@ -1211,6 +1468,20 @@
     return field;
   }
 
+  function passwordField(name, label, value, hint) {
+    const field = textField(name, label, value, hint);
+    field.querySelector("input").type = "password";
+    field.querySelector("input").autocomplete = "off";
+    return field;
+  }
+
+  function providerPanel(name, children) {
+    const block = el("div", "provider-panel");
+    block.dataset.providerPanel = name;
+    children.forEach((child) => block.append(child));
+    return block;
+  }
+
   function numberField(name, label, value, optional) {
     const field = el("div", "field");
     field.append(el("label", null, label));
@@ -1219,6 +1490,38 @@
     if (optional) input.placeholder = "any";
     field.append(input);
     return field;
+  }
+
+  async function saveLLMSettings(form) {
+    const data = new FormData(form);
+    const payload = {
+      provider: String(data.get("provider") || "none"),
+      groq_api_keys: String(data.get("groq_api_keys") || "").trim(),
+      groq_model: String(data.get("groq_model") || "").trim(),
+      groq_fallback_model: String(data.get("groq_fallback_model") || "").trim(),
+      openai_api_key: String(data.get("openai_api_key") || "").trim(),
+      openai_model: String(data.get("openai_model") || "").trim(),
+      anthropic_api_key: String(data.get("anthropic_api_key") || "").trim(),
+      anthropic_model: String(data.get("anthropic_model") || "").trim(),
+      openai_compatible_api_key: String(data.get("openai_compatible_api_key") || "").trim(),
+      openai_compatible_base_url: String(data.get("openai_compatible_base_url") || "").trim(),
+      openai_compatible_model: String(data.get("openai_compatible_model") || "").trim(),
+      llm_strict: data.has("llm_strict"),
+    };
+    try {
+      const result = await api("/api/llm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      state = result.state;
+      render(); renderSettings();
+      toast(result.provider && result.provider !== "none"
+        ? `AI provider active: ${result.provider}`
+        : "AI provider disabled; deterministic fallbacks active.", "ok");
+    } catch (err) {
+      toast(err.message, "err");
+    }
   }
 
   async function saveConfig(form) {
@@ -1231,13 +1534,22 @@
       target_domains: split("target_domains"),
       locations: split("locations"),
       job_boards: data.getAll("job_boards"),
+      public_sources: data.getAll("public_sources"),
+      work_modes: data.getAll("work_modes"),
       hours_old: Number(data.get("hours_old")) || 48,
       max_results_per_board: Number(data.get("max_results_per_board")) || 25,
       country_indeed: String(data.get("country_indeed") || "usa"),
       min_salary: salary === "" ? null : Number(salary),
-      is_remote: $("#is_remote").checked,
+      salary_currency: String(data.get("salary_currency") || "USD"),
+      is_remote: data.getAll("work_modes").length === 1 && data.getAll("work_modes")[0] === "remote",
+      find_contacts: $("#find_contacts").checked,
+      onsite_countries: split("onsite_countries"),
       desired_experience_years: state.config.values?.desired_experience_years ?? 3.0,
-      ats_companies: state.config.values?.ats_companies ?? {},
+      ats_companies: Object.fromEntries(Object.entries({
+        greenhouse: split("ats_greenhouse"),
+        lever: split("ats_lever"),
+        ashby: split("ats_ashby"),
+      }).filter(([, tokens]) => tokens.length)),
       proxy_url: state.config.values?.proxy_url ?? null,
     };
 
@@ -1310,7 +1622,105 @@
 
   /* ---------------- Wiring ---------------- */
 
+  let jobRows = [];
+  let outreachDirectory = "";
+  let manuallyApplied = new Set();
+  let visibleJobs = 50;
+  function safeLink(label, url) {
+    const link = el("a", "link", label);
+    if (/^https?:\/\//i.test(url || "") || (url || "").startsWith("/api/file?")) {
+      link.href = url; link.target = "_blank"; link.rel = "noopener noreferrer";
+    }
+    return link;
+  }
+  function renderJobRows() {
+    const query = $("#jobs-query").value.toLowerCase();
+    const mode = $("#jobs-mode").value;
+    const hiring = $("#jobs-email").checked;
+    const current = $("#jobs-current").checked;
+    const ready = $("#jobs-ready").checked;
+    const rows = jobRows.filter(row => (!mode || row["Work Mode"] === mode)
+      && (!current || row["Search Batch"] === "Current search")
+      && (!ready || row["Application Readiness"] === "Ready for your review")
+      && (!hiring || ["hiring", "person"].includes(row["Email Type"]))
+      && ["Title", "Company", "Location"].some(key => (row[key] || "").toLowerCase().includes(query)))
+      .sort((a, b) => (Number(b["Fit Score"]) || 0) - (Number(a["Fit Score"]) || 0));
+    $("#jobs-count").textContent = `${rows.length} matching jobs · ${jobRows.length} saved in total · showing ${Math.min(visibleJobs, rows.length)} · scores out of 10`;
+    $("#jobs-more").hidden = rows.length <= visibleJobs;
+    const body = $("#jobs-rows"); body.replaceChildren();
+    for (const row of rows.slice(0, visibleJobs)) {
+      const tr = el("tr");
+      const role = el("td"); role.append(el("strong", null, row.Title), el("p", null, row.Company), el("small", null, `${row.Source || ""} · ${row.Status || "found"}`));
+      if (row["Search Batch"] !== "Current search") role.append(el("p", "hint", "Earlier search; fit may be stale"));
+      if (row["Missing Skills"]) role.append(el("p", "hint", `Skill gaps: ${row["Missing Skills"]}`));
+      const location = el("td"); location.append(el("div", null, `${row.Location || "Unknown"} · ${row["Work Mode"] || ""}`), el("p", "hint", row["Remote Eligibility"] || "Review eligibility"));
+      location.title = row["Eligibility Notes"] || "";
+      const contact = el("td"); contact.append(el("div", null, row["HR / Careers Email"] || "No published email found"), el("p", "hint", row["Email Verification"] || "Deliverability not checked"));
+      if (row["Email Found On"]) contact.append(safeLink("Contact source", row["Email Found On"]));
+      const actions = el("td");
+      actions.append(safeLink("View job / apply", row["Apply URL"] || row["Job URL"]));
+      if (row["Tailored Resume Path"]) actions.append(el("br"), safeLink("Open PDF", `/api/file?path=${encodeURIComponent(row["Tailored Resume Path"])}`));
+      actions.append(el("p", "hint", row["Resume Check"] || "Resume not yet generated"));
+      actions.append(el("p", "hint", row["Next Step"] || "Review the employer listing before applying."));
+      if (row.Status !== "applied" || manuallyApplied.has(row["Job ID"])) {
+        const undo = manuallyApplied.has(row["Job ID"]);
+        const mark = el("button", "btn btn-sm", undo ? "Undo applied marker" : "Mark as applied");
+        mark.addEventListener("click", async () => {
+          mark.disabled = true;
+          try {
+            const result = await api("/api/jobs/applied", {method: "POST", body: JSON.stringify({job_id: row["Job ID"], undo})});
+            toast((result.warnings || []).join(" ") || (undo ? "Manual marker undone." : "Recorded. No application was sent by this action."));
+            await openJobs();
+          } catch (error) { toast(error.message, "err"); mark.disabled = false; }
+        });
+        actions.append(mark);
+      }
+      if (row["Email Draft File"] && outreachDirectory) actions.append(safeLink("Open unsent email draft", `/api/file?path=${encodeURIComponent(outreachDirectory + "/" + row["Email Draft File"])}`));
+      tr.append(role, location, el("td", null, row["Fit Score"] || "Not scored"), contact, actions); body.append(tr);
+    }
+    if (!rows.length) { const tr = el("tr"); const td = el("td", null, "No jobs match. Run sourcing or adjust your filters."); td.colSpan = 5; tr.append(td); body.append(tr); }
+  }
+
+  async function openJobs() {
+    const dialog = $("#jobs-dialog"); if (!dialog.open) dialog.showModal();
+    $("#jobs-count").textContent = "Loading jobs…";
+    try {
+      const result = await api("/api/jobs"); jobRows = result.jobs || []; visibleJobs = 50;
+      outreachDirectory = result.outreach_dir || "";
+      manuallyApplied = new Set(result.manually_applied || []);
+      $("#jobs-csv").href = `/api/file?path=${encodeURIComponent(result.csv_path)}`;
+      $("#jobs-latest-csv").href = `/api/file?path=${encodeURIComponent(result.latest_csv_path)}`;
+      $("#jobs-ready-csv").href = `/api/file?path=${encodeURIComponent(result.ready_csv_path)}`;
+      const report = result.run_report || {};
+      $("#jobs-run-status").textContent = report.status
+        ? `Run: ${report.status}${report.active_phase ? ` · ${report.active_phase}` : ""}. ${report.halt_reason || ""} ${(report.warnings || []).join(" ")}`
+        : "No run report yet. Run the agent to refresh these saved results.";
+      const coverage = result.coverage || {};
+      const sources = [...Object.entries(coverage.boards || {}), ...Object.entries(coverage.public_feeds || {})];
+      $("#jobs-coverage").textContent = coverage.checked_at
+        ? `Last sweep: ${new Date(coverage.checked_at).toLocaleString()}. ${sources.map(([name, value]) => `${name}: ${value.status} (${value.matching_listings || 0})`).join(" · ")}.`
+        : "No source coverage report yet. Existing jobs may come from an earlier run.";
+      if (coverage.checked_at && Date.now() - new Date(coverage.checked_at).getTime() > (coverage.hours_old || 48) * 3600000) {
+        $("#jobs-coverage").textContent += " These saved results are older than your search window. Run a fresh search before applying.";
+      }
+      renderJobRows();
+    } catch (error) { $("#jobs-count").textContent = error.message; }
+  }
+
   function init() {
+    $("#jobs-btn").addEventListener("click", openJobs);
+    $("#jobs-close").addEventListener("click", () => $("#jobs-dialog").close());
+    for (const id of ["#jobs-query", "#jobs-mode", "#jobs-email", "#jobs-current", "#jobs-ready"]) $(id).addEventListener("input", () => { visibleJobs = 50; renderJobRows(); });
+    $("#jobs-more").addEventListener("click", () => { visibleJobs += 50; renderJobRows(); });
+    $("#jobs-bundle").addEventListener("click", async () => {
+      const button = $("#jobs-bundle"); button.disabled = true; button.textContent = "Preparing download…";
+      try {
+        const result = await api("/api/export/bundle", {method: "POST", body: "{}"});
+        const link = document.createElement("a"); link.href = `/api/file?path=${encodeURIComponent(result.path)}`;
+        link.download = "application_pack.zip"; document.body.append(link); link.click(); link.remove();
+      } catch (error) { toast(error.message, "err"); }
+      finally { button.disabled = false; button.textContent = "Download CSV + PDFs"; }
+    });
     document.querySelectorAll(".tab").forEach((tab) => {
       tab.addEventListener("click", () => switchTab(tab.dataset.tab));
     });
@@ -1340,6 +1750,19 @@
 
     $("#banner-setup").addEventListener("click", () => openSetup(0));
     $("#banner-dismiss").addEventListener("click", () => { bannerDismissed = true; renderBanner(); });
+    $("#run-banner-dismiss").addEventListener("click", () => { runBannerDismissed = true; renderRunBanner(); });
+    $("#run-banner-fresh").addEventListener("click", async () => {
+      if (!confirm("Move the previous run's results to history? Seen jobs, the jobs CSV and the outreach log are kept, so nothing will be repeated.")) return;
+      try {
+        const result = await api("/api/outputs/archive", { method: "POST", body: "{}" });
+        state = result.state;
+        runBannerDismissed = true;
+        render();
+        toast("Previous results moved to history. Run all phases to search again.", "ok");
+      } catch (err) {
+        toast(err.message, "err");
+      }
+    });
 
     refreshState().then(() => {
       // Open the wizard unprompted when there is no usable profile: without one
@@ -1350,6 +1773,8 @@
       }
       connectEvents();
     });
+    // A CLI run uses the same artifacts but has no dashboard SSE connection.
+    setInterval(() => { if (!document.hidden) refreshState(); }, 10000);
   }
 
   if (document.readyState === "loading") {

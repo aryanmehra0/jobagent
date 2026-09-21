@@ -77,7 +77,7 @@ def test_form_filler_name_and_screening_answers(test_profile, test_job):
     assert ans_spon == "No"
 
     ans_exp = filler.answer_screening_question("How many years of experience do you have with Kubernetes?")
-    assert "4" in ans_exp or "experience" in ans_exp.lower()
+    assert ans_exp is None  # Total tenure does not establish tenure with a tool.
 
 
 def test_challenge_handler_detection_rules():

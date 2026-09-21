@@ -20,6 +20,7 @@ from rich.console import Console
 
 from job_agent.config.normalize import clean_text, parse_posting_timestamp, strip_html, tokenize
 from job_agent.config.schema import JobPosting, SearchParameters
+from job_agent.contacts.extract import job_post_contacts
 
 console = Console()
 
@@ -46,6 +47,7 @@ class ATSDirectIngestion:
     def __init__(self, timeout: int = 15, session: Optional[requests.Session] = None):
         self.timeout = timeout
         self.session = session or requests.Session()
+        self.report: Dict[str, Any] = {}
         self.session.headers.update({
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -61,17 +63,23 @@ class ATSDirectIngestion:
         try:
             response = self.session.get(url, timeout=self.timeout)
         except requests.RequestException as exc:
+            self.report[label] = {"status": "failed", "detail": exc.__class__.__name__}
             console.print(f"[dim]{label}: request failed ({exc.__class__.__name__}).[/dim]")
             return None
         if response.status_code == 404:
+            self.report[label] = {"status": "failed", "detail": "HTTP 404; board token not found"}
             console.print(f"[dim]{label}: board not found (check the token in searches.yaml).[/dim]")
             return None
         if response.status_code != 200:
+            self.report[label] = {"status": "failed", "detail": f"HTTP {response.status_code}"}
             console.print(f"[dim]{label}: HTTP {response.status_code}.[/dim]")
             return None
         try:
-            return response.json()
+            data = response.json()
+            self.report[label] = {"status": "ok"}
+            return data
         except ValueError:
+            self.report[label] = {"status": "failed", "detail": "Invalid JSON"}
             console.print(f"[dim]{label}: response was not JSON.[/dim]")
             return None
 
@@ -102,16 +110,27 @@ class ATSDirectIngestion:
             if not job_url or not title:
                 continue
             location = clean_text((item.get("location") or {}).get("name")) or "Remote"
+            description = strip_html(item.get("content", ""))
+            # The hosted page redirects to custom careers sites for some companies;
+            # the embeddable form is always the application itself.
+            apply_url = (
+                f"https://job-boards.greenhouse.io/embed/job_app?for={board_token}&token={item['id']}"
+                if item.get("id") else None
+            )
             posting = self._build(
                 id=JobPosting.create_id(job_url, company, title),
                 title=title,
                 company=company,
                 location=location,
                 job_url=job_url,
-                description=strip_html(item.get("content", "")),
-                date_posted=clean_text(item.get("updated_at")) or None,
+                description=description,
+                # `updated_at` changes whenever a recruiter edits an old posting;
+                # `first_published` is when it went live.
+                date_posted=clean_text(item.get("first_published") or item.get("updated_at")) or None,
                 is_remote="remote" in location.lower(),
                 source="greenhouse",
+                apply_url=apply_url,
+                contacts=job_post_contacts(description),
             )
             if posting:
                 postings.append(posting)
@@ -136,17 +155,22 @@ class ATSDirectIngestion:
             categories = item.get("categories") or {}
             location = clean_text(categories.get("location")) or "Remote"
             workplace_type = clean_text(item.get("workplaceType")).lower()
+            description = clean_text(item.get("descriptionPlain")) or strip_html(item.get("description", ""))
+            apply_url = clean_text(item.get("applyUrl")) or (f"{job_url.rstrip('/')}/apply" if item.get("hostedUrl") else None)
             posting = self._build(
                 id=JobPosting.create_id(job_url, company, title),
                 title=title,
                 company=company,
                 location=location,
                 job_url=job_url,
-                description=clean_text(item.get("descriptionPlain")) or strip_html(item.get("description", "")),
+                description=description,
                 date_posted=str(item.get("createdAt")) if item.get("createdAt") else None,
                 is_remote="remote" in location.lower() or workplace_type == "remote",
+                work_mode=(workplace_type if workplace_type in {"remote", "hybrid"} else None),
                 job_type=clean_text(categories.get("commitment")) or None,
                 source="lever",
+                apply_url=apply_url,
+                contacts=job_post_contacts(description),
             )
             if posting:
                 postings.append(posting)
@@ -169,17 +193,26 @@ class ATSDirectIngestion:
             if not job_url or not title:
                 continue
             location = clean_text(item.get("location")) or "Remote"
+            description = strip_html(item.get("descriptionHtml", "")) or clean_text(item.get("descriptionPlain"))
+            apply_url = clean_text(item.get("applyUrl")) or (f"{job_url.rstrip('/')}/application" if item.get("jobUrl") else None)
             posting = self._build(
                 id=JobPosting.create_id(job_url, company, title),
                 title=title,
                 company=company,
                 location=location,
                 job_url=job_url,
-                description=strip_html(item.get("descriptionHtml", "")) or clean_text(item.get("descriptionPlain")),
+                description=description,
                 date_posted=clean_text(item.get("publishedAt")) or None,
                 is_remote=bool(item.get("isRemote")) or "remote" in location.lower(),
+                work_mode=(
+                    clean_text(item.get("workplaceType")).lower()
+                    if clean_text(item.get("workplaceType")).lower() in {"remote", "hybrid", "onsite"}
+                    else None
+                ),
                 job_type=clean_text(item.get("employmentType")) or None,
                 source="ashby",
+                apply_url=apply_url,
+                contacts=job_post_contacts(description),
             )
             if posting:
                 postings.append(posting)
@@ -262,7 +295,8 @@ class ATSDirectIngestion:
         search_params: Optional[SearchParameters] = None,
     ) -> List[JobPosting]:
         """Poll every configured ATS board and return the postings that match the search."""
-        registry = companies or DEFAULT_ATS_REGISTRY
+        registry = DEFAULT_ATS_REGISTRY if companies is None else companies
+        self.report = {}
         fetchers = {
             "greenhouse": self.fetch_greenhouse_jobs,
             "lever": self.fetch_lever_jobs,
@@ -276,7 +310,16 @@ class ATSDirectIngestion:
                 console.print(f"[dim]Unknown ATS provider '{provider}' ignored.[/dim]")
                 continue
             for token in tokens:
-                all_postings.extend(fetcher(token))
+                from job_agent.runtime import check_cancelled, RunCancelled
+
+                check_cancelled()
+                try:
+                    all_postings.extend(fetcher(token))
+                except RunCancelled:
+                    raise
+                except Exception as exc:
+                    self.report[f"{provider}/{token}"] = {"status": "failed", "detail": str(exc)[:160]}
+                    console.print(f"[dim]{provider}/{token}: {exc.__class__.__name__}; continuing other boards.[/dim]")
 
         if not search_params:
             return all_postings
@@ -284,8 +327,6 @@ class ATSDirectIngestion:
         filtered: List[JobPosting] = []
         for posting in all_postings:
             if not self.matches_domain(posting, search_params.target_domains):
-                continue
-            if search_params.is_remote and not posting.is_remote:
                 continue
             if not self._is_fresh(posting, search_params.hours_old):
                 continue

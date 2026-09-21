@@ -1,4 +1,66 @@
-# Autonomous AI Job Search & Application Agent
+﻿# Autonomous AI Job Search & Application Agent
+
+## Job shortlist and portable downloads
+
+For the complete daily workflow, read [Start here](START_HERE.md). Full runs now
+share one CLI/dashboard engine and automatically publish `jobs_latest.csv`,
+`applications_ready.csv`, the master CSV, and the PDF pack. `run_report.json`
+records warnings, failures and incomplete scoring. The full CLI pipeline defaults
+to dry run; `--live` explicitly enables real submissions.
+
+Run `python main.py ui` and open **Jobs & downloads**. Search by role, company
+or location; filter by remote/hybrid/onsite work and hiring contacts. Current
+results are shown first; historical scores are labelled because they may refer
+to an earlier profile.
+
+Choose **Country-specific ATS** beside Run to generate English PDFs using the
+job location: Letter for US/Canada, A4 elsewhere, and regional section headings.
+Ambiguous or worldwide locations use an international format. Original
+achievements, qualifications and dates stay intact. These are presentation
+presets, not translation or a guarantee of every employer's requirements.
+**Preserve original PDF** remains available.
+
+```powershell
+python main.py tailor --mode regional
+python main.py tailor --mode regional --country UK --job-id <id>
+python main.py export
+python main.py export --bundle
+```
+
+**Download CSV + PDFs** produces `data/outputs/application_pack.zip` containing:
+
+- `jobs.csv`: jobs, scores, contact provenance, skill gaps, region, eligibility
+  notes and relative resume paths.
+- `resumes/`: current validated PDFs matching the profile and manifest hashes.
+- `index.html`: a clickable shortlist; extract the entire ZIP before opening.
+- `manifest.json`: PDF checksums and reasons unverified or older PDFs were omitted.
+- `source_coverage.json`, when available: the most recent sourcing report.
+
+CSV cannot embed PDF attachments. The ZIP keeps files and relative paths
+together across computers. The standalone CSV also retains local Excel links.
+Downloading does not send applications or emails.
+
+Sourcing includes JobSpy, configured Greenhouse/Lever/Ashby boards, Remotive,
+Arbeitnow and [Jobicy's public feed](https://jobicy.com/jobs-rss-feed).
+Responses are cached (Remotive: six hours; other public feeds: one hour).
+[Remotive requires attribution and limited polling](https://github.com/remotive-com/remote-jobs-api);
+source names and original URLs are retained. The coverage report records blocked
+boards, public-feed failures, cached requests, filtering and duplicates.
+Coverage is limited to configured, accessible sources; a cached listing does
+not prove an employer still accepts applications.
+
+Remote willingness does not override a posting's country restriction. Named
+foreign-only locations are excluded when residence is known. Unclear region
+or timezone requirements remain marked for review. These are location checks,
+not assertions about legal work authorization.
+
+Contacts are published or provider-supplied, never guessed. The sheet identifies
+the source page and marks deliverability as unchecked. Missing HR emails remain
+blank with a clear status. Regional layouts use clear headings and omit added
+demographic details, following general principles in the
+[National Careers Service CV guide](https://nationalcareers.service.gov.uk/careers-advice/cv-sections).
+
+---
 
 A local, six-stage job hunting pipeline. Each stage reads the previous stage's
 artifact from `data/outputs/` and writes its own, so stages can be run
@@ -51,6 +113,7 @@ pip install -r requirements.txt
 python -m playwright install chromium   # Only needed for stage 5
 copy .env.example .env                  # Then fill in what you have
 python main.py doctor                   # Confirms what is installed and configured
+python main.py production-check         # Release/readiness checklist
 ```
 
 **No API key is required.** Every LLM-backed stage has a deterministic fallback,
@@ -59,6 +122,147 @@ scoring nuance, and the wording of tailored bullets and outreach emails.
 
 `ANONYMIZED_TELEMETRY=false` is enforced in-process so that no dependency reports
 applicant data externally.
+
+---
+
+## A-to-Z quick start for a real user
+
+1. Clone the repository and open a terminal in the project directory.
+2. Install dependencies:
+
+   ```powershell
+   pip install -r requirements.txt
+   python -m playwright install chromium
+   ```
+
+3. Create `.env`:
+
+   ```powershell
+   copy .env.example .env
+   ```
+
+4. Optional, but recommended for better scoring and writing:
+
+   ```env
+   DEFAULT_LLM_PROVIDER=groq
+   GROQ_API_KEYS=gsk_first,gsk_second,gsk_third
+   ```
+
+5. Check the machine:
+
+   ```powershell
+   python main.py doctor --live
+   ```
+
+6. Check your resume before importing:
+
+   ```powershell
+   python main.py check "C:\Users\you\Desktop\resume.pdf"
+   ```
+
+7. Import and seal your profile:
+
+   ```powershell
+   python main.py intake --resume "C:\Users\you\Desktop\resume.pdf"
+   python main.py verify
+   ```
+
+8. Save eligibility and salary preferences:
+
+   ```powershell
+   python main.py preferences --country India --authorized India --sponsorship --remote-worldwide --salary 1000000 --salary-max 1400000 --currency INR
+   ```
+
+9. Edit targets in the dashboard or in `config/searches.yaml`.
+10. Run the production checklist:
+
+    ```powershell
+    python main.py production-check
+    ```
+
+11. Run a safe end-to-end rehearsal:
+
+    ```powershell
+    python main.py run-pipeline --skip-intake --dry-run --limit 10
+    ```
+
+12. Open the dashboard for visual control:
+
+    ```powershell
+    python main.py ui
+    ```
+
+    In **Settings > AI provider**, choose Groq, OpenAI, Anthropic,
+    OpenAI-compatible, or deterministic fallback. Paste the key there; the
+    dashboard saves it to your local `.env` and never shows the secret back.
+
+13. Review generated files in `data/outputs/`:
+
+    - `jobs_master.csv`
+    - `applications_tracker.xlsx`
+    - `tailored_resumes/*.pdf`
+    - `outreach/*.eml`
+
+14. Only after reviewing the dry run, run live application mode:
+
+    ```powershell
+    python main.py apply --limit 3
+    ```
+
+The agent never sends emails. It creates unsent `.eml` drafts and records them
+in the no-repeat ledger. `python main.py status` now reports how many outreach
+drafts exist and how many unique inboxes have been drafted to.
+
+---
+
+## Deployment and hosting
+
+For a personal production run, use the local dashboard or Docker CLI flow:
+
+```powershell
+docker compose build
+docker compose run --rm job-agent
+docker compose run --rm job-agent python main.py run-pipeline --skip-intake --dry-run --limit 10
+```
+
+The main compose file starts a persistent Postgres service and passes
+`DATABASE_URL` to the app. Local single-user artifacts still live in `data/`, and
+the hosted queue uses Postgres when `DATABASE_URL` is set.
+
+Check the database from the container:
+
+```powershell
+docker compose run --rm job-agent python main.py db-check
+```
+
+Open Adminer at `http://127.0.0.1:8081` and log in with system `PostgreSQL`,
+server `postgres`, user `job_agent`, password `job_agent_dev_password`, database
+`job_agent`. If Adminer reports `could not translate host name "db"`, change the Server field to `postgres`.
+
+The included dashboard is intentionally local-only. It can launch browser
+automation and submit real applications, so it binds to loopback and must not be
+put directly behind a public domain.
+
+For a safe hosted smoke test, run the separate token-protected control plane:
+
+```powershell
+docker compose -f docker-compose.hosted.yml up --build
+```
+
+It exposes `/health`, `/ready`, and a queued `POST /runs` API on port 8080. The
+reference worker completes queued runs in validation mode, which proves the API
+and queue are wired without sharing one browser profile across users.
+
+For an open-source hosted product with many users, use this repository as the
+worker engine and put a multi-user web layer in front of it: authenticated web
+app, per-user storage, a queue, isolated browser workers, managed secrets, and a
+database such as Postgres instead of shared local SQLite files. See
+[`DEPLOYMENT.md`](DEPLOYMENT.md) for the exact hosting model and scale checklist.
+
+The local repo still keeps single-user artifacts in `data/`: `delta_store.db`
+tracks seen jobs, lifecycle status, application attempts and outreach. The hosted
+queue uses Postgres when `DATABASE_URL` is set and falls back to
+`hosted_queue.db` without it.
 
 ---
 
@@ -176,6 +380,42 @@ node graph, in the style of n8n. Each phase is a node that reports its own statu
 and the connectors between them carry the counts handed downstream, so you can see
 exactly where the funnel narrows.
 
+### Old results and "Start fresh"
+
+When you open the dashboard it shows what is on disk: the results of your
+**previous** run. A blue notice says when that run happened. Press **Run all
+phases** to search again, or **Start fresh** first to clear the view.
+
+Start fresh moves the previous results to `data/outputs/history/`. It keeps three
+things, because they are what stops a new run from repeating itself:
+
+- the seen-jobs store
+- the outreach log
+- `jobs_master.csv`
+
+### Candidate preferences
+
+Application forms ask about things a resume rarely says. Set them once, either in
+**Settings > Candidate preferences** or from the command line:
+
+```powershell
+python main.py preferences --country India --authorized India --sponsorship --remote-worldwide `
+  --salary 1000000 --salary-max 1400000 --currency INR
+```
+
+They are stored in `data/profiles/preferences.json` and applied again whenever you
+upload a new resume. Screening answers then depend on where the job is:
+
+| Job | Visa sponsorship? | Authorized to work? |
+| --- | --- | --- |
+| In India | No | Yes |
+| Remote, for an employer anywhere | No | Yes |
+| On-site in another country | Yes | Left for you to answer |
+
+"Expected CTC in LPA" is answered as `14`. A number field gets `1400000`, and a
+text field gets `INR 10,00,000 - 14,00,000 per year (10-14 LPA)`. "Current CTC" is
+never filled in, because you have not stated it.
+
 ### First run: it asks for your resume
 
 The repository ships with a demo resume for a fictional candidate, "Alex Rivera".
@@ -251,8 +491,45 @@ python main.py source --no-ats     # Job boards only
 ```
 
 Prints a funnel showing how many listings each filter removed, so an empty sweep
-tells you which constraint was responsible. Already-seen jobs are skipped via
-`delta_store.db`.
+tells you which constraint was responsible.
+
+- **Time window is strict.** A dated posting older than `hours_old` is dropped.
+  Job boards apply the window themselves. Company ATS feeds list every open role,
+  so an undated listing there is dropped rather than risk months-old roles.
+- **No repeats, across boards and across runs.** A role is identified by company
+  plus title, with suffixes such as "Pvt Ltd" and noise words such as "Remote"
+  ignored. The same opening on LinkedIn, Indeed and the company site is kept
+  once. Of the copies, it keeps the one you can apply to, with every copy's
+  emails merged in. A role seen in any earlier run is never new again
+  (`delta_store.db`).
+- **Explicit work arrangements.** `work_modes` accepts any combination of
+  `remote`, `hybrid`, and `onsite`. When `onsite_countries` is set, physical roles
+  outside those countries are excluded. Older files that only use `is_remote`
+  continue to work.
+- **Worldwide remote eligibility.** Set this in Dashboard > Settings > Candidate
+  preferences. A listing with an explicit foreign restriction is excluded when
+  worldwide remote work is disabled; ambiguous locations stay available for review.
+- **Public API coverage.** Remotive and Arbeitnow can be enabled in
+  `public_sources`. They use public JSON feeds and fail independently from the
+  eight JobSpy sources and direct company ATS feeds.
+
+For every job, sourcing also records:
+
+- **Apply URL**: the real application form, not the board listing. For Indeed jobs
+  it is the employer's own page. For Greenhouse, Lever and Ashby it is the public
+  form.
+- **Contact emails**, each with where it came from:
+  - *Job post*: an address printed in the listing, including obfuscated ones
+    such as `hr [at] acme [dot] in`.
+  - *Company website*: the employer's homepage and its careers, jobs, contact
+    and about pages. `robots.txt` is honoured, and only addresses on the
+    company's own domain are kept.
+  - *Hunter.io*: only when `HUNTER_API_KEY` is set in `.env`. Only role
+    mailboxes (careers@, hr@) are requested, never named people.
+
+Addresses are **never guessed**. The agent does not build `firstname.lastname@`
+patterns. It also drops mailboxes meant for other teams (accommodations@,
+privacy@, press@, sales@). Turn lookups off with `find_contacts: false`.
 
 To poll specific companies' ATS boards directly, add them to `searches.yaml`:
 
@@ -261,6 +538,83 @@ ats_companies:
   greenhouse: [stripe, figma, databricks]
   lever: [ramp]
   ashby: [linear]
+```
+
+### The jobs sheet (CSV)
+
+```powershell
+python main.py export
+```
+
+`data/outputs/jobs_master.csv` lists every job the agent has found, one row each.
+It is refreshed automatically after every phase, and the dashboard offers it as
+a download. Its columns are:
+
+- Title, company, location, work mode, source, date posted and salary
+- Fit score and status (found, evaluated, qualified, tailored, then applied,
+  failed or skipped)
+- **HR / Careers Email**, Email Type, Email Source, Email Found On, Other Emails
+- Company Website, Job URL, **Apply URL**, Apply Method, Auto-apply Possible
+- Tailored Resume
+- **Outreach To**, **Outreach Status**, **Cold Email Subject**, **Cold Email Body**,
+  Email Draft File, and Notes
+
+Rows accumulate across sweeps. A job keeps its row, a later phase never blanks
+a value an earlier one recorded, and a confirmed "applied" is never overwritten.
+
+### The jobs database
+
+```powershell
+python main.py db stats                      # What the database holds
+python main.py db jobs --with-email -n 20    # Fetched jobs and their emails
+python main.py db jobs --min-score 7 --status qualified
+python main.py db sync                       # Rebuild it from the artifacts
+python main.py db query "SELECT company, contact_email FROM job_overview WHERE fit_score >= 7"
+python main.py db query "SELECT * FROM job_overview" --csv data/outputs/db_export.csv
+```
+
+`db query` runs any read-only SQL and refuses anything that would change data,
+so it is safe to explore with. To browse the database in a GUI instead, open
+`data/outputs/jobs.db` in DB Browser for SQLite (https://sqlitebrowser.org) or
+the SQLite Viewer extension in VS Code.
+
+Everything the agent fetches is also written to a database, so you can query it
+from a DB client or an admin UI instead of opening a spreadsheet. It uses
+Postgres when `DATABASE_URL` is set and SQLite (`data/outputs/jobs.db`)
+otherwise, with the same tables either way:
+
+| Table | Holds |
+| --- | --- |
+| `jobs` | One row per job: title, company, location, salary, source, posting date, description, fit score, stage, apply URL and method, tailored resume |
+| `job_evaluations` | The score behind each job: fit, technical and seniority scores, the threshold, the reasoning, and matching and missing skills |
+| `job_contacts` | Every published email found for a job, with its kind (hiring, person, general) and the page it came from |
+| `job_outreach` | The cold email drafted for a job: recipient, subject, body, draft file and whether it may be sent |
+| `job_resumes` | The tailored PDF itself, with its checksum and check result |
+| `job_applications` | What the apply phase did: status, channel, apply URL, steps and any error |
+| `candidate_profile` | The sealed profile the run used: contact, experience, country, sponsorship, salary expectation, skills, source resume |
+| `search_parameters` | The search it ran: roles, locations, on-site countries, freshness window, boards, salary floor |
+| `phase_runs` | Run history: each phase, its status, duration and summary, and whether it came from the dashboard or the terminal |
+| `job_overview` (view) | One row per job with its best contact email, resume and outreach state, for browsing |
+
+### Opening it in DBeaver
+
+1. **Database → New Database Connection → SQLite → Next.**
+2. **Path**: `data\outputs\jobs.db` inside the project folder → **Finish**.
+   (With `DATABASE_URL` set, choose PostgreSQL instead and use those details; the
+   tables are the same.)
+3. Expand **jobs → Schemas → main → Tables** and double-click a table.
+4. After a run, right-click the connection → **Refresh** (F5) to see the new rows.
+
+It is refreshed after every phase, alongside the CSV. Some useful queries:
+
+```sql
+-- Jobs worth applying to that have a hiring mailbox
+SELECT title, company, fit_score, contact_email, apply_url
+FROM job_overview WHERE fit_score >= 7 AND contact_kind = 'hiring'
+ORDER BY fit_score DESC;
+
+-- Where the contact emails are coming from
+SELECT source, COUNT(*) FROM job_contacts GROUP BY source;
 ```
 
 ### Stage 3 — Evaluation
@@ -285,6 +639,64 @@ python main.py tailor --job-id <id>
 The summary's "Integrity gate" column reports how many metrics were restored and
 how many fabrications were blocked for each resume.
 
+Every compiled resume also gets a `.ats.json` audit beside the PDF. Compilation
+fails before application if the PDF is not text-searchable, loses the candidate's
+identity, employer names, or source achievements, or grows beyond three pages.
+
+### How resumes are tailored
+
+When your uploaded resume is a PDF, the agent tailors **that file**, not a
+rebuilt copy. For each job it only reorders:
+
+- the bullets within each role (roles stay in date order),
+- the projects in a projects section,
+- the lines of the skills section,
+
+putting what the job description asks for first. Nothing is added, removed or
+reworded, and your fonts, colours, links, dates, headline, publications and page
+count stay exactly as you made them. No AI call is needed, so rate limits cannot
+break this step.
+
+Every tailored PDF is checked against your original before it is used:
+
+| Check | Passes when |
+| --- | --- |
+| Pages | Same number of pages, same size |
+| Words (2 readers) | Every word appears exactly as often as in the original |
+| Blocks intact | Every bullet and entry is still one continuous piece |
+| Links | Every link kept, with the same text |
+| Order | The planned order is what appears on the page |
+| Reading order (2 readers) | An applicant tracking system reads sections, roles and bullets in the order you see them |
+| Unchanged elsewhere | No pixel changed outside the reordered blocks |
+
+A resume that fails any check is replaced by your exact original. The result
+("PASS 10/10 checks - 2 section(s) reordered") is shown in the **Resume Check**
+column of the tracker and the CSV, and next to each resume on the dashboard.
+
+```powershell
+python main.py tailor                     # Tailor for the qualified jobs
+python main.py tailor --rebuild-existing  # Rebuild every resume already listed
+```
+
+Your uploaded PDF is always the source when there is one: if a job's reordering
+cannot be done safely, that job gets your exact original, never a resume built
+from a template. The bundled demo (`sample_resume.pdf`) is never chosen while a
+resume of your own is uploaded, and any resume in the output folder that is not
+yours is moved to `data/outputs/history/`.
+
+Each tailored resume can be reached from:
+
+- the tracker (`applications_tracker.xlsx`): click the file name;
+- the CSV (`jobs_master.csv`): the **Open Resume** column opens it in Excel;
+- the database: `job_resumes` holds the PDF itself, and
+  `python main.py db resume <job id>` saves it to Downloads, byte for byte,
+  ready to attach.
+
+`TAILORING_MODE` in `.env` selects the CLI default: `auto` (your PDF when its
+layout can be read, otherwise a resume generated from your profile), `faithful`
+(always your PDF), `generated`, or `regional` (country-aware ATS presentation).
+The dashboard's Resume selector and CLI `--mode` override this default.
+
 ### Stage 5 — Auto-apply
 
 ```powershell
@@ -292,6 +704,20 @@ python main.py apply --dry-run     # Rehearse; no browser, nothing submitted
 python main.py apply               # Live; asks for confirmation first
 python main.py apply --yes         # Skip the confirmation prompt
 ```
+
+Where the browser goes depends on the job:
+
+| Job | What auto-apply does |
+| --- | --- |
+| Greenhouse, Lever, Ashby | Opens the public application form |
+| Indeed job with an employer page | Opens the employer's page and hands off if it finds no form |
+| LinkedIn, Indeed-only, Glassdoor, Naukri | **Skipped: manual apply.** These need you signed in |
+| Workday, Taleo, SuccessFactors, Amazon Jobs | **Skipped: manual apply.** These need an account created |
+
+Skipped jobs keep their apply link and reason in the CSV and the tracker. They
+are never marked as attempted, so a later run can still pick them up. Submit is
+clicked only on a page that has a real application form (a resume upload, or
+name plus email), never on an "Apply" link.
 
 Uses a persistent Chromium profile (`data/browser_profile/`) so logins survive
 between runs. DOM-only perception (`use_vision=false`), a 25-step ceiling, a
@@ -311,6 +737,24 @@ python main.py track --all     # Log every qualified role
 Writes `data/outputs/applications_tracker.xlsx` with navy headers, wrapped text,
 and priority colour fills driven by the real fit score. Re-running updates each
 job's existing row rather than appending a duplicate.
+
+It also drafts a cold email for each role. The agent **never sends email**; it
+guarantees you are never handed a second email to the same inbox:
+
+Each draft has a role-and-company-specific subject, the candidate's most relevant
+verbatim achievements, matched skills from the posting, a direct call to action,
+and the tailored PDF attached. No achievement or email address is invented.
+
+| Outreach Status | Meaning |
+| --- | --- |
+| Ready to send | First email to this address about this role. `data/outputs/outreach/<job>.eml` opens in Outlook or Thunderbird as an unsent draft with your tailored resume attached |
+| Already drafted - do not send again | This address was already given a draft for this role, even if it came from another board or an earlier run. The original text is shown |
+| On hold | This address was drafted to about a different role in the last 14 days |
+| No email found | The draft is still written, for LinkedIn or the careers page |
+
+The ledger is the `outreach_log` table in `delta_store.db`. Drafts, including
+their subject and body, are kept in `outreach_drafts.json`, so re-running
+tracking reuses them instead of making another LLM call.
 
 ### Everything at once
 
@@ -340,14 +784,19 @@ fails immediately with the offending field named.
 | --- | --- |
 | `target_domains` | Job titles to search for |
 | `locations` | Cities or `Remote`; every location is searched on every board |
-| `is_remote` | When true, non-remote postings are dropped |
+| `work_modes` | Any combination of `remote`, `hybrid`, and `onsite` |
+| `is_remote` | Legacy compatibility field; `work_modes` takes precedence |
 | `hours_old` | Freshness window, 1 to 8760 hours |
 | `job_boards` | `linkedin`, `indeed`, `glassdoor`, `zip_recruiter`, `google`, `bayt`, `naukri`, `bdjobs` |
+| `public_sources` | Public JSON feeds: `remotive`, `arbeitnow`, `jobicy` |
 | `country_indeed` | Country for the Indeed and Glassdoor backends |
 | `min_salary` | Compared against the top of a posting's band; postings with no band are kept |
 | `max_results_per_board` | Per board, per search term |
 | `ats_companies` | Direct ATS boards to poll |
 | `proxy_url` | Overrides `RESIDENTIAL_PROXY_URL` |
+| `salary_currency` | Currency of `min_salary`, e.g. `INR` |
+| `find_contacts` | Look up published contact emails (default `true`) |
+| `onsite_countries` | Optional eligibility countries for onsite and hybrid roles |
 
 ---
 
@@ -357,7 +806,16 @@ fails immediately with the offending field named.
 python -m pytest -v
 ```
 
-189 tests across the six stages and the console. The ones worth knowing about:
+Tests cover the six stages and the console. The ones worth knowing about:
+
+- `tests/test_pipeline_integration.py` runs all six stages with fixture job listings,
+  real PDF parsing and compilation, offline scoring, dry-run application results,
+  SQLite deduplication, and Excel output. It also checks empty repeat runs and
+  preservation of submitted status.
+- `tests/test_browser_integration.py` exercises actual Chromium form filling,
+  resume upload and confirmation against an intercepted test page. Enable it with
+  `$env:JOB_AGENT_BROWSER_TESTS='1'; python -m pytest tests/test_browser_integration.py`.
+  It requires installed Chromium and sends no applications to employers.
 
 - `tests/test_anti_hallucination.py` — the guarantee described above
 - `tests/test_validation.py` — schema rejection and normalization rules
@@ -375,9 +833,14 @@ python -m pytest -v
   LinkedIn and Indeed work directly. Set `RESIDENTIAL_PROXY_URL` to use them.
 - **Automated CAPTCHA solving is not implemented.** Every challenge pauses for
   you, even with `CAPSOLVER_API_KEY` set.
-- **Auto-apply targets standard HTML forms.** Portals built entirely on custom
-  widgets, and LinkedIn Easy Apply, frequently need manual completion; those jobs
-  are routed to stage 6 with the reason recorded.
+- **Auto-apply targets public forms.** LinkedIn, Indeed-hosted applications and
+  account-based systems such as Workday are routed to manual apply with the link
+  and reason recorded. Portals built on custom widgets may still need finishing
+  by hand.
+- **Many large employers publish no hiring email.** Expect an address for a
+  minority of jobs from job posts and company sites alone; a Hunter.io key raises
+  that. LinkedIn gives no company website, so without Hunter.io its jobs only get
+  emails printed in the post.
 - **Years of experience is computed from your role dates**, with overlapping
   roles merged. If that disagrees with the total stated on your resume, both
   `intake` and `verify` say so rather than silently picking one.

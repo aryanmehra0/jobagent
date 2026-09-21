@@ -42,7 +42,8 @@ def test_snapshot_describes_every_phase():
 
 def test_snapshot_reports_provider_and_paths():
     snapshot = build_snapshot()
-    assert snapshot["provider"] in {"openai", "anthropic", "none"}
+    assert snapshot["provider"] in {"openai", "anthropic", "groq", "openai_compatible", "none"}
+    assert set(snapshot["llm"]["supported_providers"]) >= {"openai", "anthropic", "groq", "openai_compatible", "none"}
     assert snapshot["paths"]["outputs"]
     assert "tier1" in snapshot["thresholds"] and "fit" in snapshot["thresholds"]
 
@@ -245,7 +246,7 @@ def test_state_endpoint_returns_a_snapshot(console):
 def test_mutating_endpoints_require_the_session_token(console):
     """Without this, any page in the browser could start a run on localhost."""
     base, _ = console
-    for path in ("/api/run", "/api/config", "/api/resume", "/api/cancel"):
+    for path in ("/api/run", "/api/config", "/api/llm", "/api/resume", "/api/cancel"):
         status, _ = _request(f"{base}{path}", method="POST", body=b"{}")
         assert status == 401, f"{path} accepted an unauthenticated POST"
 
@@ -313,6 +314,32 @@ def test_config_endpoint_surfaces_validation_errors(console):
     assert "job_boards" in json.loads(body)["error"]
 
 
+def test_llm_settings_are_saved_without_returning_the_secret(tmp_path, monkeypatch):
+    from job_agent.config.settings import settings as live_settings
+    import job_agent.config.settings as settings_module
+    from job_agent.web.server import _save_llm_settings
+    from job_agent.web.state import build_snapshot
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("DEFAULT_LLM_PROVIDER=none\n", encoding="utf-8")
+    monkeypatch.setattr(settings_module, "dotenv_path", env_file)
+    monkeypatch.setattr(live_settings, "default_llm_provider", "none")
+    monkeypatch.setattr(live_settings, "groq_api_keys", live_settings.groq_api_keys.__class__(""))
+
+    provider = _save_llm_settings({
+        "provider": "groq",
+        "groq_api_keys": "gsk_test_key",
+        "groq_model": "openai/gpt-oss-120b",
+        "groq_fallback_model": "openai/gpt-oss-20b",
+    })
+
+    assert provider == "groq"
+    assert "GROQ_API_KEYS=gsk_test_key" in env_file.read_text(encoding="utf-8")
+    snapshot = build_snapshot()
+    assert snapshot["llm"]["has_keys"]["groq"] is True
+    assert "gsk_test_key" not in json.dumps(snapshot)
+
+
 def test_unknown_routes_return_404(console):
     base, _ = console
     status, _ = _request(f"{base}/api/nope")
@@ -370,6 +397,28 @@ def test_setup_flags_a_fresh_install_as_needing_a_resume(isolated_data):
     assert setup["needs_profile"] is True
     assert setup["using_sample"] is False
     assert setup["ready"] is False
+
+
+def test_tracking_state_includes_outreach_counts(isolated_data):
+    from job_agent.config.settings import settings as live_settings
+    from job_agent.config.schema import JobPosting
+    from job_agent.sourcing.delta_store import DeltaStore
+
+    store = DeltaStore(db_path=live_settings.outputs_dir / "delta_store.db")
+    job = JobPosting(
+        id="outreach-state-1",
+        title="AI Product Manager",
+        company="Acme",
+        job_url="https://acme.test/jobs/1",
+        description="Build AI products.",
+        source="greenhouse",
+    )
+    store.record_outreach("careers@acme.test", job, "Subject", "Body")
+
+    metrics = build_snapshot()["phases"]["track"]["metrics"]
+    assert metrics["Email drafts"] == 1
+    assert metrics["Unique inboxes"] == 1
+    assert metrics["Roles drafted"] == 1
 
 
 def test_setup_flags_the_bundled_sample_profile_as_demo_data(isolated_data):

@@ -57,6 +57,23 @@ class FormFiller:
 
     # --- Screening questions --------------------------------------------------
 
+    def salary_answer(self, lowered_label: str, numeric: bool = False) -> Optional[str]:
+        """The salary expectation in the form the field asks for.
+
+        A number field, or a label asking in lakhs, gets a single figure (the top
+        of the range: a form keeps one number, and the range's bottom would cap
+        the offer). A free-text field gets the range as the candidate stated it.
+        """
+        profile = self.profile
+        if profile.desired_salary is None:
+            return None
+        top = profile.desired_salary_max or profile.desired_salary
+        if "lpa" in lowered_label or "lakh" in lowered_label or "lac" in lowered_label:
+            return f"{top / 100000:g}"
+        if numeric:
+            return str(top)
+        return profile.salary_expectation_text()
+
     def answer_screening_question(self, question_text: str) -> Optional[str]:
         """Answer a screening question from profile facts, or return None if unknown.
 
@@ -68,30 +85,49 @@ class FormFiller:
         lowered = question.lower()
         authorization = self.profile.work_authorization
 
-        # Work authorization: answered from the profile, not assumed.
+        # Work authorization: answered from the profile, not assumed. A question
+        # that names no country is about the job's own location.
         if any(phrase in lowered for phrase in ("authorized to work", "legally authorized", "right to work", "eligible to work")):
-            authorized = authorization.is_authorized_in(question) or authorization.is_authorized_in(self.job.location)
+            authorized = authorization.is_authorized_in(question)
             if authorized is None:
-                # The profile lists authorized countries; if the question does not
-                # name one we cannot tell, so fall back to the general case.
-                authorized = bool(authorization.authorized_countries) and not authorization.requires_sponsorship
+                authorized = authorization.is_authorized_in(self.job.location)
+                if authorized is None and self.job.is_remote and authorization.remote_worldwide:
+                    authorized = True
+            if authorized is None:
+                return None
             return _YES if authorized else _NO
 
         if "sponsorship" in lowered or "visa" in lowered:
-            return _YES if authorization.requires_sponsorship else _NO
+            from job_agent.config.schema import location_country
+
+            place = question if location_country(question) else self.job.location
+            needed = authorization.needs_sponsorship_for(place, is_remote=self.job.is_remote and place != question)
+            if needed is None:
+                return None
+            return _YES if needed else _NO
+
+        if any(phrase in lowered for phrase in ("willing to work remote", "open to remote", "comfortable working remote")):
+            return None if authorization.remote_worldwide is None else (_YES if authorization.remote_worldwide else _NO)
+
+        if "current ctc" in lowered or "current salary" in lowered or "current compensation" in lowered:
+            # Not something the candidate has stated; never inferred from the expectation.
+            return None
 
         if "18 years" in lowered or "at least 18" in lowered or "age of 18" in lowered:
             # Derivable from the profile only if education or work history implies it;
             # every candidate with professional experience qualifies.
-            return _YES if self.profile.experience or self.profile.education else None
+            return None
 
         if "years of experience" in lowered or "years experience" in lowered:
+            if any(word in lowered for word in (" with ", " in ", " using ")):
+                return None
             return str(int(self.profile.years_of_experience))
 
-        if any(phrase in lowered for phrase in ("desired salary", "salary expectation", "expected compensation", "compensation expectation")):
-            if self.profile.desired_salary is None:
-                return None
-            return str(self.profile.desired_salary)
+        if any(phrase in lowered for phrase in (
+            "desired salary", "salary expectation", "expected salary", "expected compensation",
+            "compensation expectation", "expected ctc", "salary requirement", "expected pay",
+        )):
+            return self.salary_answer(lowered)
 
         if "notice period" in lowered or "start date" in lowered or "available to start" in lowered:
             return None
@@ -101,12 +137,9 @@ class FormFiller:
 
     def _llm_answer(self, question: str) -> Optional[str]:
         """Draft an open-ended answer from profile facts, or None if no LLM is configured."""
-        if settings.active_provider != "openai":
+        if settings.active_provider not in ("openai", "groq", "openai_compatible"):
             return None
         try:
-            from openai import OpenAI
-
-            client = OpenAI(api_key=settings.openai_api_key)
             prompt = (
                 f"Candidate: {self.profile.contact.full_name}\n"
                 f"Background: {self.profile.summary}\n"
@@ -118,8 +151,22 @@ class FormFiller:
                 "Answer in two sentences, in the first person, using ONLY the facts above. "
                 "Do not invent employers, metrics, or credentials."
             )
+            if settings.active_provider == "groq":
+                from job_agent.llm import groq_complete
+                return groq_complete("Answer only from supplied candidate facts. Do not guess.",
+                                     prompt, json_mode=False, max_tokens=512)
+            from openai import OpenAI
+            if settings.active_provider == "openai_compatible":
+                client = OpenAI(
+                    api_key=settings.openai_compatible_api_key,
+                    base_url=settings.openai_compatible_base_url,
+                )
+                model = settings.openai_compatible_model
+            else:
+                client = OpenAI(api_key=settings.openai_api_key)
+                model = settings.llm_tailor_model
             response = client.chat.completions.create(
-                model=settings.llm_tailor_model,
+                model=model,
                 temperature=0.2,
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}],
@@ -131,6 +178,18 @@ class FormFiller:
 
     # --- Field dispatch -------------------------------------------------------
 
+    @staticmethod
+    def _is_search_field(field: Dict[str, Any]) -> bool:
+        """Whether a field belongs to a site search box rather than the application."""
+        if (field.get("type") or "").lower() == "search":
+            return True
+        if (field.get("name") or "").lower() in ("q", "query", "keywords"):
+            return True
+        haystack = " ".join(
+            str(field.get(key) or "") for key in ("name", "id", "placeholder", "aria_label")
+        ).lower()
+        return any(marker in haystack for marker in ("search", "keyword", "typeahead"))
+
     def fill_field(self, field: Dict[str, Any], pdf_resume_path: Optional[Path] = None) -> bool:
         """Fill one detected form field, returning whether anything was entered."""
         locator: Locator = field["locator"]
@@ -139,6 +198,11 @@ class FormFiller:
         tag = field.get("tag", "input")
         contact = self.profile.contact
         first_name, last_name = self._split_name()
+
+        if self._is_search_field(field):
+            # Job sites put a search bar ("Location", "Keywords") above the form;
+            # filling it with profile data navigates away or corrupts the page.
+            return False
 
         try:
             if field_type == "file":
@@ -195,6 +259,23 @@ class FormFiller:
                 if not contact.portfolio_url:
                     return self._skip(label, "profile has no portfolio URL")
                 locator.fill(contact.portfolio_url)
+                return True
+
+            # --- Salary expectation ---
+            if any(token in label for token in ("expected salary", "expected ctc", "salary expectation",
+                                                 "desired salary", "expected compensation")) and tag != "select":
+                answer = self.salary_answer(label, numeric=field_type == "number")
+                if not answer:
+                    return self._skip(label, "no salary expectation in profile")
+                locator.fill(answer)
+                return True
+
+            # --- Country of residence ---
+            if label.strip("* ") in ("country", "country of residence", "current country") and tag != "select":
+                country = self.profile.work_authorization.current_country
+                if not country or country == "Unspecified":
+                    return self._skip(label, "profile has no country")
+                locator.fill(country)
                 return True
 
             # --- Dropdowns ---

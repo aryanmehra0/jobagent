@@ -1,0 +1,107 @@
+"""Portable, auditable application pack with relative CSV and HTML links."""
+from __future__ import annotations
+
+import csv
+import hashlib
+import html
+import io
+import json
+from pathlib import Path
+from zipfile import ZipFile, ZIP_DEFLATED
+
+from job_agent.config.settings import settings
+from job_agent.runtime import exclusive_run
+from job_agent.tracking.export import COLUMNS, JobsCsvExporter, _read_json, spreadsheet_text
+
+
+@exclusive_run
+def build_application_pack(outputs_dir: Path | None = None) -> Path:
+    out = Path(outputs_dir or settings.outputs_dir).resolve()
+    exporter = JobsCsvExporter(outputs_dir=out, csv_path=out / "jobs_master.csv")
+    exporter.export()
+    rows = list(exporter.load().values())
+    manifest = {item["job_id"]: item for item in _read_json(out / "tailored_resumes/manifest.json", [])
+                if isinstance(item, dict) and item.get("job_id")}
+    profile = _read_json(settings.profile_path, {})
+    profile_hash = profile.get("profile_hash")
+    target = out / "application_pack.zip"
+    temporary = out / "application_pack.zip.tmp"
+    included, skipped, links = [], [], []
+    try:
+        with ZipFile(temporary, "w", ZIP_DEFLATED) as archive:
+            for row in rows:
+                job_id = row.get("Job ID", "")
+                record = manifest.get(job_id, {})
+                # Never trust a path from a CSV or archived manifest outside this folder.
+                pdf = (out / "tailored_resumes" / f"resume_{job_id}.pdf").resolve()
+                pdf_link = ""
+                if record and pdf.parent == out / "tailored_resumes" and pdf.is_file():
+                    contents = pdf.read_bytes()
+                    audit = _read_json(pdf.with_suffix(".ats.json"), {})
+                    valid = record.get("validation_passed") is True or (
+                        record.get("validation_passed") is None and audit.get("passed") is True)
+                    same_profile = bool(profile_hash) and record.get("profile_hash") == profile_hash
+                    digest = hashlib.sha256(contents).hexdigest()
+                    if valid and same_profile and digest == record.get("pdf_sha256"):
+                        pdf_link = f"resumes/{pdf.name}"
+                        archive.writestr(pdf_link, contents)
+                        included.append({"job_id": job_id, "file": pdf_link, "sha256": digest})
+                if row.get("Tailored Resume") and not pdf_link:
+                    skipped.append({"job_id": job_id, "reason": "No current, validated PDF matching this profile and manifest hash."})
+                    row["Resume Check"] = "Not included in pack: no current validated PDF matching the active profile and manifest."
+                row["Tailored Resume Path"] = pdf_link
+                row["Open Resume"] = pdf_link
+                row["Tailored Resume"] = pdf_link
+                # Drafts can contain old attachments; the pack provides the current verified PDF separately.
+                row["Email Draft File"] = ""
+                escape = html.escape
+                url = row.get("Apply URL") or row.get("Job URL") or ""
+                apply = f'<a href="{escape(url, quote=True)}">Apply</a>' if url.startswith(("https://", "http://")) else ""
+                resume = f'<a href="{escape(pdf_link)}">PDF</a>' if pdf_link else "Not included"
+                links.append("<tr>" + "".join(f"<td>{escape(str(row.get(col, '')))}</td>" for col in
+                             ("Title", "Company", "Location", "Fit Score", "HR / Careers Email", "Remote Eligibility"))
+                             + f"<td>{apply}</td><td>{resume}</td></tr>")
+            sheet = io.StringIO(newline="")
+            writer = csv.DictWriter(sheet, fieldnames=COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows({col: spreadsheet_text(row.get(col, "")) for col in COLUMNS} for row in rows)
+            archive.writestr("jobs.csv", sheet.getvalue().encode("utf-8-sig"))
+            latest_sheet = io.StringIO(newline="")
+            latest_writer = csv.DictWriter(latest_sheet, fieldnames=COLUMNS, extrasaction="ignore")
+            latest_writer.writeheader()
+            latest_writer.writerows({col: spreadsheet_text(row.get(col, "")) for col in COLUMNS}
+                                   for row in rows if row.get("Search Batch") == "Current search")
+            archive.writestr("jobs_latest.csv", latest_sheet.getvalue().encode("utf-8-sig"))
+            ready_sheet = io.StringIO(newline="")
+            ready_writer = csv.DictWriter(ready_sheet, fieldnames=COLUMNS, extrasaction="ignore")
+            ready_writer.writeheader()
+            ready_writer.writerows({col: spreadsheet_text(row.get(col, "")) for col in COLUMNS}
+                                  for row in rows if row.get("Application Readiness") == "Ready for your review"
+                                  and row.get("Tailored Resume"))
+            archive.writestr("applications_ready.csv", ready_sheet.getvalue().encode("utf-8-sig"))
+            archive.writestr("index.html", '<!doctype html><html lang="en"><meta charset="utf-8">'
+                             '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                             '<title>Your application pack</title><style>body{font:15px system-ui;margin:32px;color:#17253d}'
+                             'table{border-collapse:collapse;width:100%}td,th{padding:12px;text-align:left;border-bottom:1px solid #ddd}'
+                             'a{color:#155ac0}</style><h1>Your application pack</h1>'
+                             '<p>Extract the entire ZIP first. Open jobs.csv in Excel or use the links below. '
+                             'Published emails are not deliverability verified. Check the live job before applying.</p>'
+                             '<table><thead><tr><th>Role</th><th>Company</th><th>Location</th><th>Fit</th>'
+                             '<th>Contact</th><th>Eligibility</th><th>Job</th><th>Resume</th></tr></thead><tbody>'
+                             + "".join(links) + '</tbody></table></html>')
+            archive.writestr("manifest.json", json.dumps({"jobs": len(rows), "pdfs": included, "omitted_pdfs": skipped}, indent=2))
+            archive.writestr("README.txt", "Extract all files before opening index.html or jobs.csv.\n"
+                             "CSV cannot embed attachments; the resumes folder contains the matching PDFs.\n"
+                             "Only current, hash-checked PDFs for the active profile are included. See manifest.json for omissions.\n"
+                             "Emails are published/provider-supplied contacts, not guaranteed recipients or deliverable inboxes.\n"
+                             "No applications or emails have been sent by creating this download.\n")
+            coverage = out / "source_coverage.json"
+            if coverage.is_file():
+                archive.write(coverage, "source_coverage.json")
+            report = out / "run_report.json"
+            if report.is_file():
+                archive.write(report, "run_report.json")
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return target

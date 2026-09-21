@@ -49,7 +49,15 @@ class ColdEmailGenerator:
     def _call_openai(self, profile: CandidateProfile, job: JobPosting, fit_score: float) -> str:
         """Synthesize cold email via OpenAI."""
         from openai import OpenAI
-        client = OpenAI(api_key=settings.openai_api_key)
+        if self.provider == "openai_compatible":
+            client = OpenAI(
+                api_key=settings.openai_compatible_api_key,
+                base_url=settings.openai_compatible_base_url,
+            )
+            model = settings.openai_compatible_model
+        else:
+            client = OpenAI(api_key=settings.openai_api_key)
+            model = settings.llm_tailor_model
 
         prompt = (
             f"=== TARGET JOB ===\n"
@@ -68,7 +76,7 @@ class ColdEmailGenerator:
         )
 
         response = client.chat.completions.create(
-            model=settings.llm_tailor_model,
+            model=model,
             temperature=0.3,
             messages=[
                 {"role": "system", "content": COLD_EMAIL_SYSTEM_PROMPT},
@@ -102,7 +110,7 @@ class ColdEmailGenerator:
         )
         return response.content[0].text.strip()
 
-    def _heuristic_email(self, profile: CandidateProfile, job: JobPosting) -> str:
+    def _heuristic_email(self, profile: CandidateProfile, job: JobPosting, selected=None) -> str:
         """Deterministic outreach template built only from verified candidate facts.
 
         Every highlight comes from a locked fact or a listed skill. Where the
@@ -110,39 +118,43 @@ class ColdEmailGenerator:
         generic claim ("impressed by your work", "high-availability environments")
         that the candidate never made and cannot defend in an interview.
         """
-        highlights: List[str] = []
+        from job_agent.config.normalize import dedupe_preserving_order
+        from job_agent.tailoring.rewriter import job_terms, relevance, skill_in_posting
 
-        locked = profile.all_locked_facts()
-        if locked:
-            highlights.extend(fact.statement for fact in locked[:2])
-        elif profile.experience and profile.experience[0].description_bullets:
-            highlights.append(profile.experience[0].description_bullets[0])
+        evidence = dedupe_preserving_order(
+            [fact.statement for fact in profile.all_locked_facts()]
+            + [bullet for role in profile.experience for bullet in role.description_bullets]
+        )
+        ranked = sorted(
+            enumerate(evidence),
+            key=lambda item: (-relevance(item[1], job_terms(job)), item[0]),
+        )
+        highlights = list(selected or [item for _, item in ranked[:3]])
 
-        top_skills = profile.skills.all_skills()[:6]
-        if top_skills:
-            highlights.append("Core stack: " + ", ".join(top_skills))
-        if profile.years_of_experience:
-            highlights.append(f"{profile.years_of_experience:g} years of professional experience")
+        matching_skills = [
+            skill for skill in profile.skills.all_skills() if skill_in_posting(skill, job)
+        ][:5]
 
         contact_line = " | ".join(
             part for part in (profile.contact.email, profile.contact.phone) if part
         )
 
         lines = [
-            f"Subject: {job.title} — {profile.contact.full_name}",
+            f"Subject: Application for {job.title} at {job.company} | {profile.contact.full_name}",
             "",
             f"Hi {job.company} Hiring Team,",
             "",
-            f"I came across the {job.title} role at {job.company} and wanted to reach out directly.",
+            f"I am applying for the {job.title} role at {job.company}. My background aligns with the role"
+            + (f" through {', '.join(matching_skills)}." if matching_skills else "."),
             "",
         ]
         if highlights:
-            lines.append("A few relevant highlights from my background:")
+            lines.append("Relevant evidence from my resume:")
             lines.extend(f"• {item}" for item in highlights)
             lines.append("")
         lines.extend([
-            "My tailored resume is attached. If you are open to it, I would welcome a brief "
-            "10-15 minute conversation about how I could contribute.",
+            "I have attached an ATS-friendly resume tailored to the posted requirements. "
+            "Would you be open to a 15-minute conversation about the team's priorities for this role?",
             "",
             "Best regards,",
             profile.contact.full_name,
@@ -156,11 +168,30 @@ class ColdEmailGenerator:
 
     def generate_email(self, profile: CandidateProfile, job: JobPosting, fit_score: float = 8.0) -> str:
         """Generate a personalized cold outreach email for the target job."""
-        if self.provider == "openai":
+        if self.provider == "groq":
+            from job_agent.llm import groq_complete
+            try:
+                evidence = [bullet for role in profile.experience for bullet in role.description_bullets]
+                selection = groq_complete(
+                    'Select up to three relevant candidate achievements for this job. Return JSON {"indices": [0, 1]}. Use only indices from the supplied evidence.',
+                    f"Evidence: {json.dumps(list(enumerate(evidence)))}\n"
+                    f"Target role: {job.title} at {job.company}\n{job.description[:3000]}",
+                    max_tokens=2048,
+                )
+                indices = selection.get("indices", [])
+                if not isinstance(indices, list) or any(type(i) is not int or not 0 <= i < len(evidence) for i in indices):
+                    raise ValueError("Groq returned invalid outreach evidence indices.")
+                chosen = [evidence[i] for i in dict.fromkeys(indices)][:3]
+                return self._heuristic_email(profile, job, selected=chosen)
+            except Exception:
+                if settings.llm_strict:
+                    raise
+                console.print("[yellow]Groq outreach unavailable; using verified template.[/yellow]")
+        if self.provider in ("openai", "openai_compatible"):
             try:
                 return self._call_openai(profile, job, fit_score)
             except Exception as e:
-                console.print(f"[yellow]OpenAI email generation note: {e}. Using deterministic synthesis.[/yellow]")
+                console.print(f"[yellow]{self.provider} email generation note: {e}. Using deterministic synthesis.[/yellow]")
         elif self.provider == "anthropic":
             try:
                 return self._call_anthropic(profile, job, fit_score)

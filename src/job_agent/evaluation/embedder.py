@@ -27,6 +27,8 @@ class SemanticEmbedder:
 
     def _get_encoder(self):
         """Lazy loader for sentence-transformers model with TF-IDF fallback."""
+        if self._use_fallback:
+            return None
         if self._encoder is not None:
             return self._encoder
 
@@ -75,7 +77,14 @@ class SemanticEmbedder:
         The description is trimmed to bound memory and encode time; the title and
         company carry most of the signal and are always included in full.
         """
-        return f"{job.title} at {job.company}. Location: {job.location}. {job.description[:1500]}"
+        # ATS feeds often begin with company boilerplate. Put requirements first
+        # so transformer truncation and TF-IDF both see the actual role criteria.
+        import re
+        match = re.search(r"minimum requirements|what you.bring|qualifications|requirements|who you are",
+                          job.description, flags=re.IGNORECASE)
+        start = match.start() if match else 0
+        context = job.description[start:start + 5000]
+        return f"{job.title} at {job.company}. Location: {job.location}. {context}"
 
     def compute_similarity(self, candidate_text: str, job_texts: List[str]) -> List[float]:
         """Compute cosine similarity scores between candidate vector and job vectors."""

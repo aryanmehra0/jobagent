@@ -24,10 +24,12 @@ from rich.console import Console
 
 from job_agent.config.schema import ApplicationOutcome, CandidateProfile, JobPosting
 from job_agent.config.settings import settings
+from job_agent.runtime import RunCancelled, check_cancelled
 from job_agent.automation.browser_session import BrowserSessionManager
 from job_agent.automation.form_filler import FormFiller
 from job_agent.automation.hitl import ChallengeHandler
 from job_agent.automation.navigator import DOMNavigator
+from job_agent.automation.routing import route_application
 from job_agent.sourcing.delta_store import DeltaStore
 
 console = Console()
@@ -78,8 +80,14 @@ class AutoApplyAgent:
         Returns a validated `ApplicationOutcome` as a dict.
         """
         console.print(f"\n[bold cyan]=== Auto-apply: {job.title} @ {job.company} ===[/bold cyan]")
-        console.print(f"Portal : {job.job_url}")
+        route = route_application(job)
+        console.print(f"Portal : {route.url}  [dim]({route.channel})[/dim]")
         console.print(f"Resume : {pdf_resume_path}")
+
+        if not route.automatable:
+            console.print(f"[yellow]Manual apply needed: {route.reason}[/yellow]")
+            return self._outcome(job, "skipped", 0, fit_score, route.reason, pdf_resume_path,
+                                 route=route, record=not dry_run)
 
         if dry_run:
             console.print("[yellow]Dry run: no browser launched, nothing submitted.[/yellow]")
@@ -93,11 +101,14 @@ class AutoApplyAgent:
                 fit_score=fit_score,
                 error=None,
                 pdf_path=str(pdf_resume_path),
+                apply_url=route.url,
+                channel=route.channel,
             ).model_dump()
 
         if not Path(pdf_resume_path).exists():
             return self._outcome(
-                job, "failed", 0, fit_score, f"Tailored resume not found: {pdf_resume_path}", pdf_resume_path
+                job, "failed", 0, fit_score, f"Tailored resume not found: {pdf_resume_path}", pdf_resume_path,
+                route=route,
             )
 
         page = self.session_mgr.new_stealth_page()
@@ -108,13 +119,15 @@ class AutoApplyAgent:
         consecutive_errors = 0
         submitted = False
         submit_attempted = False
+        cancelled = False
         error_message: Optional[str] = None
 
         try:
-            if not navigator.navigate_to_url(job.job_url):
-                raise RuntimeError(f"Could not reach the application portal: {job.job_url}")
+            if not navigator.navigate_to_url(route.url):
+                raise RuntimeError(f"Could not reach the application portal: {route.url}")
 
             while steps < self.max_steps:
+                self._check_between_steps(submit_attempted)
                 steps += 1
                 console.print(f"[dim]Step {steps}/{self.max_steps}: inspecting page...[/dim]")
 
@@ -147,6 +160,10 @@ class AutoApplyAgent:
                 if not submit_attempted:
                     submit_button = navigator.find_action_button("submit")
                     if submit_button:
+                        invalid = page.locator("input:invalid, select:invalid, textarea:invalid")
+                        if invalid.count():
+                            error_message = "Required fields are missing or invalid; complete them manually before submission."
+                            break
                         console.print("  - Submitting application...")
                         submit_attempted = True
                         submit_button.click()
@@ -176,6 +193,10 @@ class AutoApplyAgent:
             if steps >= self.max_steps and not submitted and error_message is None:
                 error_message = f"Reached the {self.max_steps}-step ceiling without a confirmation."
 
+        except RunCancelled:
+            error_message = "Stopped by user before this application was submitted."
+            console.print(f"[yellow]{error_message}[/yellow]")
+            cancelled = True
         except Exception as exc:
             error_message = str(exc)
             console.print(f"[red]Auto-apply error: {error_message}[/red]")
@@ -190,6 +211,11 @@ class AutoApplyAgent:
             except Exception:
                 pass
 
+        if cancelled:
+            # Nothing was submitted, so there is no outcome to record. Re-raising
+            # ends the batch; the pipeline still persists every earlier outcome.
+            raise RunCancelled("Stopped by user.")
+
         return self._outcome(
             job,
             "applied" if submitted else "failed",
@@ -197,7 +223,19 @@ class AutoApplyAgent:
             fit_score,
             error_message,
             pdf_resume_path,
+            route=route,
         )
+
+    @staticmethod
+    def _check_between_steps(submit_attempted: bool) -> None:
+        """Honour Stop between steps, but never once Submit has been clicked.
+
+        After the click the application may already be with the employer. Stopping
+        then would record it as failed — or not at all — so the job runs on until
+        its real outcome is detected and written down.
+        """
+        if not submit_attempted:
+            check_cancelled()
 
     def _outcome(
         self,
@@ -207,9 +245,12 @@ class AutoApplyAgent:
         fit_score: Optional[float],
         error: Optional[str],
         pdf_path: Path | str,
+        route=None,
+        record: bool = True,
     ) -> Dict[str, Any]:
         """Record the terminal status in the delta store and return it as a dict."""
-        self.delta_store.update_status(job.id, status)
+        if record:
+            self.delta_store.update_status(job.id, status)
         return ApplicationOutcome(
             job_id=job.id,
             title=job.title,
@@ -220,4 +261,6 @@ class AutoApplyAgent:
             fit_score=fit_score,
             error=error,
             pdf_path=str(pdf_path),
+            apply_url=route.url if route else job.apply_url,
+            channel=route.channel if route else None,
         ).model_dump()

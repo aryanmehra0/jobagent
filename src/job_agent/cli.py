@@ -1,4 +1,4 @@
-"""Autonomous AI job search and application agent - command line interface.
+﻿"""Autonomous AI job search and application agent - command line interface.
 
 Each phase is a subcommand that reads the previous phase's artifact from
 `data/outputs/` and writes its own, so phases can be run individually, re-run, or
@@ -19,6 +19,7 @@ for _stream in (sys.stdout, sys.stderr):
             pass
 
 from pathlib import Path
+import shutil
 from typing import Optional
 
 import click
@@ -27,6 +28,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from job_agent.config.settings import settings
+from job_agent.runtime import exclusive_run
 from job_agent.intake.cli import configure_cli, load_search_parameters
 from job_agent.intake.validator import describe_profile_gaps, load_and_verify_profile
 
@@ -49,13 +51,271 @@ def _require(path: Path, what: str, hint: str) -> None:
 
 @click.group()
 @click.version_option("0.2.0", prog_name="job-agent")
-def cli() -> None:
+@click.pass_context
+def cli(ctx: click.Context) -> None:
     """Autonomous AI job search and application agent."""
+    import time
+    from datetime import datetime, timezone
+
+    # When this phase started, for the run history kept in the jobs database.
+    ctx.obj = {"started_at": datetime.now(timezone.utc).isoformat(), "clock": time.perf_counter()}
 
 
 # ==============================================================================
 # PHASE 1: INTAKE & PARAMETERIZATION
 # ==============================================================================
+
+_PHASE_COMMANDS = {"source", "evaluate", "tailor", "apply", "track", "run-pipeline"}
+
+
+@cli.result_callback()
+@click.pass_context
+def _refresh_jobs_sheet(ctx: click.Context, *_: object, **__: object) -> None:
+    """Keep the jobs sheet and the database current after any phase that changes the artifacts."""
+    if ctx.invoked_subcommand not in _PHASE_COMMANDS:
+        return
+    if ctx.invoked_subcommand == "run-pipeline":
+        return  # The shared runner exports after each phase and publishes the ZIP.
+    import time
+    from datetime import datetime, timezone
+
+    from job_agent.storage.jobs_db import record_phase
+    from job_agent.workflow import publish_outputs
+
+    stats = publish_outputs(bundle=True)
+    for warning in stats["warnings"]:
+        console.print(f"[yellow]{warning}[/yellow]")
+    started = (ctx.obj or {}).get("started_at")
+    record_phase(
+        ctx.invoked_subcommand, "warning" if stats["warnings"] else "ok", started_at=started,
+        finished_at=datetime.now(timezone.utc).isoformat(),
+        duration_seconds=round(time.perf_counter() - (ctx.obj or {}).get("clock", time.perf_counter()), 2),
+        summary=stats, started_from="cli",
+    )
+
+
+@cli.group("db")
+def db_group() -> None:
+    """Query the database of jobs the agent has fetched."""
+
+
+@db_group.command("sync")
+def db_sync_command() -> None:
+    """Rebuild the jobs database from the current artifacts."""
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    database = JobsDatabase()
+    try:
+        stats = database.sync()
+    except Exception as exc:
+        _fail(f"Database sync failed: {exc}")
+    console.print(
+        f"[bold green]Synced[/bold green] {stats['jobs']} job(s), {stats['contacts']} contact email(s) "
+        f"and {stats['outreach']} outreach draft(s) to [yellow]{database.location}[/yellow]"
+    )
+
+
+@db_group.command("stats")
+def db_stats_command() -> None:
+    """Show what the database knows: jobs by stage, source and contact coverage."""
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    try:
+        summary = JobsDatabase().stats()
+    except Exception as exc:
+        _fail(f"Could not read the database: {exc}")
+
+    console.print(f"[bold cyan]Jobs database[/bold cyan] ({summary['backend']}): {summary['location']}\n")
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Measure", style="cyan")
+    table.add_column("Value", justify="right")
+    table.add_row("Jobs stored", str(summary["jobs"]))
+    table.add_row("With a contact email", str(summary["jobs_with_email"]))
+    table.add_row("With an HR / careers email", str(summary["jobs_with_hiring_email"]))
+    table.add_row("Outreach drafts", str(summary["outreach_drafts"]))
+    for stage, count in sorted(summary["by_status"].items(), key=lambda item: -item[1]):
+        table.add_row(f"Stage: {stage}", str(count))
+    for source, count in sorted(summary["by_source"].items(), key=lambda item: -item[1]):
+        table.add_row(f"Source: {source}", str(count))
+    for company, count in summary["top_companies"].items():
+        table.add_row(f"Company: {company}", str(count))
+    console.print(table)
+
+
+@db_group.command("jobs")
+@click.option("--limit", "-n", type=click.IntRange(1), default=20, help="How many jobs to show.")
+@click.option("--status", help="Only this stage, e.g. qualified, tailored, manual_apply.")
+@click.option("--company", help="Match part of a company name.")
+@click.option("--with-email", is_flag=True, help="Only jobs that have a contact email.")
+@click.option("--min-score", type=float, help="Only jobs at or above this fit score.")
+def db_jobs_command(limit, status, company, with_email, min_score) -> None:
+    """List fetched jobs with their emails and apply routes."""
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    try:
+        rows = JobsDatabase().jobs(limit=limit, status=status, company=company,
+                                   with_email=with_email, min_score=min_score)
+    except Exception as exc:
+        _fail(f"Could not read the database: {exc}")
+    if not rows:
+        console.print("[yellow]No jobs matched.[/yellow] Run a search first: python main.py source")
+        return
+
+    table = Table(show_header=True, header_style="bold magenta")
+    for column in ("Fit", "Role", "Company", "Location", "Email", "Apply", "Stage"):
+        table.add_column(column, overflow="fold")
+    for row in rows:
+        score = row.get("fit_score")
+        table.add_row(
+            "-" if score is None else f"{float(score):.1f}",
+            str(row.get("title") or "")[:40], str(row.get("company") or "")[:24],
+            str(row.get("location") or "")[:22], str(row.get("contact_email") or "-"),
+            str(row.get("apply_method") or "").replace("_", " "), str(row.get("status") or ""),
+        )
+    console.print(table)
+
+
+@db_group.command("resume")
+@click.argument("job_id")
+@click.option("--out", "-o", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Where to save the PDF (default: your Downloads folder).")
+def db_resume_command(job_id: str, out) -> None:
+    """Save the tailored resume stored in the database for a job, ready to attach."""
+    import hashlib
+
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    stored = JobsDatabase().resume_pdf(job_id)
+    if stored is None:
+        _fail(f"No tailored resume stored for job {job_id}.", "Run: python main.py db sync")
+    if hashlib.sha256(stored["pdf"]).hexdigest() != stored["sha256"]:
+        _fail("The stored resume does not match its checksum; run: python main.py db sync")
+    target = out or (Path.home() / "Downloads" / stored["file_name"])
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(stored["pdf"])
+    console.print(f"[bold green]Saved[/bold green] {target} ({len(stored['pdf']):,} bytes)")
+    if stored.get("resume_check"):
+        console.print(f"Check: {stored['resume_check']}")
+
+
+@db_group.command("query")
+@click.argument("sql")
+@click.option("--limit", "-n", type=click.IntRange(1), default=50, help="Rows to print (default 50).")
+@click.option("--csv", "csv_out", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Write the full result to a CSV file instead of printing it.")
+def db_query_command(sql: str, limit: int, csv_out) -> None:
+    """Run a read-only SQL query against the jobs database.
+
+    Example: python main.py db query "SELECT company, contact_email FROM job_overview WHERE fit_score >= 7"
+    """
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    statement = sql.strip().rstrip(";")
+    if not statement.lower().startswith(("select", "with")):
+        _fail("Only SELECT queries are allowed here.",
+              "The database is rebuilt by the pipeline; edit jobs through the agent, not by hand.")
+
+    database = JobsDatabase()
+    try:
+        with database._connect() as conn:
+            rows = [dict(row) for row in conn.execute(database._sql(statement)).fetchall()]
+    except Exception as exc:
+        _fail(f"Query failed: {exc}")
+
+    if not rows:
+        console.print("[yellow]No rows.[/yellow]")
+        return
+
+    if csv_out:
+        import csv as csv_module
+
+        csv_out.parent.mkdir(parents=True, exist_ok=True)
+        with csv_out.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv_module.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+        console.print(f"[bold green]Wrote {len(rows)} row(s) to[/bold green] [yellow]{csv_out}[/yellow]")
+        return
+
+    table = Table(show_header=True, header_style="bold magenta")
+    for column in rows[0]:
+        table.add_column(str(column), overflow="fold")
+    for row in rows[:limit]:
+        table.add_row(*["" if value is None else str(value)[:60] for value in row.values()])
+    console.print(table)
+    if len(rows) > limit:
+        console.print(f"[dim]{len(rows) - limit} more row(s); raise --limit or use --csv.[/dim]")
+
+
+@cli.command("preferences")
+@click.option("--country", help="Country you live in, e.g. India.")
+@click.option("--authorized", help="Countries you may work in without a visa, comma separated.")
+@click.option("--sponsorship/--no-sponsorship", default=None,
+              help="Whether you need visa sponsorship to work in other countries.")
+@click.option("--remote-worldwide/--no-remote-worldwide", default=None,
+              help="Open to remote jobs with employers in any country.")
+@click.option("--salary", type=int, help="Expected yearly salary (bottom of range), e.g. 1000000.")
+@click.option("--salary-max", type=int, help="Top of the expected salary range, e.g. 1400000.")
+@click.option("--currency", help="Salary currency, e.g. INR.")
+def preferences_command(country, authorized, sponsorship, remote_worldwide, salary, salary_max, currency) -> None:
+    """Set country, work authorization, sponsorship and salary (kept across resume uploads)."""
+    from job_agent.intake.preferences import load_preferences, save_preferences
+
+    current = load_preferences()
+    values = current.model_dump() if current else {}
+    updates = {
+        "current_country": country, "authorized_countries": authorized, "requires_sponsorship": sponsorship,
+        "remote_worldwide": remote_worldwide, "desired_salary": salary, "desired_salary_max": salary_max,
+        "salary_currency": currency,
+    }
+    values.update({key: value for key, value in updates.items() if value is not None})
+    try:
+        profile = save_preferences(values)
+    except Exception as exc:
+        _fail(f"Could not save preferences: {exc}")
+    auth = profile.work_authorization
+    console.print("[bold green]Preferences saved to your profile.[/bold green]")
+    console.print(f"  Country        : {auth.current_country}")
+    console.print(f"  Authorized in  : {', '.join(auth.authorized_countries) or 'not stated'}")
+    console.print(f"  Sponsorship    : {'needed abroad' if auth.requires_sponsorship else 'not needed' if auth.requires_sponsorship is False else 'not stated'}")
+    console.print(f"  Remote anywhere: {auth.remote_worldwide}")
+    console.print(f"  Salary         : {profile.salary_expectation_text() or 'not stated'}")
+
+
+@cli.command("export")
+@click.option("--bundle", is_flag=True, help="Create a portable ZIP with CSV, verified PDFs and a clickable index.")
+@click.option(
+    "--output", "-o",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help="Where to write the CSV (default: data/outputs/jobs_master.csv).",
+)
+def export_command(output: Optional[Path], bundle: bool = False) -> None:
+    """Write every found job, with contact emails and apply links, to a CSV sheet."""
+    from job_agent.tracking.export import JobsCsvExporter
+
+    if bundle:
+        from job_agent.tracking.bundle import build_application_pack
+        try:
+            path = build_application_pack()
+            if output and output.resolve() != path.resolve():
+                output.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, output)
+                path = output
+        except Exception as exc:
+            _fail(f"Pack export failed: {exc}")
+        console.print(f"[bold green]Application pack:[/bold green] {path}")
+        return
+
+    try:
+        path = JobsCsvExporter(csv_path=output).export()
+    except Exception as exc:
+        _fail(f"Export failed: {exc}")
+    import csv
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = sum(1 for _ in csv.DictReader(handle))
+    console.print(f"[bold green]Exported {rows} job(s) to[/bold green] [yellow]{path}[/yellow]")
+
 
 @cli.command("intake")
 @click.option(
@@ -318,17 +578,33 @@ def evaluate_command(
 # ==============================================================================
 
 @cli.command("tailor")
+@click.option("--mode", type=click.Choice(["auto", "faithful", "generated", "regional"]), default=None)
+@click.option("--country", default=None, help="Override the resume's target market, e.g. India or UK.")
 @click.option("--job-id", "-j", default=None, help="Tailor for one job ID (default: all qualified).")
 @click.option("--profile", "-p", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
 @click.option("--qualified", "-q", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
 @click.option("--limit", "-n", type=click.IntRange(1), default=None, help="Tailor only the top N by fit score.")
+@click.option("--rebuild-existing", is_flag=True,
+              help="Re-tailor every job that already has a resume listed (this batch and earlier ones).")
 def tailor_command(
-    job_id: Optional[str], profile: Optional[Path], qualified: Optional[Path], limit: Optional[int]
+    job_id: Optional[str], profile: Optional[Path], qualified: Optional[Path], limit: Optional[int],
+    rebuild_existing: bool, mode: Optional[str] = None, country: Optional[str] = None,
 ) -> None:
-    """Phase 4: dynamic resume tailoring and Typst ATS PDF compilation."""
+    """Phase 4: tailor your resume for each qualified job, and validate every PDF."""
     from job_agent.tailoring.pipeline import ResumeTailoringPipeline
 
     profile_path = profile or settings.profile_path
+    if rebuild_existing:
+        _require(profile_path, "profile.json", "Run: python main.py intake --resume <pdf>")
+        try:
+            summary = ResumeTailoringPipeline().rebuild_existing(profile_path=profile_path)
+        except Exception as exc:
+            _fail(f"Rebuild failed: {exc}")
+        console.print(
+            f"[bold green]Rebuilt {summary['rebuilt']} resume(s)[/bold green], "
+            f"{summary['passed']} passed every check."
+        )
+        return
     qualified_path = qualified or (settings.outputs_dir / "qualified_jobs.json")
     _require(profile_path, "profile.json", "Run: python main.py intake --resume <pdf>")
     _require(qualified_path, "qualified_jobs.json", "Run: python main.py evaluate")
@@ -339,6 +615,8 @@ def tailor_command(
             qualified_jobs_path=qualified_path,
             specific_job_id=job_id,
             limit=limit,
+            mode=mode,
+            country=country,
         )
     except Exception as exc:
         _fail(f"Tailoring failed: {exc}")
@@ -392,11 +670,13 @@ def track_command(track_all: bool) -> None:
 
 @cli.command("run-pipeline")
 @click.option("--resume", "-r", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
-@click.option("--dry-run", is_flag=True, help="Run every phase but never submit an application.")
+@click.option("--dry-run/--live", default=True, help="Default: prepare results without submitting. --live enables applications.")
+@click.option("--mode", type=click.Choice(["auto", "faithful", "generated", "regional"]), default="regional", show_default=True)
 @click.option("--skip-intake", is_flag=True, help="Reuse the existing profile.json instead of re-parsing a resume.")
 @click.option("--threshold", "-t", type=click.FloatRange(0.0, 1.0), default=None, help="Tier 1 cutoff.")
 @click.option("--limit", "-n", type=click.IntRange(1), default=None, help="Cap jobs per phase after evaluation.")
 @click.option("--yes", "assume_yes", is_flag=True, help="Skip the live-submission confirmation prompt.")
+@exclusive_run
 def run_pipeline_command(
     resume: Optional[Path],
     dry_run: bool,
@@ -404,18 +684,14 @@ def run_pipeline_command(
     threshold: Optional[float],
     limit: Optional[int],
     assume_yes: bool,
+    mode: str = "regional",
 ) -> None:
     """Run phases 1 through 6 end to end.
 
     A phase that produces nothing stops the run cleanly rather than letting the
     next phase fail on a missing artifact.
     """
-    from job_agent.automation.pipeline import AutoApplyPipeline
-    from job_agent.evaluation.pipeline import SemanticEvaluationPipeline
-    from job_agent.intake.parser import ResumeParser
-    from job_agent.sourcing.scraper import OmnichannelScraper
-    from job_agent.tailoring.pipeline import ResumeTailoringPipeline
-    from job_agent.tracking.pipeline import FallbackTrackingPipeline
+    from job_agent.web.runner import PipelineRunner
 
     console.print(
         Panel.fit(
@@ -426,48 +702,26 @@ def run_pipeline_command(
         )
     )
 
-    try:
-        # --- Phase 1 ---
-        if not skip_intake:
-            source_pdf = resume or next(iter(sorted(settings.raw_resumes_dir.glob("*.pdf"))), None)
-            if source_pdf:
-                ResumeParser().parse(pdf_path=source_pdf, output_path=settings.profile_path)
-            elif not settings.profile_path.exists():
-                _fail("No resume PDF found and no existing profile.json.", "Pass --resume <path.pdf>.")
+    phases = ["source", "evaluate", "tailor", "apply", "track"]
+    if not skip_intake:
+        phases.insert(0, "intake")
+    else:
         _require(settings.profile_path, "profile.json", "Run: python main.py intake --resume <pdf>")
-        _require(settings.searches_path, "searches.yaml", "Run: python main.py configure")
-
-        # --- Phase 2 ---
-        params = load_search_parameters(settings.searches_path)
-        sourced = OmnichannelScraper(search_params=params).run_sourcing_pipeline()
-        if not sourced:
-            console.print("[yellow]No novel jobs found; stopping here.[/yellow]")
-            return
-
-        # --- Phase 3 ---
-        _, qualified = SemanticEvaluationPipeline().run_evaluation(
-            tier1_threshold=threshold, limit=limit
-        )
-        if not qualified:
-            console.print("[yellow]No jobs met the fit threshold; stopping here.[/yellow]")
-            return
-
-        # --- Phase 4 ---
-        tailored = ResumeTailoringPipeline().run_tailoring(limit=limit)
-        if not tailored:
-            console.print("[yellow]No resumes were compiled; stopping here.[/yellow]")
-            return
-
-        # --- Phase 5 ---
-        AutoApplyPipeline().run_applications(dry_run=dry_run, limit=limit, assume_yes=assume_yes)
-
-        # --- Phase 6 ---
-        FallbackTrackingPipeline().process_fallbacks(force_track_all=True)
-    except Exception as exc:
-        _fail(f"Pipeline halted: {exc}")
-
-    console.print("\n[bold green]Pipeline complete.[/bold green] Review the tracker for next steps:")
-    console.print(f"  [yellow]{settings.tracker_path}[/yellow]")
+    result = PipelineRunner().run_sync(phases, {
+        "resume": str(resume) if resume else None, "dry_run": dry_run,
+        "threshold": threshold, "limit": limit, "tailoring_mode": mode,
+        "track_all": True, "assume_yes": assume_yes, "started_from": "cli",
+    })
+    report = result.get("report", {})
+    console.print(f"\nPipeline status: [bold]{result.get('status', 'error')}[/bold]")
+    if report.get("halt_reason"):
+        console.print(report["halt_reason"])
+    for label, path in report.get("files", {}).items():
+        console.print(f"  {label}: {path}")
+    for warning in report.get("warnings", []):
+        console.print(f"[yellow]{warning}[/yellow]")
+    if result.get("status") == "error":
+        _fail(result.get("error") or "Pipeline failed; review data/outputs/run_report.json.")
 
 
 # ==============================================================================
@@ -497,7 +751,8 @@ def ui_command(port: int, no_browser: bool) -> None:
 
 
 @cli.command("doctor")
-def doctor_command() -> None:
+@click.option("--live", is_flag=True, help="Test Groq with a small non-personal prompt.")
+def doctor_command(live: bool = False) -> None:
     """Check the environment: dependencies, API keys, and browser availability."""
     table = Table(title="Environment check", show_header=True, header_style="bold magenta")
     table.add_column("Check", style="cyan")
@@ -529,7 +784,7 @@ def doctor_command() -> None:
             "Deterministic fallbacks will be used for every LLM stage.",
         )
     else:
-        table.add_row("LLM provider", "[green]ready[/green]", f"{provider} (rerank: {settings.llm_rerank_model})")
+        table.add_row("LLM provider", "[green]configured[/green]", f"{provider} (rerank: {settings.model_for('rerank')})")
 
     # Playwright needs its browser binaries installed separately from the package.
     try:
@@ -545,6 +800,115 @@ def doctor_command() -> None:
         table.add_row("Chromium binary", "[yellow]unknown[/yellow]", "Run: python -m playwright install chromium")
 
     table.add_row("Telemetry", "[green]disabled[/green]", "ANONYMIZED_TELEMETRY=false")
+    console.print(table)
+    if live:
+        if provider != "groq":
+            _fail("Live provider check currently requires DEFAULT_LLM_PROVIDER=groq.")
+        from job_agent.llm import groq_complete, LLMError
+        try:
+            reply = groq_complete('Return JSON {"ok": true}.', "Connection check.", max_tokens=256)
+            if reply.get("ok") is not True:
+                _fail("Groq returned an unexpected connection-check response.")
+            console.print("[green]Live Groq connection verified.[/green]")
+        except LLMError as exc:
+            _fail(str(exc))
+
+
+@cli.command("production-check")
+def production_check_command() -> None:
+    """Report whether the project is ready for an end-to-end or self-hosted run."""
+    checks = []
+
+    def add(name: str, ok: bool, detail: str, fix: str = "") -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail, "fix": fix})
+
+    add(".env ignored", _git_ignores(".env"), ".env should never be committed.", "Keep .env in .gitignore.")
+    add("Profile", settings.profile_path.exists(), str(settings.profile_path), "Run: python main.py intake --resume <file>")
+    if settings.profile_path.exists():
+        try:
+            profile, valid = load_and_verify_profile(settings.profile_path)
+            add("Profile seal", valid, f"{profile.contact.full_name} ({profile.contact.email})",
+                "Re-run intake from the source resume.")
+            add("Profile is not demo", (profile.source_document or "").lower() != "sample_resume.pdf",
+                profile.source_document or "unknown", "Upload your real resume in the dashboard.")
+        except Exception as exc:
+            add("Profile seal", False, str(exc), "Run: python main.py intake --resume <file>")
+
+    add("Search config", settings.searches_path.exists(), str(settings.searches_path), "Run: python main.py configure")
+    if settings.searches_path.exists():
+        try:
+            params = load_search_parameters(settings.searches_path)
+            ats_companies = (
+                params.ats_companies.model_dump()
+                if hasattr(params.ats_companies, "model_dump")
+                else dict(params.ats_companies or {})
+            )
+            add("Search sources", bool(params.job_boards or params.public_sources or params.ats_companies),
+                f"boards={len(params.job_boards)}, public={len(params.public_sources)}, ats={sum(len(v) for v in ats_companies.values())}",
+                "Enable at least one board, public feed, or ATS company.")
+            add("Work modes", bool(params.selected_work_modes), ", ".join(params.selected_work_modes),
+                "Set work_modes to remote, hybrid, onsite, or a combination.")
+        except Exception as exc:
+            add("Search config valid", False, str(exc), "Fix config/searches.yaml.")
+
+    add("LLM provider", settings.active_provider != "none", settings.active_provider,
+        "Optional: set DEFAULT_LLM_PROVIDER=groq and GROQ_API_KEYS for better scoring and emails.")
+    add("Typst", shutil.which("typst") is not None or _module_exists("typst"), "Needed for ATS PDFs.",
+        "Install requirements, or install the Typst binary.")
+    add("Chromium", _chromium_installed(), "Needed for browser apply mode.",
+        "Run: python -m playwright install chromium")
+    add("Dockerfile", (settings.base_dir / "Dockerfile").exists(), "Self-host deployment recipe.",
+        "Keep Dockerfile in the repository.")
+    add("Local compose", (settings.base_dir / "docker-compose.yml").exists(), "Personal CLI deployment.",
+        "Keep docker-compose.yml in the repository.")
+    add("Hosted compose", (settings.base_dir / "docker-compose.hosted.yml").exists(), "API + worker reference deployment.",
+        "Keep docker-compose.hosted.yml in the repository.")
+    add("Hosted env example", (settings.base_dir / "config" / "hosted.example.env").exists(),
+        "Documented hosted environment variables.", "Keep config/hosted.example.env in the repository.")
+    add("Deployment guide", (settings.base_dir / "DEPLOYMENT.md").exists(), "Hosting and scale instructions.",
+        "Keep DEPLOYMENT.md in the repository.")
+
+    table = Table(title="Production readiness", show_header=True, header_style="bold magenta")
+    table.add_column("Check", style="cyan")
+    table.add_column("Status")
+    table.add_column("Detail", style="white")
+    table.add_column("Next step", style="white")
+    for item in checks:
+        table.add_row(
+            item["name"],
+            "[green]ok[/green]" if item["ok"] else "[yellow]attention[/yellow]",
+            item["detail"],
+            "" if item["ok"] else item["fix"],
+        )
+    console.print(table)
+
+    blockers = [item for item in checks if not item["ok"] and item["name"] not in {"LLM provider"}]
+    if blockers:
+        sys.exit(1)
+
+
+@cli.command("db-check")
+def db_check_command() -> None:
+    """Check the configured hosted queue database and create its table if needed."""
+    from job_agent.hosted.queue import HostedQueue
+
+    try:
+        queue = HostedQueue()
+        counts = queue.counts()
+    except Exception as exc:
+        _fail(f"Database check failed: {exc}")
+
+    table = Table(title="Database check", show_header=True, header_style="bold magenta")
+    table.add_column("Item", style="cyan")
+    table.add_column("Value", style="white")
+    table.add_row("Backend", queue.backend)
+    if queue.backend == "postgres":
+        table.add_row("DATABASE_URL", _mask_database_url(settings.database_url or ""))
+        table.add_row("Table", "hosted_runs")
+    else:
+        table.add_row("SQLite file", str(queue.db_path))
+        table.add_row("Table", "hosted_runs")
+    table.add_row("Queue counts", ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "empty")
     console.print(table)
 
 
@@ -649,6 +1013,7 @@ def status_command() -> None:
         table.add_row("5. Auto-apply", "[yellow]pending[/yellow]", "python main.py apply --dry-run")
 
     # Phase 6: tracker
+    outreach_counts = delta_store.outreach_counts()
     if settings.tracker_path.exists():
         try:
             import openpyxl
@@ -656,11 +1021,20 @@ def status_command() -> None:
             workbook = openpyxl.load_workbook(str(settings.tracker_path), read_only=True)
             rows = max(0, workbook.active.max_row - 1)
             workbook.close()
-            table.add_row("6. Tracker", "[bold green]ready[/bold green]", f"{rows} logged application(s)")
+            table.add_row(
+                "6. Tracker",
+                "[bold green]ready[/bold green]",
+                f"{rows} logged | {outreach_counts['drafts']} email draft(s) | "
+                f"{outreach_counts['recipients']} unique inbox(es)",
+            )
         except Exception as exc:
             table.add_row("6. Tracker", "[yellow]unreadable[/yellow]", str(exc)[:80])
     else:
-        table.add_row("6. Tracker", "[yellow]pending[/yellow]", "python main.py track")
+        table.add_row(
+            "6. Tracker",
+            "[yellow]pending[/yellow]",
+            f"python main.py track | {outreach_counts['drafts']} email draft(s) already in ledger",
+        )
 
     provider = settings.active_provider
     table.add_row(
@@ -704,6 +1078,66 @@ def _read_json(path: Path, default):
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
+
+
+def _module_exists(name: str) -> bool:
+    try:
+        __import__(name)
+        return True
+    except Exception:
+        return False
+
+
+def _chromium_installed() -> bool:
+    try:
+        from playwright.sync_api import sync_playwright
+
+        with sync_playwright() as playwright:
+            return Path(playwright.chromium.executable_path).exists()
+    except Exception:
+        return False
+
+
+def _git_ignores(path: str) -> bool:
+    import fnmatch
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "-q", path],
+            cwd=settings.base_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if result.returncode == 0:
+            return True
+    except Exception:
+        pass
+
+    gitignore = settings.base_dir / ".gitignore"
+    if not gitignore.exists():
+        return False
+    try:
+        for raw_line in gitignore.read_text(encoding="utf-8").splitlines():
+            pattern = raw_line.strip()
+            if not pattern or pattern.startswith("#") or pattern.startswith("!"):
+                continue
+            normalized = pattern.rstrip("/")
+            if normalized == path or fnmatch.fnmatch(path, normalized):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _mask_database_url(url: str) -> str:
+    if "@" not in url or "://" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    credentials, host = rest.split("@", 1)
+    user = credentials.split(":", 1)[0]
+    return f"{scheme}://{user}:***@{host}"
 
 
 if __name__ == "__main__":

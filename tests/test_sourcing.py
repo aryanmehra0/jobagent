@@ -159,7 +159,7 @@ def test_scraper_filters_non_remote_when_remote_only(tmp_path: Path):
 
 def test_scraper_applies_minimum_salary_against_the_top_of_the_band(tmp_path: Path):
     """A 120k-200k band satisfies a 175k floor; its lower bound alone does not."""
-    params = SearchParameters(min_salary=175_000, is_remote=False)
+    params = SearchParameters(min_salary=175_000, is_remote=False, target_domains=["Backend Engineer"])
     scraper = OmnichannelScraper(
         search_params=params, delta_store=DeltaStore(db_path=tmp_path / "d.db")
     )
@@ -221,3 +221,17 @@ def test_delta_store_reset_clears_everything(tmp_path: Path):
 
     store.reset()
     assert store.get_seen_count() == 0
+
+
+def test_delta_store_reports_outreach_counts(tmp_path: Path):
+    store = DeltaStore(db_path=tmp_path / "d.db")
+    first = _posting()
+    second = _posting(id="mail2", job_url="https://a.com/mail2", title="ML Engineer")
+
+    assert store.outreach_counts() == {"drafts": 0, "recipients": 0, "roles": 0}
+
+    store.record_outreach("HR@Acme.com", first, "Subject one", "Body one")
+    store.record_outreach("hr@acme.com", first, "Duplicate", "Duplicate")
+    store.record_outreach("careers@acme.com", second, "Subject two", "Body two")
+
+    assert store.outreach_counts() == {"drafts": 2, "recipients": 2, "roles": 2}

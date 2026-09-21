@@ -356,7 +356,13 @@ def strip_html(value: Optional[str]) -> str:
     """
     if not value:
         return ""
+    import html
     text = str(value)
+    for _ in range(3):
+        decoded = html.unescape(text)
+        if decoded == text:
+            break
+        text = decoded
     text = re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", text)
     text = re.sub(r"(?i)<li[^>]*>", "\n- ", text)
     text = re.sub(r"(?i)<br\s*/?>", "\n", text)

@@ -17,6 +17,7 @@ click>=8.1.7
 # --- Phase 1: candidate intake & parsing ---
 pypdf>=4.2.0
 pdfplumber>=0.11.0              # Preferred extractor; pypdf is the fallback
+PyMuPDF>=1.24.0                # Original-PDF layout preservation and validation
 python-docx>=1.1.0              # Reads .docx resumes, including table-based templates
 llama-parse>=0.4.0              # Optional cloud parser, used when LLAMA_CLOUD_API_KEY is set
 
@@ -28,6 +29,8 @@ anthropic>=0.28.0
 python-jobspy>=1.1.50
 pandas>=2.0.0                   # JobSpy returns DataFrames; used directly by the normalizer
 requests>=2.31.0
+beautifulsoup4>=4.12.0         # Public listing descriptions after deduplication
+psycopg[binary]>=3.2.0               # Optional Postgres backend for hosted queue deployments
 
 # --- Phase 3: semantic evaluation ---
 sentence-transformers>=2.7.0

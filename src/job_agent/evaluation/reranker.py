@@ -37,7 +37,7 @@ Your job is to objectively score the candidate's alignment with the provided job
 EVALUATION CRITERIA:
 1. Technical Stack Match (1.0 - 10.0): Do the candidate's verified skills, languages, and frameworks overlap with the required tech stack?
 2. Seniority & Experience (1.0 - 10.0): Does the candidate have the requested years of experience and level of responsibility (Junior, Mid, Senior, Staff)?
-3. Hard Constraints: Does the candidate meet the remote/location requirements and work authorization?
+3. Hard Constraints: Penalize only explicit contradictions in location or work authorization. Missing eligibility or relocation information is UNKNOWN, not evidence of ineligibility; flag it for human review in reasoning without inventing an answer or lowering the technical fit score.
 
 SCORING RULES:
 - 9.0 - 10.0: Exceptional match. Candidate meets >= 90% of core requirements and matches or exceeds the seniority asked for.
@@ -81,6 +81,18 @@ COMMON_TECH_VOCABULARY = (
 
 # Budget for the job text sent to the judge; roughly 1500 tokens.
 CONTEXT_BUDGET_CHARS = 6000
+
+
+
+def _sponsorship_note(profile: CandidateProfile) -> str:
+    """Sponsorship stated precisely, so a judge does not mark home-country jobs down."""
+    auth = profile.work_authorization
+    if auth.requires_sponsorship is None:
+        return "unspecified"
+    if not auth.requires_sponsorship:
+        return "no"
+    home = ", ".join(auth.authorized_countries) or auth.current_country or "home country"
+    return f"no for jobs in {home} or remote jobs; yes only to relocate to another country"
 
 
 class LLMReranker:
@@ -169,9 +181,17 @@ class LLMReranker:
         """Score via the OpenAI Chat Completions API in JSON mode."""
         from openai import OpenAI
 
-        client = OpenAI(api_key=settings.openai_api_key)
+        if self.provider == "openai_compatible":
+            client = OpenAI(
+                api_key=settings.openai_compatible_api_key,
+                base_url=settings.openai_compatible_base_url,
+            )
+            model = settings.openai_compatible_model
+        else:
+            client = OpenAI(api_key=settings.openai_api_key)
+            model = settings.llm_rerank_model
         response = client.chat.completions.create(
-            model=settings.llm_rerank_model,
+            model=model,
             response_format={"type": "json_object"},
             temperature=0.1,
             messages=[
@@ -319,8 +339,11 @@ class LLMReranker:
             f"Summary: {profile.summary}\n"
             f"Years of experience: {profile.years_of_experience:g}\n"
             f"Skills: {', '.join(profile.skills.all_skills())}\n"
+            f"Lives in: {profile.work_authorization.current_country or 'unspecified'}\n"
             f"Authorized to work in: {', '.join(profile.work_authorization.authorized_countries) or 'unspecified'}\n"
-            f"Requires sponsorship: {profile.work_authorization.requires_sponsorship}\n"
+            f"Needs visa sponsorship: {_sponsorship_note(profile)}\n"
+            f"Open to remote work for employers in any country: {profile.work_authorization.remote_worldwide}\n"
+            f"Salary expectation: {profile.salary_expectation_text() or 'unspecified'}\n"
             f"Recent roles: {recent_roles or 'none listed'}\n"
             f"Verified achievements: {'; '.join(fact.statement for fact in profile.all_locked_facts()[:6])}"
         )
@@ -338,15 +361,18 @@ class LLMReranker:
         verdict: Optional[RerankerVerdict] = None
         scored_by = "heuristic"
 
-        if self.provider in ("openai", "anthropic"):
-            caller = self._call_openai if self.provider == "openai" else self._call_anthropic
-            model = settings.llm_rerank_model if self.provider == "openai" else settings.anthropic_model
+        if self.provider in ("openai", "anthropic", "groq", "openai_compatible"):
+            caller = {"openai": self._call_openai, "anthropic": self._call_anthropic,
+                      "groq": self._call_groq, "openai_compatible": self._call_openai}[self.provider]
+            model = settings.model_for("rerank", self.provider)
             try:
                 raw = caller(profile_summary, job, job_context)
                 # Reject anything the schema will not accept rather than trusting it.
                 verdict = RerankerVerdict(**raw)
                 scored_by = f"{self.provider}:{model}"
             except Exception as exc:
+                if settings.llm_strict:
+                    raise
                 console.print(
                     f"[yellow]{self.provider} re-ranker rejected or failed ({exc.__class__.__name__}: "
                     f"{str(exc)[:120]}). Falling back to the deterministic judge.[/yellow]"
@@ -366,3 +392,8 @@ class LLMReranker:
             missing_skills=verdict.missing_skills,
             scored_by=scored_by,
         )
+
+    def _call_groq(self, profile_summary, job, job_context):
+        from job_agent.llm import groq_complete
+        return groq_complete(RERANKER_SYSTEM_PROMPT,
+                             self._build_prompt(profile_summary, job, job_context), max_tokens=2048)

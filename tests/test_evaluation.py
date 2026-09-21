@@ -167,7 +167,8 @@ def test_pipeline_end_to_end(candidate_profile, sample_jobs, tmp_path: Path):
     evaluated, qualified = pipeline.run_evaluation(
         profile_path=prof_file,
         jobs_path=jobs_file,
-        tier1_threshold=0.10,
+        # Exercise Tier 2 for both postings regardless of the embedding backend.
+        tier1_threshold=0.0,
         output_dir=tmp_path,
     )
 

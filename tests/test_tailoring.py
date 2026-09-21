@@ -111,6 +111,25 @@ def qualified_job() -> EvaluatedJob:
     return EvaluatedJob(job=job, evaluation=score)
 
 
+@pytest.mark.parametrize("location,width,heading", [
+    ("India", 595.3, "Professional Summary"),
+    ("USA", 612.0, "Professional Summary"),
+    ("United Kingdom", 595.3, "Professional Profile"),
+])
+def test_regional_pdf_dimensions_and_source_facts(candidate_profile, qualified_job, tmp_path, location, width, heading):
+    job = qualified_job.job.model_copy(update={"location": location})
+    data = ResumeTailorer().generate_tailored_profile_data(candidate_profile, job)
+    pdf = TypstResumeCompiler(output_dir=tmp_path).compile_resume(data, job.id)
+    reader = pypdf.PdfReader(pdf)
+    assert abs(float(reader.pages[0].mediabox.width) - width) < 0.2
+    text = " ".join(page.extract_text() for page in reader.pages)
+    assert heading.casefold() in text.casefold()
+    assert candidate_profile.contact.full_name in text
+    for role in candidate_profile.experience:
+        assert role.company in text
+        assert set(role.description_bullets) == set(next(exp["description_bullets"] for exp in data["experience"] if exp["company"] == role.company))
+
+
 def test_anti_hallucination_metric_restoration(candidate_profile, qualified_job):
     """Verify that if an LLM drops a locked metric, the rewriter detects and restores it."""
     tailorer = ResumeTailorer()
@@ -150,6 +169,9 @@ def test_typst_compiler_single_pass_pdf_generation(candidate_profile, qualified_
 
     assert pdf_path.exists()
     assert pdf_path.stat().st_size > 1000
+    audit = json.loads(pdf_path.with_suffix(".ats.json").read_text(encoding="utf-8"))
+    assert audit["passed"] is True
+    assert audit["source_bullets_checked"] >= 1
 
     # Verify text is fully searchable and extractable by an ATS
     reader = pypdf.PdfReader(str(pdf_path))

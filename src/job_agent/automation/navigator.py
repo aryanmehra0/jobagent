@@ -125,12 +125,17 @@ class DOMNavigator:
         """Locate navigation buttons ('Submit', 'Next', 'Continue', 'Apply')."""
         if action_type == "submit":
             patterns = [
-                "button:has-text('Submit')",
                 "button:has-text('Submit Application')",
-                "button:has-text('Apply')",
+                "button:has-text('Submit')",
+                "button:has-text('Send application')",
                 "input[type='submit']",
                 "button[type='submit']",
             ]
+            # "Apply" is deliberately absent: on a listing page "Apply for this job"
+            # opens the form, and treating it as Submit ended the attempt before
+            # anything was filled.
+            if not self.has_application_form():
+                return None
         elif action_type == "next":
             patterns = [
                 "button:has-text('Next')",
@@ -145,10 +150,33 @@ class DOMNavigator:
             try:
                 btn = self.page.locator(pattern).first
                 if btn.count() > 0 and btn.is_visible():
+                    if action_type == "submit":
+                        label = (btn.inner_text() or btn.get_attribute("value") or "").strip().lower()
+                        if any(word in label for word in ("next", "continue", "proceed")):
+                            continue
                     return btn
             except Exception:
                 pass
         return None
+
+    def has_application_form(self) -> bool:
+        """Whether the page carries an application form rather than a listing or search.
+
+        A real application asks for a resume upload, or for both an email address
+        and a name. A search bar or newsletter box asks for neither combination.
+        """
+        try:
+            if self.page.locator("input[type='file']").count():
+                return True
+            email = self.page.locator(
+                "input[type='email'], input[name*='email' i], input[id*='email' i], input[autocomplete='email']"
+            )
+            name = self.page.locator(
+                "input[name*='name' i], input[id*='name' i], input[autocomplete*='name']"
+            )
+            return email.count() > 0 and name.count() > 0
+        except Exception:
+            return False
 
     def detect_submission_success(self) -> bool:
         """Check for confirmation indicators on the page."""
@@ -158,7 +186,6 @@ class DOMNavigator:
             "your application has been received",
             "application received",
             "successfully submitted",
-            "thanks for your interest",
         ]
         try:
             body_text = self.page.inner_text("body", timeout=1500).lower()

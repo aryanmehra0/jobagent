@@ -1,0 +1,48 @@
+﻿services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-job_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-job_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-job_agent_dev_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      default:
+        aliases:
+          - db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-job_agent} -d ${POSTGRES_DB:-job_agent}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  job-agent:
+    build: .
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://job_agent:job_agent_dev_password@postgres:5432/job_agent}
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "main.py", "production-check"]
+
+  adminer:
+    image: adminer:4
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${ADMINER_PORT:-8081}:8080"
+
+volumes:
+  postgres-data:
+

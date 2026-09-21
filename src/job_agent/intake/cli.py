@@ -17,7 +17,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, FloatPrompt, IntPrompt, Prompt
 
-from job_agent.config.schema import SUPPORTED_JOB_BOARDS, SearchParameters
+from job_agent.config.schema import SUPPORTED_JOB_BOARDS, SUPPORTED_PUBLIC_SOURCES, SearchParameters
 from job_agent.config.settings import settings
 
 console = Console()
@@ -58,9 +58,17 @@ def prompt_user_parameters(existing_config: Optional[SearchParameters] = None) -
             )
         )
 
-        is_remote = Confirm.ask(
-            "[bold green]?[/bold green] Keep only remote positions?",
-            default=existing_config.is_remote if existing_config else True,
+        work_modes = _split_list(
+            Prompt.ask(
+                "[bold green]?[/bold green] Work modes (remote, hybrid, onsite)",
+                default=", ".join(existing_config.selected_work_modes) if existing_config else "remote",
+            )
+        )
+        onsite_countries = _split_list(
+            Prompt.ask(
+                "[bold green]?[/bold green] Countries allowed for onsite/hybrid roles (optional)",
+                default=", ".join(existing_config.onsite_countries) if existing_config else "",
+            )
         )
 
         hours_old = IntPrompt.ask(
@@ -72,6 +80,12 @@ def prompt_user_parameters(existing_config: Optional[SearchParameters] = None) -
             Prompt.ask(
                 f"[bold green]?[/bold green] Job boards, comma-separated ({', '.join(SUPPORTED_JOB_BOARDS)})",
                 default=", ".join(existing_config.job_boards) if existing_config else "linkedin, indeed",
+            )
+        )
+        public_sources = _split_list(
+            Prompt.ask(
+                f"[bold green]?[/bold green] Public APIs ({', '.join(SUPPORTED_PUBLIC_SOURCES)}; optional)",
+                default=", ".join(existing_config.public_sources) if existing_config else "remotive, arbeitnow",
             )
         )
 
@@ -101,9 +115,12 @@ def prompt_user_parameters(existing_config: Optional[SearchParameters] = None) -
                 target_domains=domains,
                 desired_experience_years=desired_experience,
                 locations=locations,
-                is_remote=is_remote,
+                work_modes=work_modes,
+                is_remote=work_modes == ["remote"],
+                onsite_countries=onsite_countries,
                 hours_old=hours_old,
                 job_boards=job_boards,
+                public_sources=public_sources,
                 country_indeed=country_indeed,
                 max_results_per_board=max_results,
                 min_salary=min_salary,

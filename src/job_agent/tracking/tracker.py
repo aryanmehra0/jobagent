@@ -49,6 +49,12 @@ COLUMNS = [
 
 # Hidden column holding the job ID, which is what makes a row updatable.
 JOB_ID_COLUMN = len(COLUMNS) + 1
+RESUME_COLUMN = COLUMNS.index("Tailored Resume PDF") + 1
+
+# Added after the hidden ID column so workbooks created earlier keep their
+# layout: existing rows are matched by the same column as before.
+EXTRA_COLUMNS = ["HR / Careers Email", "Other Emails", "Apply URL", "Apply Method", "Resume Check"]
+EXTRA_START = JOB_ID_COLUMN + 1
 
 SHEET_TITLE = "Applications & Outreach"
 
@@ -91,8 +97,16 @@ class MasterTracker:
         for index, name in enumerate(COLUMNS, start=1):
             self.ws.cell(row=1, column=index, value=name)
         self.ws.cell(row=1, column=JOB_ID_COLUMN, value="Job ID")
+        self._write_extra_header()
         style_header_row(self.ws)
         self._hide_id_column()
+
+    def _write_extra_header(self) -> None:
+        for offset, name in enumerate(EXTRA_COLUMNS):
+            cell = self.ws.cell(row=1, column=EXTRA_START + offset)
+            if cell.value != name:
+                cell.value = name
+                self._dirty = True
 
     def _hide_id_column(self) -> None:
         """Hide the job-ID column; it is bookkeeping, not something to read."""
@@ -104,6 +118,12 @@ class MasterTracker:
         if self.ws.cell(row=1, column=JOB_ID_COLUMN).value != "Job ID":
             self.ws.cell(row=1, column=JOB_ID_COLUMN, value="Job ID")
             self._dirty = True
+        # Every added column is checked, so a workbook from before a later column
+        # was introduced gets that header too.
+        if any(self.ws.cell(row=1, column=EXTRA_START + offset).value != name
+               for offset, name in enumerate(EXTRA_COLUMNS)):
+            self._write_extra_header()
+            style_header_row(self.ws)
         # Applied every time: an older workbook was saved without the hidden flag.
         self._hide_id_column()
 
@@ -116,8 +136,67 @@ class MasterTracker:
                 index[str(job_id)] = row
         return index
 
+    @staticmethod
+    def _resume_checks(resumes_dir: Path) -> Dict[str, str]:
+        """Validation result per job ID, from the tailoring manifest."""
+        import json as _json
+
+        try:
+            entries = _json.loads((resumes_dir / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return {
+            str(entry["job_id"]): entry.get("validation_summary") or "generated from profile (integrity gate)"
+            for entry in entries if isinstance(entry, dict) and entry.get("job_id")
+        }
+
+    def refresh_resume_links(self) -> None:
+        """Make each row's resume cell open the PDF, and say plainly when it is gone.
+
+        A bare file name cannot be opened from Excel, and rows logged before a
+        resume existed showed "N/A" even after one was compiled. Each row is
+        matched to `resume_<job id>.pdf` by its hidden job ID.
+        """
+        from openpyxl.styles import Font as _Font
+
+        resumes_dir = settings.outputs_dir / "tailored_resumes"
+        checks = self._resume_checks(resumes_dir)
+        check_column = EXTRA_START + EXTRA_COLUMNS.index("Resume Check")
+        for row in range(2, self.ws.max_row + 1):
+            job_id = self.ws.cell(row=row, column=JOB_ID_COLUMN).value
+            cell = self.ws.cell(row=row, column=RESUME_COLUMN)
+            recorded = str(cell.value or "").split(" (")[0].strip()
+            name = recorded if recorded.lower().endswith(".pdf") else (f"resume_{job_id}.pdf" if job_id else "")
+            path = resumes_dir / name if name else None
+
+            if job_id and str(job_id) in checks:
+                check_cell = self.ws.cell(row=row, column=check_column)
+                if check_cell.value != checks[str(job_id)]:
+                    check_cell.value = checks[str(job_id)]
+                    check_cell.border = THIN_BORDER
+                    check_cell.alignment = ALIGN_LEFT_TOP
+                    passed = checks[str(job_id)].startswith("PASS")
+                    check_cell.font = _Font(color="15803D" if passed else "B91C1C", bold=True)
+                    self._dirty = True
+
+            if path is not None and path.is_file():
+                target = path.resolve().as_uri()
+                if cell.value != name or not cell.hyperlink or cell.hyperlink.target != target:
+                    cell.value = name
+                    cell.hyperlink = target
+                    cell.font = _Font(color="2563EB", underline="single")
+                    self._dirty = True
+            elif recorded.lower().endswith(".pdf"):
+                label = f"{recorded} (file no longer exists - run tailor again)"
+                if cell.value != label:
+                    cell.value = label
+                    cell.hyperlink = None
+                    cell.font = _Font(color="9CA3AF")
+                    self._dirty = True
+
     def save(self) -> None:
         """Write the workbook to disk, resizing columns first."""
+        self.refresh_resume_links()
         autofit_column_widths(self.ws)
         try:
             self.wb.save(str(self.excel_path))
@@ -177,6 +256,25 @@ class MasterTracker:
                 cell.font = Font(color="2563EB", underline="single")
 
         self.ws.cell(row=row_index, column=JOB_ID_COLUMN, value=job.id)
+
+        from job_agent.automation.routing import route_application
+
+        route = route_application(job)
+        primary = job.primary_contact()
+        extras = [
+            primary.email if primary else "N/A",
+            "; ".join(c.email for c in job.contacts if primary is None or c.email != primary.email) or "N/A",
+            route.url or job.job_url,
+            route.channel.replace("_", " "),
+        ]
+        for offset, value in enumerate(extras):
+            cell = self.ws.cell(row=row_index, column=EXTRA_START + offset, value=value)
+            cell.border = THIN_BORDER
+            cell.alignment = ALIGN_LEFT_TOP
+        if primary:
+            email_cell = self.ws.cell(row=row_index, column=EXTRA_START)
+            email_cell.hyperlink = f"mailto:{primary.email}"
+            email_cell.font = Font(color="2563EB", underline="single")
 
         priority_fill = get_priority_fill(match_score)
         self.ws.cell(row=row_index, column=4).fill = priority_fill

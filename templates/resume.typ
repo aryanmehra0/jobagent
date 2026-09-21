@@ -5,15 +5,16 @@
 
 #let data_file = sys.inputs.at("data_file", default: "resume_data.json")
 #let d = json(data_file)
+#let regional = d.at("regional", default: (:))
 
 #set page(
-  paper: "us-letter",
+  paper: regional.at("paper", default: "us-letter"),
   margin: (x: 1.35cm, top: 1.25cm, bottom: 1.25cm),
 )
 
 #set text(
   font: ("Liberation Sans", "Helvetica", "Arial", "Roboto"),
-  size: 9.5pt,
+  size: regional.at("font_size_pt", default: 9.5) * 1pt,
   fill: rgb("#1e293b"),
   lang: "en",
 )
@@ -44,7 +45,7 @@
 ]
 
 // --- PROFESSIONAL SUMMARY ---
-#section_heading("Professional Summary")
+#section_heading(regional.at("summary_heading", default: "Professional Summary"))
 #d.summary
 
 // --- TECHNICAL SKILLS ---
@@ -66,8 +67,9 @@
 ]
 
 // --- WORK EXPERIENCE ---
-#section_heading("Professional Experience")
+#section_heading(regional.at("experience_heading", default: "Professional Experience"))
 #for exp in d.experience [
+  #block(breakable: false)[
   #grid(
     columns: (1fr, auto),
     [*#exp.company* — #text(style: "italic")[#exp.title]],
@@ -77,7 +79,11 @@
     #text(size: 8pt, fill: rgb("#64748b"))[#exp.location] \
   ]
   #v(1pt)
-  #for bullet in exp.description_bullets [
+  #if exp.description_bullets.len() > 0 [
+    - #exp.description_bullets.first()
+  ]
+  ]
+  #for bullet in exp.description_bullets.slice(calc.min(1, exp.description_bullets.len())) [
     - #bullet
   ]
   #v(2.5pt)

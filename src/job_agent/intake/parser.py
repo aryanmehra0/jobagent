@@ -26,6 +26,7 @@ from rich.console import Console
 
 from job_agent.config.schema import CandidateProfile
 from job_agent.config.settings import settings
+from job_agent.runtime import exclusive_run, invalidate_after
 from job_agent.intake.heuristic import ResumeParseError, build_profile_dict
 from job_agent.intake.validator import validate_and_save_profile
 
@@ -41,7 +42,7 @@ CRITICAL INTEGRITY & ANTI-HALLUCINATION RULES:
 3. If a field is not present in the resume, use null (or an empty list). NEVER substitute a placeholder or example value.
 4. Every quantifiable achievement (e.g., "$2.5M", "42% increase", "100k RPS", "team of 8") MUST be preserved verbatim in locked_facts with its category ("metric", "scale", "revenue", "deployment", or "tenure").
 5. Copy metric values character-for-character from the resume. Do not round, reformat, or convert units.
-6. Only record work authorization details that the resume states explicitly. Otherwise set requires_sponsorship=false, visa_status=null, and citizenship=[].
+6. Only record work authorization details that the resume states explicitly. Otherwise set requires_sponsorship=null, visa_status=null, authorized_countries=[], and citizenship=[]. Residence is not work authorization.
 7. Compute total professional experience in years from the start and end dates you extracted.
 
 Output ONLY a single valid JSON object adhering to this structure:
@@ -60,7 +61,7 @@ Output ONLY a single valid JSON object adhering to this structure:
     "citizenship": [],
     "current_country": "...",
     "authorized_countries": [],
-    "requires_sponsorship": false,
+    "requires_sponsorship": null,
     "visa_status": null
   },
   "education": [
@@ -279,14 +280,23 @@ class ResumeParser:
 
     def _call_openai(self, resume_text: str) -> Dict[str, Any]:
         """Extract structured JSON via the OpenAI Chat Completions API in JSON mode."""
-        if not settings.openai_api_key:
-            raise ValueError("OPENAI_API_KEY is not configured in .env")
-
         from openai import OpenAI
 
-        client = OpenAI(api_key=settings.openai_api_key)
+        if self.provider == "openai_compatible":
+            if not settings.openai_compatible_api_key or not settings.openai_compatible_base_url:
+                raise ValueError("OPENAI_COMPATIBLE_API_KEY and OPENAI_COMPATIBLE_BASE_URL are required")
+            client = OpenAI(
+                api_key=settings.openai_compatible_api_key,
+                base_url=settings.openai_compatible_base_url,
+            )
+            model = settings.openai_compatible_model
+        else:
+            if not settings.openai_api_key:
+                raise ValueError("OPENAI_API_KEY is not configured in .env")
+            client = OpenAI(api_key=settings.openai_api_key)
+            model = settings.llm_intake_model
         response = client.chat.completions.create(
-            model=settings.llm_intake_model,
+            model=model,
             response_format={"type": "json_object"},
             temperature=0.0,
             messages=[
@@ -323,8 +333,44 @@ class ResumeParser:
 
     def _llm_extract(self, resume_text: str) -> Optional[Dict[str, Any]]:
         """Run the configured LLM extractor, or return None if none is usable."""
+        if self.provider == "groq":
+            from job_agent.llm import groq_complete
+            from pydantic import ValidationError
+            prompt = resume_text + "\nPreserve year-only dates as YYYY strings. Copy all prose verbatim."
+            baseline: Optional[Dict[str, Any]] = None
+            try:
+                baseline = build_profile_dict(resume_text, source_document="resume")
+                prompt += "\nSource-derived draft to verify and complete (keep its valid field names and date formats):\n" + json.dumps(baseline)
+            except ResumeParseError:
+                pass
+            for attempt in range(2):
+                data = groq_complete(SYSTEM_EXTRACTION_PROMPT, prompt, max_tokens=8000)
+                # Reconcile against the source *before* validating. Validating
+                # the raw draft first meant a date the model omitted failed the
+                # whole intake, even though the resume text supplied it — and the
+                # retry spent a second model call asking for a fact already known.
+                if baseline:
+                    _reconcile_with_source(data, baseline)
+                try:
+                    CandidateProfile(**data)
+                    return data
+                except ValidationError as exc:
+                    fields = [".".join(str(p) for p in e["loc"]) + ": " + e["msg"] for e in exc.errors()]
+                    if attempt:
+                        raise ValueError("Groq extraction failed validation: " + "; ".join(fields)) from None
+                    prompt += "\nCorrect these validation problems using only source evidence: " + "; ".join(fields)
         if self.provider == "openai" and settings.openai_api_key:
             console.print(f"[cyan]Executing LLM parsing with OpenAI ({settings.llm_intake_model})...[/cyan]")
+            return self._call_openai(resume_text)
+        if (
+            self.provider == "openai_compatible"
+            and settings.openai_compatible_api_key
+            and settings.openai_compatible_base_url
+        ):
+            console.print(
+                f"[cyan]Executing LLM parsing with OpenAI-compatible API "
+                f"({settings.openai_compatible_model})...[/cyan]"
+            )
             return self._call_openai(resume_text)
         if self.provider == "anthropic" and settings.anthropic_api_key:
             console.print(f"[cyan]Executing LLM parsing with Anthropic ({settings.anthropic_model})...[/cyan]")
@@ -333,6 +379,7 @@ class ResumeParser:
 
     # --- Orchestration --------------------------------------------------------
 
+    @exclusive_run
     def parse(self, pdf_path: Path, output_path: Optional[Path] = None) -> CandidateProfile:
         """Run the full intake pipeline: PDF to sealed, fact-checked profile.json."""
         target_output = output_path or settings.profile_path
@@ -347,14 +394,18 @@ class ResumeParser:
         try:
             llm_output = self._llm_extract(raw_text)
         except Exception as exc:
+            if settings.llm_strict and self.provider not in ("offline", "none"):
+                raise
             console.print(f"[yellow]LLM extraction failed: {exc}. Falling back to deterministic parser.[/yellow]")
             llm_output = None
 
         if llm_output is not None:
             if _is_useful_extraction(llm_output):
                 profile_dict = llm_output
-                method = f"{self.provider}:{settings.llm_intake_model}"
+                method = f"{self.provider}:{settings.model_for('intake', self.provider)}"
             else:
+                if settings.llm_strict:
+                    raise ValueError("LLM extraction returned an unusable profile; intake stopped.")
                 console.print(
                     "[yellow]LLM returned an empty or unusable profile. "
                     "Falling back to the deterministic parser.[/yellow]"
@@ -370,8 +421,83 @@ class ResumeParser:
         profile_dict.setdefault("source_document", pdf_path.name)
         profile_dict["extraction_method"] = method
 
+        # Groq drafts were already reconciled against the source inside
+        # `_llm_extract`, before validation.
+
         # Validate, fact-check against the source text, seal, and persist.
-        return validate_and_save_profile(profile_dict, target_output, source_text=raw_text)
+        profile = validate_and_save_profile(profile_dict, target_output, source_text=raw_text)
+        if target_output.resolve() == settings.profile_path.resolve():
+            # Country, sponsorship and salary are not on a resume; the ones the
+            # candidate saved earlier carry over to the new profile.
+            from job_agent.intake.preferences import reapply_saved_preferences
+
+            profile = reapply_saved_preferences(profile, target_output)
+            invalidate_after("intake", settings.outputs_dir)
+        import hashlib
+        target_output.with_suffix(".source.json").write_text(json.dumps({
+            "source_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
+            "profile_hash": profile.profile_hash,
+        }, indent=2), encoding="utf-8")
+        return profile
+
+
+def _match_source_role(role: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Find the one source-parsed role an LLM-extracted role corresponds to.
+
+    Tries progressively looser matches and accepts a match only when it is
+    unique, so an ambiguous pairing leaves the draft untouched rather than
+    grafting one role's dates onto another. Containment handles the common case
+    of a model trimming or expanding an employer name ("ScaleFlow" versus
+    "ScaleFlow Technologies").
+    """
+    company = str(role.get("company") or "").casefold().strip()
+    title = str(role.get("title") or "").casefold().strip()
+    if not company:
+        return None
+
+    def related(left: str, right: str) -> bool:
+        return bool(left) and bool(right) and (left in right or right in left)
+
+    rules = (
+        lambda item: item["company"].casefold() == company and item["title"].casefold() == title,
+        lambda item: related(item["company"].casefold(), company) and related(item["title"].casefold(), title),
+        lambda item: related(item["company"].casefold(), company),
+    )
+    for rule in rules:
+        matches = [item for item in candidates if rule(item)]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+
+def _reconcile_with_source(profile_dict: Dict[str, Any], baseline: Dict[str, Any]) -> None:
+    """Overwrite source-verifiable fields of an LLM draft with the source's own values.
+
+    Dates, bullets and locked facts are copied from the deterministic parse of
+    the same resume text, so the model can neither manufacture month precision
+    nor rewrite an achievement. Nothing here is invented: every value comes from
+    the document. A role with no unique source match is left as the model wrote
+    it, and validation then reports any gap honestly.
+    """
+    source_roles = baseline.get("experience", [])
+    for role in profile_dict.get("experience") or []:
+        if not isinstance(role, dict):
+            continue
+        match = _match_source_role(role, source_roles)
+        if match:
+            for field in ("start_date", "end_date", "description_bullets", "locked_facts"):
+                if field in match:
+                    role[field] = match[field]
+
+    skills = profile_dict.get("skills")
+    if not isinstance(skills, dict):
+        skills = profile_dict["skills"] = {}
+    for group, values in (baseline.get("skills") or {}).items():
+        existing = skills.get(group) or []
+        skills[group] = list(dict.fromkeys(list(existing) + list(values)))
+
+    profile_dict["work_authorization"] = baseline["work_authorization"]
+    profile_dict["years_of_experience"] = baseline["years_of_experience"]
 
 
 def _extract_json_object(content: str) -> Dict[str, Any]:

@@ -9,6 +9,9 @@ data/proxies.txt
 
 # Candidate documents (personal data; do not commit)
 data/raw_resumes/*.pdf
+data/raw_resumes/*.docx
+data/raw_resumes/*.txt
+data/raw_resumes/*.md
 !data/raw_resumes/sample_resume.pdf
 
 # Python
@@ -22,6 +25,7 @@ venv/
 
 # Tooling caches
 .pytest_cache/
+.pytest_tmp*/
 .mypy_cache/
 .ruff_cache/
 .coverage

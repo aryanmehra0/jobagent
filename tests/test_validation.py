@@ -51,14 +51,15 @@ def test_contact_location_is_optional():
 
 # --- WorkAuthorization ------------------------------------------------------
 
-def test_work_authorization_defaults_to_country_of_residence():
+def test_work_authorization_does_not_infer_eligibility_from_residence():
     auth = WorkAuthorization(current_country="United States")
-    assert auth.authorized_countries == ["United States"]
+    assert auth.authorized_countries == []
+    assert auth.requires_sponsorship is None
 
 
 def test_is_authorized_in_returns_none_when_unknown():
     """An unknown location must be reported as unknown, never guessed."""
-    auth = WorkAuthorization(current_country="United States")
+    auth = WorkAuthorization(current_country="United States", authorized_countries=["United States"])
     assert auth.is_authorized_in("Remote - United States") is True
     assert auth.is_authorized_in("San Francisco, USA") is True
     assert auth.is_authorized_in("Berlin, Germany") is None

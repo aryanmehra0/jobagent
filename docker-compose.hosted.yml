@@ -1,0 +1,66 @@
+﻿services:
+  hosted-api:
+    build: .
+    env_file:
+      - .env
+      - config/hosted.example.env
+    environment:
+      HOSTED_API_HOST: 0.0.0.0
+      HOSTED_API_PORT: 8080
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    ports:
+      - "8080:8080"
+    command: ["python", "-m", "job_agent.hosted.api"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  hosted-worker:
+    build: .
+    env_file:
+      - .env
+      - config/hosted.example.env
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
+    command: ["python", "-m", "job_agent.hosted.worker"]
+    depends_on:
+      hosted-api:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-job_agent}
+      POSTGRES_USER: ${POSTGRES_USER:-job_agent}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-job_agent_dev_password}
+    volumes:
+      - hosted-postgres:/var/lib/postgresql/data
+    networks:
+      default:
+        aliases:
+          - db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-job_agent} -d ${POSTGRES_DB:-job_agent}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["saas"]
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - hosted-redis:/data
+
+volumes:
+  hosted-postgres:
+  hosted-redis:
+

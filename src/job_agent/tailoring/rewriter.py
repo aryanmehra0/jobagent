@@ -35,10 +35,10 @@ CRITICAL ANTI-HALLUCINATION & FACT PRESERVATION RULES:
 1. PRESERVE ALL ORIGINAL METRICS AND NUMBERS VERBATIM:
    Every metric, percentage, dollar value, scale indicator, and timeline ($340k, 200k RPS, 45%, 99.999% SLA) present in the candidate profile MUST be retained character-for-character.
 2. ZERO FABRICATION: Do NOT invent new metrics, numbers, tools, employers, degrees, or years of experience. If a bullet has no number, it must still have no number after rewriting.
-3. SYNONYM & EMPHASIS OPTIMIZATION:
-   Rephrase and re-weight bullet points to naturally feature keywords, frameworks, and architecture patterns from the job description.
+3. EVIDENCE-PRESERVING OPTIMIZATION:
+   Rank the existing bullet points by relevance. COPY each selected bullet VERBATIM from the candidate profile. Do not rewrite it or introduce job-description claims into candidate achievements.
 4. TAILOR THE PROFESSIONAL SUMMARY:
-   Write a concise 2-3 sentence summary aligning the candidate's verified achievements with the company's mission.
+   Copy the candidate's original summary verbatim.
 5. REORDER BULLETS: Frontload the achievements that most directly address the job requirements.
 6. Return one entry per role in the candidate profile, echoing its company, title, and start_date exactly as given so the roles can be matched back.
 
@@ -50,6 +50,43 @@ Output ONLY valid JSON adhering to this schema:
   ]
 }
 """
+
+
+_TERM_STOPWORDS = {
+    "the", "and", "for", "with", "you", "our", "your", "are", "will", "have", "has", "this", "that", "from", "their",
+    "who", "work", "team", "role", "job", "about", "all", "can", "able", "into", "across", "more", "etc", "using",
+    "experience", "years", "strong", "good", "including", "such", "other", "within", "also", "must", "should",
+}
+
+
+def job_terms(job: JobPosting) -> Dict[str, float]:
+    """Words of a posting weighted by where they appear: the title counts most."""
+    weights: Dict[str, float] = {}
+    for text, weight in ((job.title, 3.0), (job.description, 1.0)):
+        for word in re.findall(r"[a-z][a-z0-9+#./-]{1,}", (text or "").lower()):
+            word = word.strip("./-")
+            if len(word) > 1 and word not in _TERM_STOPWORDS:
+                weights[word] = weights.get(word, 0.0) + weight
+    # Diminishing returns: a word repeated 30 times in boilerplate is not 30x relevant.
+    return {word: min(weight, 6.0) for word, weight in weights.items()}
+
+
+def relevance(text: str, terms: Dict[str, float]) -> float:
+    words = set(re.findall(r"[a-z][a-z0-9+#./-]{1,}", (text or "").lower()))
+    return sum(terms.get(word.strip("./-"), 0.0) for word in words)
+
+
+def skill_in_posting(skill: str, job: JobPosting) -> bool:
+    haystack = f"{job.title} {job.description}".lower()
+    return re.search(rf"(?<![a-z0-9]){re.escape(skill.lower())}(?![a-z0-9])", haystack) is not None
+
+
+def order_by_relevance(items: List[Any], key, terms: Dict[str, float]) -> List[Any]:
+    """Stable sort, most relevant first; ties keep the candidate's own order."""
+    return [item for _, _, item in sorted(
+        ((-relevance(key(item), terms), index, item) for index, item in enumerate(items)),
+        key=lambda entry: (entry[0], entry[1]),
+    )]
 
 
 class ResumeTailorer:
@@ -77,9 +114,17 @@ class ResumeTailorer:
         """Tailor via the OpenAI Chat Completions API in JSON mode."""
         from openai import OpenAI
 
-        client = OpenAI(api_key=settings.openai_api_key)
+        if self.provider == "openai_compatible":
+            client = OpenAI(
+                api_key=settings.openai_compatible_api_key,
+                base_url=settings.openai_compatible_base_url,
+            )
+            model = settings.openai_compatible_model
+        else:
+            client = OpenAI(api_key=settings.openai_api_key)
+            model = settings.llm_tailor_model
         response = client.chat.completions.create(
-            model=settings.llm_tailor_model,
+            model=model,
             response_format={"type": "json_object"},
             temperature=0.2,
             messages=[
@@ -106,6 +151,10 @@ class ResumeTailorer:
         return _extract_json_object(response.content[0].text)
 
     # --- Deterministic tailoring ---------------------------------------------
+
+    def _call_groq(self, candidate_json, job):
+        from job_agent.llm import groq_complete
+        return groq_complete(TAILORING_SYSTEM_PROMPT, self._build_prompt(candidate_json, job), max_tokens=6000)
 
     def _heuristic_tailor(self, profile: CandidateProfile, job: JobPosting) -> Dict[str, Any]:
         """Deterministic tailoring: reorder bullets by relevance without rewording them.
@@ -341,16 +390,20 @@ class ResumeTailorer:
         self,
         profile: CandidateProfile,
         job: JobPosting,
+        use_llm: bool = True,
     ) -> Dict[str, Any]:
         """Produce the tailored JSON payload the Typst template compiles."""
         console.print(f"[cyan]Tailoring resume for:[/cyan] [bold]{job.title}[/bold] @ {job.company}")
 
         tailored_response: Optional[Dict[str, Any]] = None
-        if self.provider in ("openai", "anthropic"):
-            caller = self._call_openai if self.provider == "openai" else self._call_anthropic
+        if use_llm and self.provider in ("openai", "anthropic", "groq", "openai_compatible"):
+            caller = {"openai": self._call_openai, "anthropic": self._call_anthropic,
+                      "groq": self._call_groq, "openai_compatible": self._call_openai}[self.provider]
             try:
                 tailored_response = caller(profile.model_dump_json(indent=2), job)
             except Exception as exc:
+                if settings.llm_strict:
+                    raise
                 console.print(
                     f"[yellow]{self.provider} tailoring failed ({exc.__class__.__name__}: "
                     f"{str(exc)[:120]}). Using the deterministic engine.[/yellow]"
@@ -365,13 +418,43 @@ class ResumeTailorer:
             (entry["company"].casefold(), entry["title"].casefold(), (entry.get("start_date") or "").casefold()): entry["tailored_bullets"]
             for entry in verified["tailored_experience"]
         }
+        terms = job_terms(job)
 
-        summary = clean_text(verified.get("tailored_summary")) or profile.summary
+        # The model may rank evidence, but novel prose cannot be proven true by
+        # checking numbers alone. Restore exact source bullets for every rewrite,
+        # then use deterministic job-term relevance for anything the model did
+        # not validly select.
+        for role in profile.experience:
+            proposed = bullets_by_role.get(role.key, [])
+            originals = list(role.description_bullets)
+            selected = [bullet for bullet in proposed if bullet in originals]
+            ranked = order_by_relevance(originals, lambda bullet: bullet, terms)
+            bullets_by_role[role.key] = dedupe_preserving_order(selected + ranked)
+
+        summary = profile.summary
+
+        # Skills the posting names come first in each group, then the rest in the
+        # candidate's order. Nothing is added or removed.
+        skills = {
+            group: sorted(values, key=lambda skill, _order={v: i for i, v in enumerate(values)}:
+                          (not skill_in_posting(skill, job), _order[skill]))
+            if isinstance(values, list) else values
+            for group, values in profile.skills.model_dump().items()
+        }
+        projects = order_by_relevance(
+            [proj.model_dump() for proj in profile.projects],
+            lambda proj: " ".join([proj.get("title") or "", proj.get("description") or "",
+                                   " ".join(proj.get("technologies") or [])]),
+            terms,
+        )
+
+        from job_agent.tailoring.regional import regional_policy
 
         return {
+            "regional": regional_policy(job),
             "contact": profile.contact.model_dump(),
             "summary": summary,
-            "skills": profile.skills.model_dump(),
+            "skills": skills,
             "experience": [
                 {
                     "company": exp.company,
@@ -382,10 +465,11 @@ class ResumeTailorer:
                     "end_date": exp.end_date or "Present",
                     "description_bullets": bullets_by_role.get(exp.key, exp.description_bullets),
                 }
-                for exp in profile.experience
+                for exp in sorted(profile.experience, key=lambda role: (
+                    bool(role.is_current or not role.end_date), role.end_date or "9999", role.start_date), reverse=True)
             ],
             "education": [edu.model_dump() for edu in profile.education],
-            "projects": [proj.model_dump() for proj in profile.projects],
+            "projects": projects,
             # Certifications were previously assembled but never passed through, so
             # the template's certifications section could never render.
             "certifications": [cert.model_dump() for cert in profile.certifications],

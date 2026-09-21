@@ -73,6 +73,9 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
 
 
+JOBS_CSV_NAME = "jobs_master.csv"
+
+
 def _artifact(path: Path) -> Dict[str, Any]:
     """Describe an artifact file for the dashboard's output list."""
     exists = path.exists()
@@ -146,6 +149,7 @@ def _source_state() -> Dict[str, Any]:
     """Novel jobs found in the most recent sweep, plus lifetime delta store counts."""
     path = settings.outputs_dir / "scraped_jobs.json"
     jobs = _read_json(path, default=[])
+    coverage = _read_json(settings.outputs_dir / "source_coverage.json", {})
 
     tracked: Dict[str, int] = {}
     try:
@@ -156,15 +160,17 @@ def _source_state() -> Dict[str, Any]:
         pass
 
     return {
-        "status": "ready" if path.exists() else "empty",
-        "summary": f"{len(jobs)} novel job(s)" if path.exists() else "Not run yet",
-        "hint": "Jobs already seen in earlier sweeps are filtered out.",
+        "status": "error" if coverage.get("status") == "failed" else "ready" if path.exists() else "empty",
+        "summary": f"{coverage.get('latest_matching_jobs', len(jobs))} latest matches; {len(jobs)} to process" if path.exists() else "Not run yet",
+        "hint": f"Source status: {coverage.get('status', 'not checked')}. Latest CSV includes already-seen matches; processing avoids repeats.",
         "metrics": {
             "This sweep": len(jobs),
+            "With contact email": sum(1 for job in jobs if isinstance(job, dict) and job.get("contacts")),
             "Tracked all-time": sum(tracked.values()),
         },
         "breakdown": tracked,
-        "artifacts": [_artifact(path)],
+        "artifacts": [_artifact(path), _artifact(settings.outputs_dir / "jobs_latest.csv"),
+                      _artifact(settings.outputs_dir / "source_coverage.json"), _artifact((settings.outputs_dir / JOBS_CSV_NAME))],
     }
 
 
@@ -174,6 +180,7 @@ def _evaluate_state() -> Dict[str, Any]:
     qualified_path = settings.outputs_dir / "qualified_jobs.json"
     evaluated = _read_json(evaluated_path, default=[])
     qualified = _read_json(qualified_path, default=[])
+    progress = _read_json(settings.outputs_dir / "evaluation_progress.json", {})
 
     top = [
         {
@@ -191,7 +198,9 @@ def _evaluate_state() -> Dict[str, Any]:
         "status": "ready" if evaluated_path.exists() else "empty",
         "summary": f"{len(qualified)} qualified" if evaluated_path.exists() else "Not run yet",
         "hint": f"Threshold: fit >= {settings.min_match_score:g}/10.",
-        "metrics": {"Scored": len(evaluated), "Qualified": len(qualified)},
+        "metrics": {"Scored": len(evaluated), "Qualified": len(qualified),
+                    "Missing description": progress.get("missing_descriptions", 0),
+                    "Deferred by limit": progress.get("deferred_by_limit", 0)},
         "top": top,
         "artifacts": [_artifact(evaluated_path), _artifact(qualified_path)],
     }
@@ -220,6 +229,10 @@ def _tailor_state() -> Dict[str, Any]:
                 "title": item.get("title"),
                 "score": item.get("score"),
                 "pdf": Path(item.get("pdf_path", "")).name,
+                "pdf_path": item.get("pdf_path", "") if Path(item.get("pdf_path", "")).is_file() else "",
+                "check": item.get("validation_summary") or "",
+                "check_passed": item.get("validation_passed"),
+                "changes": item.get("changes", []),
                 "restored": item.get("restored_metrics", []),
                 "blocked": item.get("dropped_fabrications", []),
             }
@@ -248,7 +261,8 @@ def _apply_state() -> Dict[str, Any]:
         "metrics": {
             "Submitted": len(successful) - dry_runs,
             "Dry runs": dry_runs,
-            "Fallbacks": len(failed),
+            "Manual apply needed": sum(1 for item in failed if item.get("status") == "skipped"),
+            "Failed": sum(1 for item in failed if item.get("status") != "skipped"),
         },
         "artifacts": [_artifact(path)],
     }
@@ -258,6 +272,7 @@ def _track_state() -> Dict[str, Any]:
     """Rows in the master tracking workbook."""
     path = settings.tracker_path
     rows = 0
+    outreach = {"drafts": 0, "recipients": 0, "roles": 0}
     if path.exists():
         try:
             import openpyxl
@@ -267,13 +282,24 @@ def _track_state() -> Dict[str, Any]:
             workbook.close()
         except Exception:
             rows = 0
+    try:
+        from job_agent.sourcing.delta_store import DeltaStore
+
+        outreach = DeltaStore().outreach_counts()
+    except Exception:
+        pass
 
     return {
         "status": "ready" if path.exists() else "empty",
         "summary": f"{rows} logged" if path.exists() else "Not run yet",
-        "hint": "Re-running updates each job's row instead of duplicating it.",
-        "metrics": {"Rows": rows},
-        "artifacts": [_artifact(path)],
+        "hint": "Re-running updates each job's row and reuses drafted outreach.",
+        "metrics": {
+            "Rows": rows,
+            "Email drafts": outreach["drafts"],
+            "Unique inboxes": outreach["recipients"],
+            "Roles drafted": outreach["roles"],
+        },
+        "artifacts": [_artifact(path), _artifact((settings.outputs_dir / JOBS_CSV_NAME))],
     }
 
 
@@ -297,8 +323,19 @@ def config_state() -> Dict[str, Any]:
     try:
         params = load_search_parameters(path)
     except Exception as exc:
-        return {"status": "error", "path": str(path), "error": str(exc), "values": None}
-    return {"status": "ready", "path": str(path), "error": None, "values": params.model_dump()}
+        return {"status": "error", "path": str(path), "error": str(exc), "values": None, "warnings": []}
+
+    from job_agent.sourcing.scraper import OmnichannelScraper
+
+    return {
+        "status": "ready",
+        "path": str(path),
+        "error": None,
+        "values": params.model_dump(),
+        # Shown in Settings before a run, so a mismatched country or currency is
+        # caught before the sweep spends twenty minutes finding nothing.
+        "warnings": OmnichannelScraper.configuration_warnings(params),
+    }
 
 
 def supported_formats() -> List[str]:
@@ -332,6 +369,75 @@ def available_resumes() -> List[Dict[str, Any]]:
         }
         for pdf in pdfs
     ]
+
+
+RUN_ARTIFACTS = ("scraped_jobs.json", "evaluated_jobs.json", "qualified_jobs.json",
+                 "tailored_resumes/manifest.json", "application_results.json")
+
+
+def last_run_state() -> Optional[Dict[str, Any]]:
+    """When the results on screen were produced, so old ones are not mistaken for new."""
+    from datetime import datetime, timezone
+
+    stamps = [
+        (settings.outputs_dir / name).stat().st_mtime
+        for name in RUN_ARTIFACTS
+        if (settings.outputs_dir / name).is_file()
+    ]
+    if not stamps:
+        return None
+    latest = datetime.fromtimestamp(max(stamps), tz=timezone.utc)
+    age_hours = (datetime.now(timezone.utc) - latest).total_seconds() / 3600
+    return {"at": latest.isoformat(), "age_hours": round(age_hours, 1)}
+
+
+def preferences_state() -> Dict[str, Any]:
+    """The candidate's saved eligibility and salary preferences, for the Settings form."""
+    try:
+        from job_agent.intake.preferences import load_preferences
+
+        preferences = load_preferences()
+        return {"values": preferences.model_dump() if preferences else None, "error": None}
+    except Exception as exc:
+        return {"values": None, "error": str(exc)}
+
+
+def llm_state() -> Dict[str, Any]:
+    """LLM configuration for the Settings UI, with secrets reduced to booleans."""
+    return {
+        "active_provider": settings.active_provider,
+        "default_provider": settings.default_llm_provider,
+        "supported_providers": ["groq", "openai", "anthropic", "openai_compatible", "none"],
+        "has_keys": {
+            "groq": bool(settings.groq_keys),
+            "openai": bool(settings.openai_api_key),
+            "anthropic": bool(settings.anthropic_api_key),
+            "openai_compatible": bool(
+                settings.openai_compatible_api_key and settings.openai_compatible_base_url
+            ),
+        },
+        "models": {
+            "groq": settings.groq_model,
+            "groq_fallback": settings.groq_fallback_model,
+            "openai_intake": settings.llm_intake_model,
+            "openai_rerank": settings.llm_rerank_model,
+            "openai_tailor": settings.llm_tailor_model,
+            "anthropic": settings.anthropic_model,
+            "openai_compatible": settings.openai_compatible_model,
+        },
+        "openai_compatible_base_url": settings.openai_compatible_base_url or "",
+        "strict": settings.llm_strict,
+    }
+
+
+def run_report_state() -> Dict[str, Any]:
+    from job_agent.runtime import pipeline_busy
+    report = _read_json(settings.outputs_dir / "run_report.json", {})
+    if report.get("status") == "running" and not pipeline_busy():
+        report["status"] = "interrupted"
+        report["warnings"] = list(report.get("warnings", [])) + [
+            "The previous worker stopped before finishing. Saved outputs remain available; resume the unfinished phase."]
+    return report
 
 
 def build_snapshot() -> Dict[str, Any]:
@@ -386,5 +492,11 @@ def build_snapshot() -> Dict[str, Any]:
             "outputs": str(settings.outputs_dir),
             "resumes": str(settings.raw_resumes_dir),
             "tracker": str(settings.tracker_path),
+            "jobs_csv": str(settings.outputs_dir / JOBS_CSV_NAME),
         },
+        "last_run": last_run_state(),
+        "run_report": run_report_state(),
+        "source_coverage": _read_json(settings.outputs_dir / "source_coverage.json", {}),
+        "preferences": preferences_state(),
+        "llm": llm_state(),
     }

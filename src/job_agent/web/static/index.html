@@ -24,6 +24,14 @@
 
     <div class="topbar-spacer"></div>
 
+    <button class="btn" id="jobs-btn">Jobs &amp; downloads</button>
+    <label class="toggle">Resume
+      <select id="resume-mode" aria-label="Resume format">
+        <option value="regional">Country-specific ATS</option>
+        <option value="auto">Preserve original PDF</option>
+      </select>
+    </label>
+
     <label class="toggle" id="dry-toggle">
       <input type="checkbox" id="dry-run" checked>
       <span id="dry-label">Dry run (nothing is submitted)</span>
@@ -39,6 +47,13 @@
     <span class="grow" id="sample-banner-text"></span>
     <button class="btn btn-sm" id="banner-setup">Use my resume</button>
     <button class="btn btn-sm btn-ghost" id="banner-dismiss" title="Hide until next reload">Dismiss</button>
+  </div>
+
+  <div class="banner banner-info" id="run-banner" hidden>
+    <span class="banner-icon">🕘</span>
+    <span class="grow" id="run-banner-text"></span>
+    <button class="btn btn-sm" id="run-banner-fresh" title="Move these results to history; seen jobs and sent-email records are kept">Start fresh</button>
+    <button class="btn btn-sm btn-ghost" id="run-banner-dismiss">Dismiss</button>
   </div>
 
   <div class="body">
@@ -72,6 +87,33 @@
 <div class="toasts" id="toasts"></div>
 <div id="modal-root"></div>
 <div id="setup-root"></div>
+<dialog id="jobs-dialog" class="jobs-dialog">
+  <div class="jobs-heading"><div><h2>Your job shortlist</h2><p>Review fit, location restrictions and published contacts.</p></div>
+    <button class="btn" id="jobs-close" aria-label="Close job shortlist">Close</button></div>
+  <div class="jobs-controls">
+    <details class="application-guide"><summary>How to go from search to application</summary>
+      <ol><li>Upload your resume, confirm the extracted details, and set roles, locations and work preferences in Settings.</li>
+      <li>Keep Dry run enabled and run all phases. The agent searches, scores matches, prepares PDFs and updates downloads.</li>
+      <li>Check the search timestamp and source report. Choose Ready for review, then read each PDF and eligibility note.</li>
+      <li>Use the job link for manual applications. Review any email draft and attach the matching PDF before sending it yourself.</li>
+      <li>For supported public forms, turn off Dry run only when you intend to submit, then confirm the Live apply step.</li></ol>
+    </details>
+    <input id="jobs-query" aria-label="Search jobs" placeholder="Search role, company or location">
+    <select id="jobs-mode" aria-label="Filter work mode"><option value="">All work modes</option><option>Remote</option><option>Hybrid</option><option>Onsite</option></select>
+    <label><input type="checkbox" id="jobs-email"> With hiring contact</label>
+    <label><input type="checkbox" id="jobs-current" checked> Latest saved search</label>
+    <label><input type="checkbox" id="jobs-ready"> Ready for review</label>
+    <a class="btn" id="jobs-csv">Download CSV</a>
+    <a class="btn" id="jobs-latest-csv">Latest search CSV</a>
+    <a class="btn" id="jobs-ready-csv">Application shortlist CSV</a>
+    <button class="btn btn-primary" id="jobs-bundle">Download CSV + PDFs</button>
+  </div>
+  <p id="jobs-count" role="status"></p>
+  <p id="jobs-coverage"></p>
+  <p id="jobs-run-status" role="status"></p>
+  <div class="jobs-table-wrap"><table class="jobs-table"><thead><tr><th>Role / company</th><th>Location</th><th>Fit</th><th>Contact</th><th>Resume / apply</th></tr></thead><tbody id="jobs-rows"></tbody></table></div>
+  <button class="btn" id="jobs-more" hidden>Show more</button>
+</dialog>
 
 <script>window.SESSION_TOKEN = "__SESSION_TOKEN__";</script>
 <script src="/static/app.js"></script>

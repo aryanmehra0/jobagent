@@ -15,7 +15,9 @@ that no stage can bypass them:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -51,6 +53,126 @@ MAX_CAREER_YEARS = 60.0
 
 # Boards supported by the `python-jobspy` backend used in Phase 2.
 SUPPORTED_JOB_BOARDS = ("linkedin", "indeed", "glassdoor", "zip_recruiter", "google", "bayt", "naukri", "bdjobs")
+SUPPORTED_PUBLIC_SOURCES = ("remotive", "arbeitnow", "jobicy")
+WORK_MODES = ("remote", "hybrid", "onsite")
+
+# Common misspellings and former names of cities, mapped to the form job boards
+# geocode reliably. Keys are casefolded. Deliberately limited to well-known
+# variants: an entry here silently changes where a sweep searches.
+CITY_ALIASES: Dict[str, str] = {
+    # India
+    "gurgaon": "Gurugram", "gurgoan": "Gurugram", "gurugram": "Gurugram", "gurugao": "Gurugram",
+    "bangalore": "Bengaluru", "banglore": "Bengaluru", "bengaluru": "Bengaluru", "bengalore": "Bengaluru",
+    "bombay": "Mumbai", "mumbai": "Mumbai", "mumbay": "Mumbai",
+    "delhi": "Delhi", "new delhi": "New Delhi", "dehli": "Delhi",
+    "noida": "Noida", "greater noida": "Greater Noida",
+    "hyderabad": "Hyderabad", "hyderbad": "Hyderabad", "hydrabad": "Hyderabad",
+    "chennai": "Chennai", "madras": "Chennai",
+    "kolkata": "Kolkata", "calcutta": "Kolkata",
+    "pune": "Pune", "poona": "Pune",
+    "ahmedabad": "Ahmedabad", "ahmadabad": "Ahmedabad",
+    "chandigarh": "Chandigarh", "jaipur": "Jaipur", "kochi": "Kochi", "cochin": "Kochi",
+    "trivandrum": "Thiruvananthapuram", "thiruvananthapuram": "Thiruvananthapuram",
+    "indore": "Indore", "coimbatore": "Coimbatore", "lucknow": "Lucknow", "bhopal": "Bhopal",
+    # Elsewhere
+    "nyc": "New York, NY", "new york city": "New York, NY", "sf": "San Francisco, CA",
+    "bay area": "San Francisco Bay Area", "remote": "Remote",
+}
+
+# Canonical city names per country, used to spot a sweep whose Indeed country does
+# not match where it is actually searching.
+CITY_COUNTRIES: Dict[str, str] = {
+    **{city: "india" for city in (
+        "Gurugram", "Bengaluru", "Mumbai", "Delhi", "New Delhi", "Noida", "Greater Noida",
+        "Hyderabad", "Chennai", "Kolkata", "Pune", "Ahmedabad", "Chandigarh", "Jaipur",
+        "Kochi", "Thiruvananthapuram", "Indore", "Coimbatore", "Lucknow", "Bhopal",
+    )},
+    **{city: "usa" for city in ("New York, NY", "San Francisco, CA", "San Francisco Bay Area")},
+}
+
+
+# Two-letter codes and alternative names boards use in a location string
+# ("Gurugram, HR, IN", "Bengaluru, Karnataka, India").
+COUNTRY_CODES: Dict[str, Tuple[str, ...]] = {
+    "india": ("in", "ind", "bharat"),
+    "usa": ("us", "united states", "united states of america", "u.s.", "america"),
+    "uk": ("gb", "united kingdom", "england", "scotland", "wales"),
+    "canada": ("ca",), "australia": ("au",), "germany": ("de",), "singapore": ("sg",),
+    "united arab emirates": ("ae", "uae", "dubai", "abu dhabi"), "netherlands": ("nl",),
+    "ireland": ("ie",), "france": ("fr",),
+}
+
+INDIAN_STATES = (
+    "andhra pradesh", "arunachal pradesh", "assam", "bihar", "chhattisgarh", "goa", "gujarat", "haryana",
+    "himachal pradesh", "jharkhand", "karnataka", "kerala", "madhya pradesh", "maharashtra", "manipur",
+    "meghalaya", "mizoram", "nagaland", "odisha", "punjab", "rajasthan", "sikkim", "tamil nadu", "telangana",
+    "tripura", "uttar pradesh", "uttarakhand", "west bengal", "delhi", "ncr", "delhi ncr",
+)
+
+
+def _country_key(country: str) -> str:
+    key = clean_text(country).casefold()
+    for canonical, aliases in COUNTRY_CODES.items():
+        if key == canonical or key in aliases:
+            return canonical
+    return key
+
+
+def location_country(location: Optional[str]) -> Optional[str]:
+    """The country a job location string names, or None when it cannot be told.
+
+    Only explicit evidence counts: a country name, a trailing country code
+    ("Pune, MH, IN"), a known city, or an Indian state. "Remote" alone names no
+    country.
+    """
+    text = clean_text(location).casefold()
+    if not text:
+        return None
+    parts = [part.strip() for part in re.split(r"[,/|()\-]", text) if part.strip()]
+    for canonical, aliases in COUNTRY_CODES.items():
+        names = (canonical,) + tuple(alias for alias in aliases if len(alias) > 3 or "." in alias)
+        if any(re.search(rf"(?<![a-z]){re.escape(name)}(?![a-z])", text) for name in names):
+            return canonical
+    # A trailing two-letter code is a country only in "City, ST, CC" or "ST, CC"
+    # form. "San Francisco, CA" and "Indianapolis, IN" end in US state codes.
+    if len(parts) >= 3 or (len(parts) == 2 and len(parts[0]) == 2):
+        for canonical, aliases in COUNTRY_CODES.items():
+            codes = tuple(alias for alias in aliases if len(alias) <= 3 and "." not in alias)
+            if parts[-1] in codes:
+                return canonical
+    for city, country in CITY_COUNTRIES.items():
+        if re.search(rf"(?<![a-z]){re.escape(city.casefold())}(?![a-z])", text):
+            return country
+    for alias, city in CITY_ALIASES.items():
+        if CITY_COUNTRIES.get(city) and re.search(rf"(?<![a-z]){re.escape(alias)}(?![a-z])", text):
+            return CITY_COUNTRIES[city]
+    if any(re.search(rf"(?<![a-z]){re.escape(state)}(?![a-z])", text) for state in INDIAN_STATES):
+        return "india"
+    return None
+
+
+def location_in_countries(location: Optional[str], countries: List[str]) -> Optional[bool]:
+    """Whether a location is in one of the countries; None when the location names none."""
+    found = location_country(location)
+    if found is None:
+        return None
+    return found in {_country_key(country) for country in countries}
+
+
+def _jobspy_countries() -> set:
+    """Every country name JobSpy's Indeed/Glassdoor backends accept.
+
+    Returns an empty set when JobSpy is not installed, which disables the check
+    rather than rejecting every configuration.
+    """
+    try:
+        from jobspy.model import Country
+    except Exception:
+        return set()
+    names: set = set()
+    for country in Country:
+        names.update(part.strip() for part in country.value[0].split(","))
+    return names
 
 FactCategory = Literal["metric", "deployment", "scale", "revenue", "tenure", "award"]
 
@@ -132,21 +254,25 @@ class WorkAuthorization(StrictModel):
     """
 
     citizenship: List[str] = Field(default_factory=list, description="Countries of citizenship")
-    current_country: str = Field(..., min_length=2, max_length=80, description="Country of current residence")
+    current_country: Optional[str] = Field(None, min_length=2, max_length=80, description="Country of current residence")
     authorized_countries: List[str] = Field(
         default_factory=list,
         description="Countries the candidate may work in without sponsorship",
     )
-    requires_sponsorship: bool = Field(
-        default=False,
+    requires_sponsorship: Optional[bool] = Field(
+        default=None,
         description="Whether the candidate will now or in the future require visa sponsorship",
     )
     visa_status: Optional[str] = Field(None, max_length=80, description="Current visa type (e.g. 'H-1B', 'OPT', 'F-1')")
+    remote_worldwide: Optional[bool] = Field(
+        default=None,
+        description="Willing to work remotely for employers in any country, from the current country",
+    )
 
     @field_validator("current_country", mode="before")
     @classmethod
-    def _clean_country(cls, value: Any) -> str:
-        return clean_text(value)
+    def _clean_country(cls, value: Any) -> Optional[str]:
+        return clean_text(value) or None
 
     @field_validator("citizenship", "authorized_countries", mode="before")
     @classmethod
@@ -165,14 +291,31 @@ class WorkAuthorization(StrictModel):
 
     @model_validator(mode="after")
     def _ensure_home_country_authorized(self) -> WorkAuthorization:
-        """A candidate is assumed authorized in their country of residence.
-
-        Without this, a profile that omits `authorized_countries` would answer "no"
-        to every location eligibility question on an application form.
-        """
-        if not self.authorized_countries and self.current_country:
-            object.__setattr__(self, "authorized_countries", [self.current_country])
+        """Residence alone does not establish work authorization."""
         return self
+
+    def needs_sponsorship_for(self, location: Optional[str], is_remote: bool = False) -> Optional[bool]:
+        """Whether this job would need visa sponsorship, or None when that cannot be told.
+
+        `requires_sponsorship` states the need for countries the candidate is not
+        authorized in. A job in an authorized country needs none, and neither
+        does a remote job done from the candidate's own country — unless its
+        location names another country, where a relocation is implied.
+        """
+        if self.requires_sponsorship is None:
+            return None
+        if not self.requires_sponsorship:
+            return False
+        home = self.authorized_countries or ([self.current_country] if self.current_country else [])
+        inside = location_in_countries(location, home) if home else None
+        if inside is True:
+            return False
+        if inside is False:
+            return not (is_remote and self.remote_worldwide)
+        # The location names no country.
+        if is_remote and self.remote_worldwide:
+            return False
+        return None
 
     def is_authorized_in(self, location: str) -> Optional[bool]:
         """Whether the candidate is work-authorized for a location, or None if unknown.
@@ -183,6 +326,10 @@ class WorkAuthorization(StrictModel):
         haystack = clean_text(location).casefold()
         if not haystack:
             return None
+        # Only a positive match is asserted. A country missing from the list may
+        # just be unstated (a second citizenship), so it stays unknown, not "no".
+        if self.authorized_countries and location_in_countries(location, self.authorized_countries):
+            return True
         for country in self.authorized_countries:
             if country.casefold() in haystack:
                 return True
@@ -193,7 +340,7 @@ class WorkAuthorization(StrictModel):
         }
         for country in self.authorized_countries:
             for alias in aliases.get(country.casefold(), ()):
-                if alias in haystack:
+                if alias in haystack or (country.casefold() == "united states" and re.search(r"\bus\b", haystack)):
                     return True
         return None
 
@@ -485,8 +632,15 @@ class CandidateProfile(StrictModel):
         ..., ge=0.0, le=MAX_CAREER_YEARS, description="Total professional experience in years"
     )
     desired_salary: Optional[int] = Field(
-        default=None, ge=0, le=10_000_000,
+        default=None, ge=0, le=100_000_000,
         description="Salary expectation used to answer compensation questions; omitted when unknown",
+    )
+    desired_salary_max: Optional[int] = Field(
+        default=None, ge=0, le=100_000_000,
+        description="Top of the expected salary range, when a range was given",
+    )
+    salary_currency: Optional[str] = Field(
+        default=None, description="ISO currency code of the salary expectation, e.g. INR"
     )
 
     # Provenance and integrity
@@ -500,6 +654,50 @@ class CandidateProfile(StrictModel):
         default=None, description="SHA-256 integrity hash over all locked facts"
     )
     last_updated: str = Field(default_factory=utc_now_iso, description="Timestamp of profile digitization")
+
+    @field_validator("salary_currency", mode="before")
+    @classmethod
+    def _clean_salary_currency(cls, value: Any) -> Optional[str]:
+        cleaned = clean_text(value).upper()
+        if not cleaned:
+            return None
+        if not re.fullmatch(r"[A-Z]{3}", cleaned):
+            raise ValueError("salary_currency must be a 3-letter code such as INR or USD")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _check_salary_range(self) -> CandidateProfile:
+        if self.desired_salary is not None and self.desired_salary_max is not None \
+                and self.desired_salary_max < self.desired_salary:
+            raise ValueError("desired_salary_max must not be below desired_salary")
+        return self
+
+    def salary_expectation_text(self) -> Optional[str]:
+        """The expectation as a person would write it: "INR 10,00,000 - 14,00,000 per year (10-14 LPA)"."""
+        if self.desired_salary is None:
+            return None
+        currency = self.salary_currency or ""
+
+        def money(amount: int) -> str:
+            if currency == "INR":
+                text = str(amount)
+                head, tail = text[:-3], text[-3:]
+                groups = []
+                while len(head) > 2:
+                    groups.insert(0, head[-2:])
+                    head = head[:-2]
+                if head:
+                    groups.insert(0, head)
+                return ",".join(groups + [tail]) if groups else tail
+            return f"{amount:,}"
+
+        top = self.desired_salary_max
+        span = money(self.desired_salary) + (f" - {money(top)}" if top and top != self.desired_salary else "")
+        text = f"{currency} {span} per year".strip()
+        if currency == "INR":
+            lakhs = lambda amount: f"{amount / 100000:g}"
+            text += f" ({lakhs(self.desired_salary)}{'-' + lakhs(top) if top and top != self.desired_salary else ''} LPA)"
+        return text
 
     @field_validator("summary", mode="before")
     @classmethod
@@ -572,9 +770,23 @@ class CandidateProfile(StrictModel):
         collected.sort()
         return hashlib.sha256("||".join(collected).encode("utf-8")).hexdigest()
 
+    profile_hash: Optional[str] = None
+
+    def compute_profile_hash(self) -> str:
+        payload = self.model_dump(exclude={"fact_hash", "profile_hash", "last_updated"})
+        # Fields added after profiles were first sealed are left out while unset,
+        # so an existing seal still verifies.
+        for key in ("desired_salary_max", "salary_currency"):
+            if payload.get(key) is None:
+                payload.pop(key, None)
+        if payload.get("work_authorization", {}).get("remote_worldwide") is None:
+            payload.get("work_authorization", {}).pop("remote_worldwide", None)
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+
     def seal_profile(self) -> CandidateProfile:
         """Seal the profile by computing and setting the fact hash."""
         self.fact_hash = self.compute_fact_hash()
+        self.profile_hash = self.compute_profile_hash()
         self.last_updated = utc_now_iso()
         return self
 
@@ -582,7 +794,8 @@ class CandidateProfile(StrictModel):
         """Whether the locked facts still match the seal."""
         if not self.fact_hash:
             return False
-        return self.compute_fact_hash() == self.fact_hash
+        return (self.compute_fact_hash() == self.fact_hash
+                and self.profile_hash == self.compute_profile_hash())
 
 
 # ==============================================================================
@@ -604,20 +817,44 @@ class SearchParameters(StrictModel):
         default_factory=lambda: ["Remote"], min_length=1, description="Target cities, states, or 'Remote'"
     )
     is_remote: bool = Field(default=True, description="Whether only remote jobs should be kept")
+    work_modes: Optional[List[Literal["remote", "hybrid", "onsite"]]] = Field(
+        default=None,
+        description=(
+            "Work arrangements to keep. When omitted, legacy is_remote and onsite_countries "
+            "settings are converted automatically."
+        ),
+    )
+    onsite_countries: List[str] = Field(
+        default_factory=list,
+        description=(
+            "With is_remote on, on-site and hybrid jobs are also kept when located in one of these "
+            "countries (e.g. ['india']): remote anywhere, or on-site at home."
+        ),
+    )
     hours_old: int = Field(
         default=48, ge=1, le=8760, description="Maximum posting age in hours (1 hour to 1 year)"
     )
     job_boards: List[str] = Field(
         default_factory=lambda: ["linkedin", "indeed", "glassdoor", "zip_recruiter"],
-        min_length=1,
         description="Platforms to scrape via JobSpy",
+    )
+    public_sources: List[str] = Field(
+        default_factory=list,
+        description="Public job APIs to query in addition to JobSpy and company ATS boards",
     )
     country_indeed: str = Field(
         default="usa",
         description="Country used by the Indeed and Glassdoor backends (e.g. 'usa', 'india', 'uk')",
     )
     min_salary: Optional[int] = Field(
-        default=None, ge=0, le=10_000_000, description="Minimum annual salary threshold (optional)"
+        default=None, ge=0, le=100_000_000, description="Minimum annual salary threshold (optional)"
+    )
+    salary_currency: str = Field(
+        default="USD",
+        description=(
+            "ISO currency code `min_salary` is expressed in. The floor is only applied to "
+            "postings listed in this currency; others are kept rather than compared across currencies."
+        ),
     )
     max_results_per_board: int = Field(
         default=25, ge=1, le=200, description="Limit on jobs to ingest per board per search term"
@@ -627,6 +864,13 @@ class SearchParameters(StrictModel):
         description="Direct ATS boards to poll, keyed by provider ('greenhouse', 'lever', 'ashby')",
     )
     proxy_url: Optional[str] = Field(default=None, description="Residential proxy string, overriding .env")
+    find_contacts: bool = Field(
+        default=True,
+        description=(
+            "Look up published contact emails on each employer's website (and Hunter.io when "
+            "HUNTER_API_KEY is set). Emails printed in the job post are always kept."
+        ),
+    )
 
     @field_validator("target_domains", "locations", mode="before")
     @classmethod
@@ -661,10 +905,89 @@ class SearchParameters(StrictModel):
             )
         return dedupe_preserving_order(boards)
 
+    @field_validator("public_sources", mode="before")
+    @classmethod
+    def _validate_public_sources(cls, value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            value = [part for part in re.split(r"[,;]", value)]
+        sources = [clean_text(item).lower().replace("-", "") for item in value]
+        aliases = {"arbeit_now": "arbeitnow", "arbeit-now": "arbeitnow"}
+        sources = [aliases.get(source, source) for source in sources if source]
+        unknown = sorted({source for source in sources if source not in SUPPORTED_PUBLIC_SOURCES})
+        if unknown:
+            raise ValueError(
+                f"Unsupported public source(s): {', '.join(unknown)}. "
+                f"Supported: {', '.join(SUPPORTED_PUBLIC_SOURCES)}"
+            )
+        return dedupe_preserving_order(sources)
+
+    @field_validator("work_modes", mode="before")
+    @classmethod
+    def _validate_work_modes(cls, value: Any) -> Optional[List[str]]:
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = [part for part in re.split(r"[,;]", value)]
+        modes = [clean_text(item).lower().replace("on-site", "onsite") for item in value]
+        modes = [mode for mode in modes if mode]
+        unknown = sorted({mode for mode in modes if mode not in WORK_MODES})
+        if unknown:
+            raise ValueError(
+                f"Unsupported work mode(s): {', '.join(unknown)}. Supported: {', '.join(WORK_MODES)}"
+            )
+        if not modes:
+            raise ValueError("Select at least one work mode")
+        return dedupe_preserving_order(modes)
+
+    @property
+    def selected_work_modes(self) -> List[str]:
+        """Effective work modes, including compatibility with older configuration files."""
+        if self.work_modes:
+            return list(self.work_modes)
+        if not self.is_remote:
+            return list(WORK_MODES)
+        if self.onsite_countries:
+            return list(WORK_MODES)
+        return ["remote"]
+
+    @field_validator("locations", mode="after")
+    @classmethod
+    def _normalise_locations(cls, value: List[str]) -> List[str]:
+        """Correct well-known city misspellings so boards can geocode them.
+
+        LinkedIn returned no results at all for "gurgoan". Only names in the alias
+        table are changed; anything unrecognised is passed through as typed, since
+        guessing at an unknown place would search somewhere the user never asked for.
+        """
+        normalised = [CITY_ALIASES.get(clean_text(item).casefold(), item) for item in value]
+        return dedupe_preserving_order(normalised)
+
     @field_validator("country_indeed", mode="before")
     @classmethod
     def _clean_country(cls, value: Any) -> str:
-        return clean_text(value).lower() or "usa"
+        """Accept only a country the Indeed and Glassdoor backends support.
+
+        An unsupported value is otherwise discovered mid-sweep, inside JobSpy,
+        after the boards before it have already been queried.
+        """
+        country = clean_text(value).lower() or "usa"
+        supported = _jobspy_countries()
+        if supported and country not in supported:
+            raise ValueError(
+                f"country_indeed '{country}' is not supported by the job board backend. "
+                f"Examples: india, usa, uk, canada, australia, singapore, germany."
+            )
+        return country
+
+    @field_validator("salary_currency", mode="before")
+    @classmethod
+    def _clean_salary_currency(cls, value: Any) -> str:
+        currency = clean_text(value).upper() or "USD"
+        if not re.fullmatch(r"[A-Z]{3}", currency):
+            raise ValueError(f"salary_currency must be a 3-letter ISO code such as USD or INR, got {value!r}")
+        return currency
 
     @field_validator("ats_companies", mode="before")
     @classmethod
@@ -704,10 +1027,60 @@ class SearchParameters(StrictModel):
             )
         return cleaned
 
+    @model_validator(mode="after")
+    def _require_a_source(self) -> SearchParameters:
+        if not self.job_boards and not self.public_sources and not self.ats_companies:
+            raise ValueError("Configure at least one job board, public source, or direct ATS company")
+        return self
+
 
 # ==============================================================================
 # SOURCED JOB SCHEMA (Phase 2 output / downstream input)
 # ==============================================================================
+
+ContactSource = Literal["job_post", "company_site", "hunter"]
+ContactKind = Literal["hiring", "person", "general", "other"]
+
+
+_COMPANY_SUFFIXES = re.compile(
+    r"\b(private|pvt|limited|ltd|llp|llc|inc|incorporated|corp|corporation|co|company|gmbh|plc|"
+    r"technologies|technology|solutions|services|india|global|group|the)\b"
+)
+_TITLE_NOISE = re.compile(r"\b(remote|hybrid|onsite|on-site|wfh|work from home|urgent|hiring|immediate joiner[s]?)\b")
+
+
+def job_fingerprint(company: str, title: str) -> str:
+    """Board-independent key for a role: normalised company plus normalised title."""
+    company_key = _COMPANY_SUFFIXES.sub(" ", re.sub(r"[^a-z0-9 ]+", " ", clean_text(company).casefold()))
+    title_text = re.sub(r"\(.*?\)|\[.*?\]", " ", clean_text(title).casefold())
+    title_key = _TITLE_NOISE.sub(" ", re.sub(r"[^a-z0-9+# ]+", " ", title_text))
+    token = " ".join(company_key.split()) + "|" + " ".join(title_key.split())
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+class JobContact(StrictModel):
+    """A published email address for a posting, with where it was found.
+
+    Provenance is mandatory. A contact whose origin cannot be shown is exactly
+    the kind a user should not send a resume to.
+    """
+
+    email: EmailStr
+    kind: ContactKind = "other"
+    source: ContactSource
+    source_url: Optional[str] = Field(None, description="Page the address was published on")
+    confidence: Optional[int] = Field(None, ge=0, le=100, description="Lookup service confidence, when given")
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _lowercase(cls, value: Any) -> str:
+        return clean_text(value).lower()
+
+    @field_validator("source_url", mode="before")
+    @classmethod
+    def _clean_source_url(cls, value: Any) -> Optional[str]:
+        return normalize_url(value)
+
 
 class JobPosting(StrictModel):
     """Normalized, deduplicated job posting from JobSpy or a direct ATS feed."""
@@ -720,12 +1093,53 @@ class JobPosting(StrictModel):
     description: str = Field(default="", description="Complete job description text")
     date_posted: Optional[str] = Field(None, description="Date or timestamp posted")
     is_remote: bool = Field(default=False, description="Remote work indicator")
+    work_mode: Optional[Literal["remote", "hybrid", "onsite"]] = Field(
+        default=None, description="Normalized work arrangement inferred from the listing"
+    )
     salary_min: Optional[float] = Field(None, ge=0, description="Minimum salary if listed")
     salary_max: Optional[float] = Field(None, ge=0, description="Maximum salary if listed")
     salary_currency: Optional[str] = Field("USD", max_length=8, description="Currency for listed salary")
     job_type: Optional[str] = Field(None, max_length=60, description="Employment type (fulltime, contract, ...)")
     source: str = Field(..., min_length=1, max_length=40, description="Discovery source")
     discovered_at: str = Field(default_factory=utc_now_iso, description="Timestamp when listing was discovered")
+    apply_url: Optional[str] = Field(
+        None,
+        description=(
+            "The employer's own application form, when known. `job_url` is often a board "
+            "listing (LinkedIn, Indeed) that needs a login; this is where auto-apply goes."
+        ),
+    )
+    company_website: Optional[str] = Field(None, description="The hiring company's own website")
+    contacts: List[JobContact] = Field(
+        default_factory=list, description="Published emails for sending a resume, best first"
+    )
+
+    @field_validator("apply_url", "company_website", mode="before")
+    @classmethod
+    def _clean_optional_urls(cls, value: Any) -> Optional[str]:
+        return normalize_url(value)
+
+    @field_validator("contacts", mode="after")
+    @classmethod
+    def _order_contacts(cls, value: List[JobContact]) -> List[JobContact]:
+        """One entry per address, most useful for sending a resume first."""
+        from job_agent.contacts.extract import KIND_RANK
+
+        seen: Dict[str, JobContact] = {}
+        source_rank = {"job_post": 0, "company_site": 1, "hunter": 2}
+        for contact in value:
+            existing = seen.get(contact.email)
+            # Keep the most direct provenance: the job post beats a crawled page.
+            if existing is None or source_rank[contact.source] < source_rank[existing.source]:
+                seen[contact.email] = contact
+        return sorted(seen.values(), key=lambda c: (KIND_RANK[c.kind], source_rank[c.source]))
+
+    def primary_contact(self) -> Optional[JobContact]:
+        """The best address to send a resume to: a recruiting mailbox or a named person."""
+        for contact in self.contacts:
+            if contact.kind in ("hiring", "person"):
+                return contact
+        return self.contacts[0] if self.contacts else None
 
     @field_validator("title", "company", mode="before")
     @classmethod
@@ -791,14 +1205,23 @@ class JobPosting(StrictModel):
 
     @model_validator(mode="after")
     def _reconcile_derived_fields(self) -> JobPosting:
-        """Repair inverted salary bands and infer remoteness from the text."""
+        """Repair inverted salary bands and infer a consistent work arrangement."""
         if self.salary_min is not None and self.salary_max is not None and self.salary_min > self.salary_max:
-            object.__setattr__(self, "salary_min", self.salary_max)
-            object.__setattr__(self, "salary_max", self.salary_min)
-        if not self.is_remote:
-            haystack = f"{self.title} {self.location}".casefold()
-            if "remote" in haystack or "work from home" in haystack:
-                object.__setattr__(self, "is_remote", True)
+            low, high = self.salary_max, self.salary_min
+            object.__setattr__(self, "salary_min", low)
+            object.__setattr__(self, "salary_max", high)
+        haystack = f"{self.title} {self.location}".casefold()
+        mode = self.work_mode
+        if mode is None:
+            if "hybrid" in haystack:
+                mode = "hybrid"
+            elif self.is_remote or "remote" in haystack or "work from home" in haystack or "wfh" in haystack:
+                mode = "remote"
+            else:
+                mode = "onsite"
+            object.__setattr__(self, "work_mode", mode)
+        if self.is_remote != (mode == "remote"):
+            object.__setattr__(self, "is_remote", mode == "remote")
         return self
 
     @classmethod
@@ -811,7 +1234,14 @@ class JobPosting(StrictModel):
         """
         cleaned_url = clean_text(job_url)
         if cleaned_url:
-            token = re.sub(r"[?#].*$", "", cleaned_url).rstrip("/").lower()
+            parts = urlsplit(cleaned_url)
+            # Keep posting identifiers such as gh_jid and jk; strip only known
+            # tracking parameters. Stripe serves every role on /jobs/search.
+            query = sorted((key, value) for key, value in parse_qsl(parts.query)
+                           if not key.lower().startswith("utm_")
+                           and key.lower() not in {"gh_src", "source", "ref", "referrer", "trackingid"})
+            token = urlunsplit((parts.scheme.lower(), parts.netloc.lower(),
+                               parts.path.rstrip("/"), urlencode(query), ""))
         else:
             token = f"{clean_text(company).lower()}:{clean_text(title).lower()}"
         return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
@@ -821,6 +1251,16 @@ class JobPosting(StrictModel):
         from job_agent.config.normalize import parse_posting_timestamp
 
         return parse_posting_timestamp(self.date_posted)
+
+    def fingerprint(self) -> str:
+        """Identity of the role independent of where it was found.
+
+        The same opening appears on LinkedIn, Indeed and the company's own ATS
+        under three URLs and therefore three IDs. Company and title, normalised,
+        identify it across boards and sweeps, so it is evaluated, applied to and
+        emailed about once.
+        """
+        return job_fingerprint(self.company, self.title)
 
     def age_hours(self) -> Optional[float]:
         """How many hours ago this was posted, or None when the date is unknown."""
@@ -967,12 +1407,21 @@ class TailoredResumeRecord(StrictModel):
     score: float = Field(..., ge=0.0, le=10.0)
     pdf_path: str
     json_path: str
+    profile_hash: Optional[str] = None
+    pdf_sha256: Optional[str] = None
+    target_country: Optional[str] = None
+    regional: Dict[str, Any] = Field(default_factory=dict)
     restored_metrics: List[str] = Field(
         default_factory=list, description="Locked metrics the tailorer had to restore after rewriting"
     )
     dropped_fabrications: List[str] = Field(
         default_factory=list, description="Invented metrics removed from the rewritten bullets"
     )
+    mode: str = Field(default="generated", description="faithful (the candidate's own PDF) or generated")
+    changes: List[str] = Field(default_factory=list, description="What was reordered for this job")
+    validation_passed: Optional[bool] = Field(default=None, description="Whether every PDF check passed")
+    validation_summary: Optional[str] = Field(default=None, description="One-line result of the PDF checks")
+    validation: Dict[str, Any] = Field(default_factory=dict, description="Each PDF check and its detail")
     tailored_at: str = Field(default_factory=utc_now_iso)
 
     model_config = ConfigDict(extra="ignore", validate_assignment=True, str_strip_whitespace=True)
@@ -991,6 +1440,8 @@ class ApplicationOutcome(StrictModel):
     fit_score: Optional[float] = Field(default=None, ge=0.0, le=10.0)
     error: Optional[str] = None
     pdf_path: Optional[str] = None
+    apply_url: Optional[str] = None
+    channel: Optional[str] = None
     finished_at: str = Field(default_factory=utc_now_iso)
 
     model_config = ConfigDict(extra="ignore", validate_assignment=True, str_strip_whitespace=True)
