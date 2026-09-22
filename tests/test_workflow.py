@@ -160,7 +160,7 @@ def test_cli_full_run_uses_shared_flow_and_defaults_to_dry_run(monkeypatch, tmp_
     monkeypatch.setattr(run.PipelineRunner, "run_sync", run_sync)
     result = CliRunner().invoke(cli, ["run-pipeline", "--skip-intake"])
     assert result.exit_code == 0, result.output
-    assert calls[0][0] == ["source", "evaluate", "tailor", "apply", "track"]
+    assert calls[0][0] == ["source", "evaluate", "tailor", "apply", "track", "prep"]
     assert calls[0][1]["dry_run"] is True
     assert calls[0][1]["assume_yes"] is False
     assert calls[0][1]["tailoring_mode"] == "regional"

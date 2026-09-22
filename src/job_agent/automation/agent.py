@@ -74,13 +74,16 @@ class AutoApplyAgent:
         pdf_resume_path: Path,
         dry_run: bool = False,
         fit_score: Optional[float] = None,
+        assist_workday: bool = False,
+        review_callback=None,
     ) -> Dict[str, Any]:
         """Run the auto-apply sequence for a single posting.
 
         Returns a validated `ApplicationOutcome` as a dict.
         """
         console.print(f"\n[bold cyan]=== Auto-apply: {job.title} @ {job.company} ===[/bold cyan]")
-        route = route_application(job)
+        route = route_application(job, assist_workday=assist_workday)
+        assisted = route.channel == "workday_assisted"
         console.print(f"Portal : {route.url}  [dim]({route.channel})[/dim]")
         console.print(f"Resume : {pdf_resume_path}")
 
@@ -133,6 +136,15 @@ class AutoApplyAgent:
 
                 self.challenge_handler.handle_if_challenged(page)
 
+                if assisted and page.locator("input[type='password']").count():
+                    error_message = "Workday account access requires your action. No credentials were entered."
+                    if review_callback is not None:
+                        review_callback(page, error_message + " Sign in yourself, open the application form, then return here to resume assistance.")
+                        if not page.locator("input[type='password']").count():
+                            error_message = None
+                            continue
+                    break
+
                 if navigator.detect_submission_success():
                     console.print("[bold green]Submission confirmed on page.[/bold green]")
                     submitted = True
@@ -160,6 +172,9 @@ class AutoApplyAgent:
                 if not submit_attempted:
                     submit_button = navigator.find_action_button("submit")
                     if submit_button:
+                        if assisted:
+                            error_message = "Workday fields prepared for your review. Automatic submission is disabled."
+                            break
                         invalid = page.locator("input:invalid, select:invalid, textarea:invalid")
                         if invalid.count():
                             error_message = "Required fields are missing or invalid; complete them manually before submission."
@@ -175,6 +190,9 @@ class AutoApplyAgent:
 
                 next_button = navigator.find_action_button("next")
                 if next_button:
+                    if page.locator("input:invalid, select:invalid, textarea:invalid").count():
+                        error_message = "Required fields remain unanswered; complete this step yourself."
+                        break
                     console.print("  - Multi-page application; advancing...")
                     next_button.click()
                     navigator.wait_for_idle(timeout=5000)
@@ -201,6 +219,8 @@ class AutoApplyAgent:
             error_message = str(exc)
             console.print(f"[red]Auto-apply error: {error_message}[/red]")
         finally:
+            if assisted and review_callback is not None:
+                review_callback(page, error_message or "Review the Workday page before continuing manually.")
             if filler.skipped_fields:
                 console.print(
                     f"[yellow]{len(filler.skipped_fields)} field(s) left blank for lack of profile data:[/yellow] "
@@ -218,7 +238,7 @@ class AutoApplyAgent:
 
         return self._outcome(
             job,
-            "applied" if submitted else "failed",
+            "applied" if submitted else ("skipped" if assisted else "failed"),
             steps,
             fit_score,
             error_message,

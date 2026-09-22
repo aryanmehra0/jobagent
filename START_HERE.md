@@ -1,10 +1,32 @@
 # Start applying with Job Agent
 
+For a new installation, use Python 3.11 or newer and run these commands from
+the project folder on Windows. The explicit environment path avoids needing
+to change PowerShell's activation policy:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m playwright install chromium
+.\.venv\Scripts\python.exe main.py ui
+```
+
+Upload your own resume in the dashboard. API keys are optional; without them,
+the agent uses deterministic scoring and document preparation. Fresh job searches
+still require internet access. Use the same environment's Python for later commands.
+
 Open a terminal in this project and start the dashboard:
 
 ```powershell
 python main.py ui
 ```
+
+**To download your results:** click **Jobs & downloads → Download everything
+(ZIP)**, right-click the saved ZIP and choose **Extract All**, then open
+`index.html`. It shows the review shortlist first and links to each included
+resume, cover letter, interview guide, CSV and Excel workbook. You can also use
+the individual download links beside each job. This downloads saved results;
+run the agent first whenever you need a fresh search.
 
 1. **Confirm your profile.** Upload your resume if needed. Check the extracted
    name, skills, employment dates and achievements. Correct the source resume
@@ -30,6 +52,43 @@ python main.py ui
    application; their links and reasons are recorded.
 
 ## Downloads after a run
+
+Interview preparation is now Phase 7. Open a job's **Interview Prep** link for
+ten questions, a role briefing and STAR practice prompts. The evidence is copied
+from your sealed profile; fill bracketed context/result prompts yourself. Full
+runs include this phase. To prepare the current shortlist without another search:
+
+```powershell
+python main.py prep --offline
+```
+
+Enable **Cover letters** before running Tailoring, or use
+`python main.py tailor --mode regional --cover-letter`. This is opt-in; it creates
+a separate validated one-page PDF per role. Review it before attaching it.
+
+The **Analytics** inspector tab counts actual applications and observed replies.
+Dry runs and unsent drafts never count as applications. **Why this score** in
+each job shows the existing reasoning, matches, gaps and any reported gap already
+present in your profile. It does not change the fit score or invent skills.
+
+For reply tracking, set `IMAP_HOST`, `IMAP_USER`, `IMAP_APP_PASSWORD` and an explicit
+`IMAP_FOLDER` in your local `.env`, then run `python main.py sync-inbox`. This reads
+up to 100 pending messages in that folder from the past 14 days. It never marks
+messages read or sends mail. Matching requires a known employer domain, company,
+role and recorded application; ambiguous messages are ignored. Bodies are not
+saved. `INBOX_USE_LLM=1` separately opts into sending ambiguous matched message
+text to your configured provider. Without that flag, classification stays local.
+
+`python main.py contacts --limit 5` checks public employer team/about pages for
+explicit names and relevant titles. Results appear under **Possible contacts
+(unverified)**. These are leads, not referrals or verified email recipients.
+
+`python main.py workday-assist --job-id <id>` opens a visible browser for a
+qualified Workday job with a validated resume. It fills supported profile fields,
+leaves demographic disclosures alone and stops before final submission. Account
+access and unknown required answers remain yours to complete. Workday live
+submission remains disabled; public-page checks could not validate the complete
+application flow. iCIMS, Taleo and SuccessFactors have no new dedicated adapter.
 
 | File in `data/outputs/` | Use it for |
 | --- | --- |

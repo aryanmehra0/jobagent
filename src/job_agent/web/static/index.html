@@ -32,6 +32,7 @@
       </select>
     </label>
 
+    <label class="toggle"><input type="checkbox" id="cover-letter">Cover letters</label>
     <label class="toggle" id="dry-toggle">
       <input type="checkbox" id="dry-run" checked>
       <span id="dry-label">Dry run (nothing is submitted)</span>
@@ -69,6 +70,7 @@
         <button class="tab is-active" data-tab="details" role="tab">Details</button>
         <button class="tab" data-tab="log" role="tab">Live log</button>
         <button class="tab" data-tab="settings" role="tab">Settings</button>
+        <button class="tab" data-tab="analytics" role="tab">Analytics</button>
       </div>
 
       <section class="panel" id="panel-details" role="tabpanel">
@@ -80,6 +82,7 @@
       </div>
 
       <section class="panel" id="panel-settings" role="tabpanel" hidden></section>
+      <section class="panel" id="panel-analytics" role="tabpanel" hidden></section>
     </aside>
   </div>
 </div>
@@ -106,7 +109,8 @@
     <a class="btn" id="jobs-csv">Download CSV</a>
     <a class="btn" id="jobs-latest-csv">Latest search CSV</a>
     <a class="btn" id="jobs-ready-csv">Application shortlist CSV</a>
-    <button class="btn btn-primary" id="jobs-bundle">Download CSV + PDFs</button>
+    <button class="btn btn-primary" id="jobs-bundle">Download everything (ZIP)</button>
+    <p class="download-help">Recommended: download the ZIP, choose Extract All, then open index.html. It links every included job document and spreadsheet. Cover letters are included only when you enable them.</p>
   </div>
   <p id="jobs-count" role="status"></p>
   <p id="jobs-coverage"></p>

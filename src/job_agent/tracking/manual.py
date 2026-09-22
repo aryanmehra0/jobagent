@@ -19,6 +19,8 @@ def mark_applied(job_id: str, undo: bool = False):
     path = settings.outputs_dir / "manual_applications.json"
     updates = _read_json(path, {})
     if undo:
+        if rows[job_id].get('Status', '').startswith('replied_'):
+            raise ValueError('A reply has been recorded; the application cannot be undone with a manual marker.')
         previous = updates.pop(job_id, None)
         if previous is None:
             raise ValueError("Only your own manual applied marker can be undone.")
@@ -26,7 +28,7 @@ def mark_applied(job_id: str, undo: bool = False):
         exporter._write(rows.values())
         DeltaStore().update_status(job_id, previous.get("previous_delta_status", "scraped"))
     else:
-        if rows[job_id].get("Status") == "applied":
+        if rows[job_id].get("Status") == "applied" or rows[job_id].get("Status", "").startswith("replied_"):
             raise ValueError("This job is already marked as applied.")
         updates[job_id] = {"status": "applied", "at": utc_now_iso(),
                            "previous_delta_status": DeltaStore().statuses([job_id]).get(job_id, "scraped"),

@@ -146,6 +146,33 @@ application tool reachable from other machines.
 
 ## Hosted API and worker smoke test
 
+The authentication slice now uses per-user bearer keys. The old shared
+`HOSTED_API_TOKEN` is no longer accepted. Issue a key from the administrator's
+terminal against the same database used by the API:
+
+```powershell
+python main.py hosted-key --user candidate-1
+# For the compose deployment:
+docker compose -f docker-compose.hosted.yml exec hosted-api python main.py hosted-key --user candidate-1
+```
+
+Copy the returned key once into your client or secret manager. Only its SHA-256
+hash is stored. Rotate by issuing a new key; revoke an old key with
+`python main.py hosted-key --revoke <key-id-before-the-dot>` in the same environment.
+There is no public account-provisioning endpoint.
+
+The API derives ownership from this key. A supplied `user_id` must match;
+another user's run returns 404. `/jobs` and `/jobs/stats` read only the
+`hosted_user_jobs` partition for that owner. They never expose the shared personal
+jobs database. Existing personal jobs are not migrated automatically. The new
+`hosted_users`, `hosted_api_keys` and `hosted_user_jobs` tables are created on the
+configured Postgres database, or on SQLite for local tests.
+
+This completes authentication and API data isolation, not public SaaS execution.
+The reference worker still only validates queue entries. Per-user workspaces,
+object storage, isolated browsers, rate limits and production observability remain
+required before executing real hosted jobs.
+
 The repository now includes a hosted control-plane scaffold that is safe to put
 behind HTTPS because it does not expose the local dashboard and does not run
 browser automation in the request thread.
@@ -165,9 +192,9 @@ docker compose -f docker-compose.hosted.yml up --build
 In another terminal, enqueue a dry-run request:
 
 ```powershell
-$token = "change-this-token-before-deploy"
+$token = "paste-the-per-user-key-issued-above"
 $body = @{
-  user_id = "local-smoke-user"
+  user_id = "candidate-1"
   phases = @("source", "evaluate", "tailor", "track")
   options = @{ dry_run = $true; limit = 3 }
 } | ConvertTo-Json -Depth 5
@@ -186,8 +213,8 @@ Check readiness and queue counts:
 Invoke-RestMethod "http://127.0.0.1:8080/ready"
 ```
 
-For a real hosted product, replace the placeholder token with a secret from your
-hosting provider and put the API behind TLS. Keep the reference worker in
+For a real hosted product, store issued per-user keys securely and put the API
+behind TLS. Keep the reference worker in
 validation mode until you have per-user storage and a per-user browser profile.
 
 ## What a public hosted version needs

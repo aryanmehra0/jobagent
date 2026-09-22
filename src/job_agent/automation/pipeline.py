@@ -111,6 +111,9 @@ class AutoApplyPipeline:
 
         console.print(f"Targeting [bold green]{len(manifest)}[/bold green] tailored application(s).\n")
 
+        from job_agent.tracking.export import JobsCsvExporter
+        already_applied = {key for key, row in JobsCsvExporter().load().items()
+                           if row.get('Status') == 'applied' or row.get('Status', '').startswith('replied_')}
         successful: List[Dict[str, Any]] = []
         failed: List[Dict[str, Any]] = []
 
@@ -118,6 +121,9 @@ class AutoApplyPipeline:
             for index, entry in enumerate(manifest, start=1):
                 self._check_before_job()
                 job_id = entry.get("job_id")
+                if job_id in already_applied:
+                    console.print(f"[yellow]Already applied or replied: {job_id}; no repeated application.[/yellow]")
+                    continue
                 job = job_lookup.get(job_id)
                 if not job:
                     console.print(f"[yellow]No qualified-job record for ID {job_id}; skipping.[/yellow]")

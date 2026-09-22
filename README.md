@@ -2,6 +2,32 @@
 
 ## Job shortlist and portable downloads
 
+Nine roadmap improvements landed on top of the six-stage core; full detail,
+verification notes and known limits are in
+[Implementation status](ROADMAP_IMPLEMENTATION.md). Summary of what each one
+actually is (not what it aspires to be):
+
+| Feature | Command / trigger | Dashboard? |
+| --- | --- | --- |
+| Interview prep (Phase 7) | `python main.py prep [--job-id] [--offline]` | Yes — its own phase node |
+| Cover letters | `--cover-letter` on `tailor`, or the dashboard run toggle | Yes — run-form checkbox |
+| Outcome analytics | automatic once jobs are tracked | Yes — Inspector "Analytics" tab |
+| Reply tracking (opt-in) | `python main.py sync-inbox --days N --limit N` | No — CLI only, reply state shows up in the CSV/tracker afterwards |
+| Warm contact leads | `python main.py contacts --job-id --limit N` | No — CLI only; results appear passively as "Possible contacts" once run |
+| Workday assisted apply | `python main.py workday-assist --job-id ID` | No — deliberately interactive/blocking, doesn't fit the async dashboard runner |
+| Hosted per-user API keys | `python main.py hosted-key --user X` / `--revoke KEY_ID` | N/A — hosted control-plane, not the local dashboard |
+| CI | `.github/workflows/ci.yml` | — |
+| Score explanation | automatic in Phase 3 evaluation output | Yes — already part of the existing job detail view |
+
+Reply tracking, warm contacts and Workday assist are real, tested capabilities,
+but they're CLI-first: you run the command, and the dashboard only reflects
+what it produced. Hosted auth is a per-user API-key/token layer over the
+existing hosted scaffold (isolated request access, not a running multi-tenant
+worker yet) — see [Implementation status](ROADMAP_IMPLEMENTATION.md) and
+[`DEPLOYMENT.md`](DEPLOYMENT.md) for exactly what's still scaffolding.
+
+[![CI](https://github.com/aryanmehra0/jobagent/actions/workflows/ci.yml/badge.svg)](https://github.com/aryanmehra0/jobagent/actions/workflows/ci.yml)
+
 For the complete daily workflow, read [Start here](START_HERE.md). Full runs now
 share one CLI/dashboard engine and automatically publish `jobs_latest.csv`,
 `applications_ready.csv`, the master CSV, and the PDF pack. `run_report.json`
@@ -27,7 +53,7 @@ python main.py export
 python main.py export --bundle
 ```
 
-**Download CSV + PDFs** produces `data/outputs/application_pack.zip` containing:
+**Download everything (ZIP)** produces `data/outputs/application_pack.zip` containing:
 
 - `jobs.csv`: jobs, scores, contact provenance, skill gaps, region, eligibility
   notes and relative resume paths.
@@ -62,7 +88,7 @@ demographic details, following general principles in the
 
 ---
 
-A local, six-stage job hunting pipeline. Each stage reads the previous stage's
+A local, seven-stage job hunting pipeline. Each stage reads the previous stage's
 artifact from `data/outputs/` and writes its own, so stages can be run
 individually, re-run, or chained end to end.
 
@@ -71,9 +97,16 @@ individually, re-run, or chained end to end.
 | 1 | **Intake** | Converts a PDF resume into a strict, cryptographically sealed `profile.json` | `data/profiles/profile.json` |
 | 2 | **Sourcing** | Scrapes job boards via `python-jobspy` plus direct Greenhouse/Lever/Ashby feeds, with proxy rotation and SQLite deduplication | `scraped_jobs.json` |
 | 3 | **Evaluation** | Two-tier matching: dense-embedding pre-filter, then an LLM judge scoring 1.0-10.0 | `evaluated_jobs.json`, `qualified_jobs.json` |
-| 4 | **Tailoring** | Rewrites bullets for each target role and compiles a single-column ATS PDF with Typst (~100 ms) | `tailored_resumes/*.pdf` |
+| 4 | **Tailoring** | Rewrites bullets for each target role, optionally drafts a cover letter, compiles a single-column ATS PDF with Typst (~100 ms) | `tailored_resumes/*.pdf`, `cover_letters/*.pdf` |
 | 5 | **Auto-apply** | Navigates portals with Playwright using DOM-only perception, with a step ceiling and a human-in-the-loop pause | `application_results.json` |
 | 6 | **Tracking** | Logs outcomes to a styled Excel workbook with a personalized cold outreach email per role | `applications_tracker.xlsx` |
+| 7 | **Interview prep** | Drafts likely technical/behavioral/company-fit questions and evidence-backed STAR answers per qualified job | `interview_prep/<job_id>.md` |
+
+Two more stages exist but sit outside this numbered chain because they're
+opt-in and read from outcomes, not toward them: **reply tracking**
+(`sync-inbox`, reads your inbox to detect rejections/interviews/offers) and
+**warm contact discovery** (`contacts`, reads employer team pages for
+possible referral leads). Both are covered under Commands below.
 
 ---
 
@@ -442,11 +475,17 @@ What you can do from it:
 - **Upload a resume** by dropping a PDF onto the Settings tab or into the wizard.
 - **Edit the search parameters** without hand-editing YAML; invalid values are
   rejected with the offending field named.
-- **Run one phase** from its own node, or **run all six** from the top bar.
+- **Run one phase** from its own node, or **run all seven** from the top bar.
 - **Watch progress live.** Nodes turn blue and their incoming connector animates
   while a phase runs; the Live log tab streams the same output the CLI prints.
 - **Inspect results.** Clicking a node shows its metrics, top matches, the files
   it produced, and what the anti-hallucination gate did.
+- **Read the funnel in Analytics.** The Inspector's Analytics tab shows
+  sourced → qualified → tailored → applied → replied → interview → offer, with
+  the conversion rate between each stage, response rate broken down by fit
+  score, job source and role, and median time to first reply. It only counts a
+  real submission as "applied" — dry runs and unsent drafts never inflate the
+  numbers — and reply-stage data is empty until you've run `sync-inbox`.
 
 The console drives the same code the subcommands do, so the two are
 interchangeable: run a phase in the terminal and the dashboard reflects it on its
@@ -756,6 +795,99 @@ The ledger is the `outreach_log` table in `delta_store.db`. Drafts, including
 their subject and body, are kept in `outreach_drafts.json`, so re-running
 tracking reuses them instead of making another LLM call.
 
+### Stage 7 — Interview prep
+
+```powershell
+python main.py prep                    # Every qualified job
+python main.py prep --job-id <id>
+python main.py prep --limit 5
+python main.py prep --offline           # Skip the LLM; template questions and evidence only
+```
+
+Refuses to run against a profile whose seal doesn't verify, same as tailoring.
+For each job it writes `data/outputs/interview_prep/<job_id>.md` (10 questions —
+4 technical from the JD, 3 behavioral, 3 company-fit) plus a `.json` copy. Every
+STAR-format answer is built only from bullets and locked facts already present
+in the sealed profile — it goes through the same fabrication gate as resume
+tailoring (`enforce_metric_integrity`), so an interview answer can't claim
+anything your resume doesn't. The "likely panel composition" line is explicitly
+labelled a hypothesis, not confirmed company information. Guides are linked
+from the dashboard's Interview prep node and included in the ZIP export; a
+guide is hidden again if you re-seal the profile with different content, so
+you're never handed a guide written for an outdated version of yourself.
+
+### Reply tracking (opt-in, CLI only)
+
+```powershell
+python main.py sync-inbox --days 14 --limit 100
+```
+
+Off by default — it only runs once you set all four of `IMAP_HOST`,
+`IMAP_USER`, `IMAP_APP_PASSWORD`, and `IMAP_FOLDER` in `.env`. Point it at a
+**dedicated folder**, not your whole inbox. It opens that folder read-only,
+never sends anything, and matches an inbound email to a tracked application
+only when the sender's domain is the employer's own (not gmail/outlook/etc.),
+the company name matches, and the job title overlaps enough to be unambiguous
+— an uncertain match is left alone rather than guessed. Matched emails are
+classified as rejection / interview / offer / other, first by keyword rules
+and only by an LLM (`INBOX_USE_LLM=1`) when the rules don't recognise the
+wording. Already-processed messages are checkpointed in `inbox_events.json`
+so re-running never reclassifies or double-counts them, and this is what
+feeds the Analytics tab's response-rate numbers below.
+
+### Warm contact leads (opt-in, CLI only)
+
+```powershell
+python main.py contacts --job-id <id>
+python main.py contacts --limit 5
+```
+
+Separate from the hiring-mailbox lookup in sourcing. This looks at an
+employer's own `team` / `about` / `leadership` / `people` pages for named
+staff with a public title, as a **possible** referral lead — never a claimed
+relationship, never a guessed email, and never a social-platform crawl
+(LinkedIn and similar are explicitly excluded). A name is kept only if it and
+its title both appear as literal visible text on the page; ambiguous cards
+with more than one plausible title are dropped rather than guessed. Results
+are written to `data/outputs/warm_contacts.json` and show up passively as a
+"Possible contacts (unverified)" list next to the job once you've run this —
+there's no dashboard button to trigger the crawl itself yet.
+
+### Workday assisted apply
+
+```powershell
+python main.py workday-assist --job-id <id>
+```
+
+Workday listings are skipped by the normal `apply` phase (account required).
+This command is the assisted alternative: it opens a **visible** browser,
+requires a validated tailored resume to already exist for that job, fills
+every field it can from your profile (skipping anything it can't back with a
+fact, exactly like Gate 3), and then **always stops for you** — it never
+clicks submit. If a password field, a CAPTCHA, or an unfillable required field
+appears, it pauses and hands control to you at the keyboard. Demographic
+fields (race, veteran status, disability, gender) are refused outright and
+left for you, regardless of channel. Treat it as "get the form 90% filled,
+you finish and submit it," not as autonomous Workday submission — that
+remains unimplemented by design.
+
+### Hosted API keys
+
+```powershell
+python main.py hosted-key --user alice
+python main.py hosted-key --revoke <key-id>
+```
+
+Only relevant if you're running the separate hosted control-plane scaffold
+(see Deployment below), not the local dashboard. Issues a per-user bearer
+token shown once; only its SHA-256 hash is ever stored, and lookups use a
+timing-safe comparison. `/runs` and `/runs/<id>` on the hosted API are now
+scoped to the authenticated user — one user's key cannot see or enumerate
+another's runs. This replaces the earlier single shared `HOSTED_API_TOKEN`.
+It authenticates and isolates hosted API requests; it does not by itself add
+a running multi-user worker — see [`DEPLOYMENT.md`](DEPLOYMENT.md) for what's
+still needed before this is a real hosted product.
+
 ### Everything at once
 
 ```powershell
@@ -763,7 +895,7 @@ python main.py run-pipeline --dry-run
 python main.py run-pipeline --skip-intake --limit 10
 ```
 
-Runs stages 1-6 in order, stopping cleanly if a stage produces nothing.
+Runs stages 1-7 in order, stopping cleanly if a stage produces nothing.
 
 ### Diagnostics and reset
 
@@ -844,3 +976,19 @@ Tests cover the six stages and the console. The ones worth knowing about:
 - **Years of experience is computed from your role dates**, with overlapping
   roles merged. If that disagrees with the total stated on your resume, both
   `intake` and `verify` say so rather than silently picking one.
+- **`sync-inbox`, `contacts`, and `workday-assist` are CLI-only.** The
+  dashboard shows what they produced (reply status, possible-contact list,
+  a filled-but-unsubmitted Workday form) once you've run them from a
+  terminal; there's no in-dashboard trigger for any of the three yet.
+- **`workday-assist` never submits.** It fills the form and stops for you at
+  every risky step (password fields, CAPTCHA, required fields it can't back
+  with a fact, and the submit button itself). No other account-required ATS
+  (Taleo, iCIMS, SuccessFactors) has an assisted path yet — they still route
+  to manual apply.
+- **Hosted per-user API keys authenticate and isolate requests to the hosted
+  control-plane scaffold; they are not a running multi-tenant product.**
+  There is still no worker that executes queued per-user jobs in isolation —
+  see [`DEPLOYMENT.md`](DEPLOYMENT.md).
+- **CI runs only after this workflow is pushed.** The badge above reflects
+  `.github/workflows/ci.yml`'s actual run history on GitHub, not a local
+  guarantee.

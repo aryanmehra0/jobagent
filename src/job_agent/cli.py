@@ -65,7 +65,7 @@ def cli(ctx: click.Context) -> None:
 # PHASE 1: INTAKE & PARAMETERIZATION
 # ==============================================================================
 
-_PHASE_COMMANDS = {"source", "evaluate", "tailor", "apply", "track", "run-pipeline"}
+_PHASE_COMMANDS = {"source", "evaluate", "tailor", "apply", "track", "prep", "contacts", "run-pipeline"}
 
 
 @cli.result_callback()
@@ -578,6 +578,7 @@ def evaluate_command(
 # ==============================================================================
 
 @cli.command("tailor")
+@click.option("--cover-letter", is_flag=True, help="Also prepare a grounded one-page cover letter.")
 @click.option("--mode", type=click.Choice(["auto", "faithful", "generated", "regional"]), default=None)
 @click.option("--country", default=None, help="Override the resume's target market, e.g. India or UK.")
 @click.option("--job-id", "-j", default=None, help="Tailor for one job ID (default: all qualified).")
@@ -588,7 +589,7 @@ def evaluate_command(
               help="Re-tailor every job that already has a resume listed (this batch and earlier ones).")
 def tailor_command(
     job_id: Optional[str], profile: Optional[Path], qualified: Optional[Path], limit: Optional[int],
-    rebuild_existing: bool, mode: Optional[str] = None, country: Optional[str] = None,
+    rebuild_existing: bool, mode: Optional[str] = None, country: Optional[str] = None, cover_letter: bool = False,
 ) -> None:
     """Phase 4: tailor your resume for each qualified job, and validate every PDF."""
     from job_agent.tailoring.pipeline import ResumeTailoringPipeline
@@ -617,6 +618,7 @@ def tailor_command(
             limit=limit,
             mode=mode,
             country=country,
+            cover_letter=cover_letter,
         )
     except Exception as exc:
         _fail(f"Tailoring failed: {exc}")
@@ -646,6 +648,41 @@ def apply_command(job_id: Optional[str], dry_run: bool, limit: Optional[int], as
         _fail(f"Application execution failed: {exc}")
 
 
+@cli.command("workday-assist")
+@click.option("--job-id", required=True)
+@exclusive_run
+def workday_assist_command(job_id):
+    """Fill supported Workday fields in a visible browser; never click final Submit."""
+    from job_agent.automation.agent import AutoApplyAgent
+    from job_agent.automation.routing import is_workday
+    from job_agent.tailoring.pipeline import ResumeTailoringPipeline
+    from job_agent.tracking.export import _read_json
+    import hashlib
+    profile, valid = load_and_verify_profile(settings.profile_path)
+    if not valid:
+        _fail('Profile seal failed.')
+    jobs = ResumeTailoringPipeline._load_qualified(settings.outputs_dir/'qualified_jobs.json')
+    job = next((j.job for j in jobs if j.job.id == job_id), None)
+    if job is None or not (is_workday(job.job_url) or is_workday(job.apply_url)):
+        _fail('Select a qualified Workday job.')
+    record = next((r for r in _read_json(settings.outputs_dir/'tailored_resumes/manifest.json', []) if r.get('job_id') == job_id), {})
+    pdf = settings.outputs_dir/'tailored_resumes'/f'resume_{job_id}.pdf'
+    if (not pdf.is_file() or record.get('profile_hash') != profile.profile_hash or
+            not record.get('validation_passed') or record.get('pdf_sha256') != hashlib.sha256(pdf.read_bytes()).hexdigest()):
+        _fail('Generate a current validated resume first.')
+    def review(page, reason):
+        click.echo(reason)
+        click.pause('The browser remains open for your action. Follow the message above, then press any key here to continue or finish assistance.')
+    previous = settings.playwright_headless
+    settings.playwright_headless = False
+    agent = AutoApplyAgent()
+    try:
+        console.print(agent.apply_to_job(profile, job, pdf, assist_workday=True, review_callback=review))
+    finally:
+        agent.close()
+        settings.playwright_headless = previous
+
+
 # ==============================================================================
 # PHASE 6: TRACKING
 # ==============================================================================
@@ -664,11 +701,70 @@ def track_command(track_all: bool) -> None:
     console.print(f"[bold green]Tracking complete.[/bold green] {len(records)} entr(ies) written.")
 
 
+@cli.command("prep")
+@click.option("--job-id", default=None)
+@click.option("--limit", type=click.IntRange(1), default=None)
+@click.option("--offline", is_flag=True, help="Select evidence without provider calls.")
+def prep_command(job_id, limit, offline):
+    """Phase 7: interview questions, STAR evidence and role briefing."""
+    from job_agent.interview.pipeline import InterviewPrepPipeline
+    try:
+        records = InterviewPrepPipeline().run(job_id=job_id, limit=limit, use_llm=not offline)
+        console.print(f"Prepared {len(records)} interview guides.")
+    except Exception as exc:
+        _fail(str(exc))
+
+
+@cli.command("sync-inbox")
+@click.option("--days", type=click.IntRange(1, 90), default=14)
+@click.option("--limit", type=click.IntRange(1, 500), default=100)
+def sync_inbox_command(days, limit):
+    """Read only the configured IMAP folder and record matched replies."""
+    from job_agent.tracking.inbox import sync_inbox
+    try:
+        console.print(sync_inbox(days=days, limit=limit))
+    except Exception as exc:
+        _fail(str(exc))
+
+
+@cli.command("hosted-key")
+@click.option("--user", default=None, help="Issue a new key for this hosted user.")
+@click.option("--revoke", default=None, help="Revoke a key ID (the part before the dot).")
+def hosted_key_command(user, revoke):
+    """Local administrator command; keys are displayed once and stored hashed."""
+    from job_agent.hosted.auth import HostedIdentityStore
+    if bool(user) == bool(revoke):
+        _fail('Specify exactly one of --user or --revoke.')
+    store = HostedIdentityStore()
+    if revoke:
+        if not store.revoke(revoke):
+            _fail('Unknown key ID.')
+        console.print('Key revoked.')
+    else:
+        try:
+            click.echo(store.issue_key(user))
+        except ValueError as exc:
+            _fail(str(exc))
+
+
+@cli.command("contacts")
+@click.option("--job-id", default=None)
+@click.option("--limit", type=click.IntRange(1, 25), default=5)
+def contacts_command(job_id, limit):
+    """Find published team members as possible, unverified contact leads."""
+    from job_agent.contacts.warm import discover
+    try:
+        console.print(discover(job_id=job_id, limit=limit))
+    except Exception as exc:
+        _fail(str(exc))
+
+
 # ==============================================================================
 # FULL PIPELINE
 # ==============================================================================
 
 @cli.command("run-pipeline")
+@click.option("--cover-letter", is_flag=True, help="Include optional cover letters during tailoring.")
 @click.option("--resume", "-r", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
 @click.option("--dry-run/--live", default=True, help="Default: prepare results without submitting. --live enables applications.")
 @click.option("--mode", type=click.Choice(["auto", "faithful", "generated", "regional"]), default="regional", show_default=True)
@@ -685,8 +781,9 @@ def run_pipeline_command(
     limit: Optional[int],
     assume_yes: bool,
     mode: str = "regional",
+    cover_letter: bool = False,
 ) -> None:
-    """Run phases 1 through 6 end to end.
+    """Run phases 1 through 7 end to end.
 
     A phase that produces nothing stops the run cleanly rather than letting the
     next phase fail on a missing artifact.
@@ -695,14 +792,14 @@ def run_pipeline_command(
 
     console.print(
         Panel.fit(
-            "[bold cyan]Autonomous pipeline: phases 1-6[/bold cyan]\n"
+            "[bold cyan]Autonomous pipeline: phases 1-7[/bold cyan]\n"
             + ("[yellow]Dry run: no application will be submitted.[/yellow]" if dry_run
                else "[red]LIVE run: real applications will be submitted.[/red]"),
             border_style="cyan",
         )
     )
 
-    phases = ["source", "evaluate", "tailor", "apply", "track"]
+    phases = ["source", "evaluate", "tailor", "apply", "track", "prep"]
     if not skip_intake:
         phases.insert(0, "intake")
     else:
@@ -711,6 +808,7 @@ def run_pipeline_command(
         "resume": str(resume) if resume else None, "dry_run": dry_run,
         "threshold": threshold, "limit": limit, "tailoring_mode": mode,
         "track_all": True, "assume_yes": assume_yes, "started_from": "cli",
+        "cover_letter": cover_letter,
     })
     report = result.get("report", {})
     console.print(f"\nPipeline status: [bold]{result.get('status', 'error')}[/bold]")
@@ -735,7 +833,7 @@ def run_pipeline_command(
 def ui_command(port: int, no_browser: bool) -> None:
     """Open the visual flow console in your browser.
 
-    Shows the six phases as a node graph, runs them on demand, and streams their
+    Shows the seven phases as a node graph, runs them on demand, and streams their
     progress live. It drives the same code these subcommands do, so the two can be
     used interchangeably.
     """
@@ -1036,6 +1134,15 @@ def status_command() -> None:
             f"python main.py track | {outreach_counts['drafts']} email draft(s) already in ledger",
         )
 
+    from job_agent.tracking.supplements import document_links
+    documents = document_links()
+    guide_count = sum('Interview Prep' in value for value in documents.values())
+    letter_count = sum('Cover Letter' in value for value in documents.values())
+    table.add_row('7. Interview prep', '[green]ready[/green]' if guide_count else '[yellow]pending[/yellow]',
+                  f'{guide_count} verified guides | python main.py prep --offline')
+    table.add_row('Cover letters', 'optional', f'{letter_count} verified PDFs | tailor --cover-letter')
+    table.add_row('Download pack', 'ready' if (settings.outputs_dir/'application_pack.zip').is_file() else 'pending',
+                  'Jobs & downloads > Download everything (ZIP); extract, then open index.html')
     provider = settings.active_provider
     table.add_row(
         "LLM provider",

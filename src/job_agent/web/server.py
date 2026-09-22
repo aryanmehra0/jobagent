@@ -173,10 +173,22 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, {"state": build_snapshot(), "running": self.server.runner.is_running or pipeline_busy()})
         elif route == "/api/events":
             self._serve_events()
+        elif route == "/api/analytics":
+            from job_agent.web.analytics import analytics
+            self._json(HTTPStatus.OK, analytics())
         elif route == "/api/jobs":
             from job_agent.tracking.export import JobsCsvExporter, _read_json
             from job_agent.web.state import run_report_state
-            self._json(HTTPStatus.OK, {"jobs": list(JobsCsvExporter().load().values()),
+            from job_agent.runtime import pipeline_lock
+            exporter = JobsCsvExporter()
+            warnings = []
+            try:
+                # Refresh derived dates/readiness without running a new job search.
+                with pipeline_lock():
+                    exporter.export()
+            except (RuntimeError, OSError) as exc:
+                warnings.append(f"Showing the saved export; refresh could not finish: {exc}")
+            self._json(HTTPStatus.OK, {"jobs": list(exporter.load().values()), "warnings": warnings,
                        "csv_path": str(settings.outputs_dir / "jobs_master.csv"),
                        "latest_csv_path": str(settings.outputs_dir / "jobs_latest.csv"),
                        "ready_csv_path": str(settings.outputs_dir / "applications_ready.csv"),
@@ -185,7 +197,8 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
                        "run_report": run_report_state(),
                        "coverage": _read_json(settings.outputs_dir / "source_coverage.json", {})})
         elif route == "/api/file":
-            self._serve_artifact(parse_qs(parsed.query).get("path", [""])[0])
+            query = parse_qs(parsed.query)
+            self._serve_artifact(query.get("path", [""])[0], download=query.get("download") == ["1"])
         else:
             self._error(HTTPStatus.NOT_FOUND, f"No route for {route}")
 
@@ -248,7 +261,7 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         self._send(HTTPStatus.OK, target.read_bytes(), content_type)
 
-    def _serve_artifact(self, raw_path: str) -> None:
+    def _serve_artifact(self, raw_path: str, download: bool = False) -> None:
         """Serve a generated artifact (a tailored PDF, the workbook, a JSON file).
 
         Restricted to the project's own data directory so the console cannot be
@@ -266,7 +279,7 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         if target.suffix.lower() == ".csv":
             content_type = "text/csv; charset=utf-8"
         # Spreadsheets are for opening in Excel, not rendering as text in a tab.
-        disposition = "attachment" if target.suffix.lower() in (".csv", ".xlsx", ".zip", ".eml") else "inline"
+        disposition = "attachment" if download or target.suffix.lower() in (".csv", ".xlsx", ".zip", ".eml") else "inline"
         self._send(
             HTTPStatus.OK,
             target.read_bytes(),

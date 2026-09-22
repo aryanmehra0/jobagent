@@ -332,7 +332,7 @@ class LLMReranker:
         """Condense the profile into the evidence the judge needs."""
         recent_roles = "; ".join(
             f"{exp.title} at {exp.company} ({exp.start_date} to {exp.end_date})"
-            for exp in profile.experience[:3]
+            for exp in profile.experience
         )
         return (
             f"Name: {profile.contact.full_name}\n"
@@ -345,7 +345,8 @@ class LLMReranker:
             f"Open to remote work for employers in any country: {profile.work_authorization.remote_worldwide}\n"
             f"Salary expectation: {profile.salary_expectation_text() or 'unspecified'}\n"
             f"Recent roles: {recent_roles or 'none listed'}\n"
-            f"Verified achievements: {'; '.join(fact.statement for fact in profile.all_locked_facts()[:6])}"
+            f"Verified achievements: {'; '.join(dict.fromkeys([fact.statement for fact in profile.all_locked_facts()] + [b for role in profile.experience for b in role.description_bullets]))}\n"
+            f"Projects: {'; '.join(p.title + ': ' + p.description + ' Technologies: ' + ', '.join(p.technologies) for p in profile.projects)}"
         )
 
     def evaluate_job(

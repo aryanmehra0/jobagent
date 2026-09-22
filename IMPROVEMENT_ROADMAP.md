@@ -7,6 +7,16 @@ Sources at the bottom).
 
 ## How to use this file
 
+**Implementation update (2026-09-22):** all nine items have now received the
+implementation described in [Roadmap implementation and operating limits](ROADMAP_IMPLEMENTATION.md).
+Read that status document before running these original prompts again. Workday
+submission, a real mailbox connection and public hosted execution have explicit
+validation/configuration limits; they are not claimed as production-complete.
+
+The competitor comparisons below are retained as original proposal claims, not
+verified product guarantees. Keyless operation still needs network access for
+fresh job sourcing; local-first does not mean every workflow is offline.
+
 Each numbered item below is self-contained. Copy the "Prompt" block for the item
 you want and paste it as-is into a new Claude Code session in this repo. It
 already contains the context a fresh session needs (why, where, constraints),

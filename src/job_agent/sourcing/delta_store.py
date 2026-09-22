@@ -30,6 +30,7 @@ VALID_STATUSES = (
     "applied",
     "failed",
     "fallback_logged",
+    "replied_rejection", "replied_interview", "replied_offer", "replied_other",
     "skipped",
 )
 

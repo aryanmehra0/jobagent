@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 from job_agent.config.settings import settings
 
 # Phase identifiers, in execution order. The dashboard draws its graph from this.
-PHASE_ORDER: List[str] = ["intake", "source", "evaluate", "tailor", "apply", "track"]
+PHASE_ORDER: List[str] = ["intake", "source", "evaluate", "tailor", "apply", "track", "prep"]
 
 # The demo resume bundled with the repository. A profile built from it belongs to
 # a fictional candidate, so the console has to say so loudly: running the pipeline
@@ -26,6 +26,9 @@ PHASE_ORDER: List[str] = ["intake", "source", "evaluate", "tailor", "apply", "tr
 SAMPLE_RESUME_NAME = "sample_resume.pdf"
 
 PHASE_META: Dict[str, Dict[str, str]] = {
+    "prep": {"title": "Interview Prep", "subtitle": "Questions + verified evidence",
+             "detail": "Builds interview questions and STAR practice drafts from the sealed profile.",
+             "command": "python main.py prep"},
     "intake": {
         "title": "Resume Intake",
         "subtitle": "PDF to sealed profile",
@@ -303,7 +306,16 @@ def _track_state() -> Dict[str, Any]:
     }
 
 
+def _prep_state():
+    from job_agent.tracking.supplements import document_links
+    links = [v['Interview Prep'] for v in document_links().values() if v.get('Interview Prep')]
+    return {"status": "ready" if links else "empty", "summary": f"{len(links)} interview guides",
+            "hint": "Review source evidence and complete the bracketed STAR details yourself.",
+            "metrics": {"Guides": len(links)}, "artifacts": [_artifact(Path(p)) for p in links]}
+
+
 _BUILDERS = {
+    "prep": _prep_state,
     "intake": _intake_state,
     "source": _source_state,
     "evaluate": _evaluate_state,

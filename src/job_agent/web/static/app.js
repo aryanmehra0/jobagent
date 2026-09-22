@@ -32,6 +32,7 @@
     tailor:   { x: 738, y: 420 },
     apply:    { x: 498, y: 420 },
     track:    { x: 258, y: 420 },
+    prep:     { x: 258, y: 690 },
   };
 
   // [from, to, label] — the label shows the count handed to the next phase.
@@ -43,6 +44,7 @@
     ["evaluate", "tailor", "qualified"],
     ["tailor", "apply", "resumes"],
     ["apply", "track", "outcomes"],
+    ["track", "prep", "practice"],
   ];
 
   const SVG_NS = "http://www.w3.org/2000/svg";
@@ -531,7 +533,7 @@
 
   /* ---------------- Run control ---------------- */
 
-  async function startRun(phases) {
+  async function startRun(phases, jobId = null) {
     if (running) { toast("A run is already in progress.", "err"); return; }
 
     // Guard against running as somebody else. A run that includes intake will
@@ -565,6 +567,8 @@
             dry_run: dryRun,
             track_all: true,
             tailoring_mode: $("#resume-mode").value,
+            cover_letter: $("#cover-letter").checked,
+            job_id: jobId,
           },
         }),
       });
@@ -983,7 +987,27 @@
     $("#panel-details").hidden = name !== "details";
     $("#panel-log").hidden = name !== "log";
     $("#panel-settings").hidden = name !== "settings";
+    $("#panel-analytics").hidden = name !== "analytics";
+    if (name === "analytics") renderAnalytics();
     if (name === "settings") renderSettings();
+  }
+
+  async function renderAnalytics() {
+    const panel = $("#panel-analytics"); panel.replaceChildren(el("p", null, "Loading outcomes…"));
+    try {
+      const result = await api("/api/analytics"); panel.replaceChildren(el("h3", null, "Application outcomes"), el("p", null, result.note));
+      for (const stage of result.funnel) {
+        const row = el("div", "analytics-row");
+        row.append(el("strong", null, `${stage.stage}: ${stage.count}`), el("p", "hint", stage.conversion == null ? "Conversion unknown" : `${(stage.conversion * 100).toFixed(1)}% of preceding stage`));
+        const meter = el("meter"); meter.min = 0; meter.max = Math.max(1, result.funnel[0].count); meter.value = stage.count; meter.title = `${stage.stage}: ${stage.count}`;
+        row.append(meter); panel.append(row);
+      }
+      panel.append(el("p", null, result.median_response_days == null ? "Median response time: unknown" : `Median response time: ${result.median_response_days.toFixed(1)} days (${result.timed_responses} dated replies)`));
+      for (const [key, title] of [["by_score", "By fit score"], ["by_source", "By source"], ["by_variant", "By resume format"], ["by_role", "By role"]]) {
+        panel.append(el("h4", null, title));
+        for (const row of result[key]) panel.append(el("p", null, `${row.label}: ${row.replied}/${row.applied} replies${result.reply_tracking ? ` (${(row.response_rate * 100).toFixed(1)}%)` : " (tracking unavailable)"}`));
+      }
+    } catch (error) { panel.replaceChildren(el("p", null, error.message)); }
   }
 
   function renderPanel() {
@@ -1652,17 +1676,29 @@
       const tr = el("tr");
       const role = el("td"); role.append(el("strong", null, row.Title), el("p", null, row.Company), el("small", null, `${row.Source || ""} · ${row.Status || "found"}`));
       if (row["Search Batch"] !== "Current search") role.append(el("p", "hint", "Earlier search; fit may be stale"));
-      if (row["Missing Skills"]) role.append(el("p", "hint", `Skill gaps: ${row["Missing Skills"]}`));
+      const scoreDetails = el("details"); scoreDetails.append(el("summary", null, "Why this score"));
+      scoreDetails.append(el("p", null, row["Score Reasoning"] || "No scoring explanation is recorded."));
+      scoreDetails.append(el("p", "hint", `Matched: ${row["Matched Skills"] || "Not recorded"}`));
+      scoreDetails.append(el("p", "hint", `Reported gaps: ${row["Missing Skills"] || "None recorded"}`));
+      if (row["Skills Found In Profile"]) scoreDetails.append(el("p", "hint", `Already in your profile: ${row["Skills Found In Profile"]}. Review the scorer's gap assessment; the score has not been changed.`));
+      scoreDetails.append(el("p", "hint", "Only add keywords supported by your actual experience.")); role.append(scoreDetails);
       const location = el("td"); location.append(el("div", null, `${row.Location || "Unknown"} · ${row["Work Mode"] || ""}`), el("p", "hint", row["Remote Eligibility"] || "Review eligibility"));
       location.title = row["Eligibility Notes"] || "";
       const contact = el("td"); contact.append(el("div", null, row["HR / Careers Email"] || "No published email found"), el("p", "hint", row["Email Verification"] || "Deliverability not checked"));
       if (row["Email Found On"]) contact.append(safeLink("Contact source", row["Email Found On"]));
+      if (row["Possible Contacts"]) { const leads = el("details"); leads.append(el("summary", null, "Possible contacts (unverified)"), el("p", null, row["Possible Contacts"])); contact.append(leads); }
       const actions = el("td");
       actions.append(safeLink("View job / apply", row["Apply URL"] || row["Job URL"]));
       if (row["Tailored Resume Path"]) actions.append(el("br"), safeLink("Open PDF", `/api/file?path=${encodeURIComponent(row["Tailored Resume Path"])}`));
+      if (row["Tailored Resume Path"]) actions.append(el("br"), safeLink("Download resume", `/api/file?download=1&path=${encodeURIComponent(row["Tailored Resume Path"])}`));
       actions.append(el("p", "hint", row["Resume Check"] || "Resume not yet generated"));
       actions.append(el("p", "hint", row["Next Step"] || "Review the employer listing before applying."));
-      if (row.Status !== "applied" || manuallyApplied.has(row["Job ID"])) {
+      for (const column of ["Interview Prep", "Cover Letter"]) if (row[column]) actions.append(el("br"), safeLink(column, `/api/file?download=1&path=${encodeURIComponent(row[column])}`));
+      if (row["Tailored Resume Path"] && !row["Interview Prep"]) {
+        const prep = el("button", "btn btn-sm", "Prepare interview guide"); prep.disabled = running;
+        prep.addEventListener("click", () => { $("#jobs-dialog").close(); startRun(["prep"], row["Job ID"]); }); actions.append(prep);
+      }
+      if (!row.Status.startsWith("replied_") && (row.Status !== "applied" || manuallyApplied.has(row["Job ID"]))) {
         const undo = manuallyApplied.has(row["Job ID"]);
         const mark = el("button", "btn btn-sm", undo ? "Undo applied marker" : "Mark as applied");
         mark.addEventListener("click", async () => {
@@ -1693,7 +1729,7 @@
       $("#jobs-ready-csv").href = `/api/file?path=${encodeURIComponent(result.ready_csv_path)}`;
       const report = result.run_report || {};
       $("#jobs-run-status").textContent = report.status
-        ? `Run: ${report.status}${report.active_phase ? ` · ${report.active_phase}` : ""}. ${report.halt_reason || ""} ${(report.warnings || []).join(" ")}`
+        ? `Run: ${report.status}${report.active_phase ? ` · ${report.active_phase}` : ""}. ${report.halt_reason || ""} ${[...(report.warnings || []), ...(result.warnings || [])].join(" ")}`
         : "No run report yet. Run the agent to refresh these saved results.";
       const coverage = result.coverage || {};
       const sources = [...Object.entries(coverage.boards || {}), ...Object.entries(coverage.public_feeds || {})];
@@ -1718,15 +1754,16 @@
         const result = await api("/api/export/bundle", {method: "POST", body: "{}"});
         const link = document.createElement("a"); link.href = `/api/file?path=${encodeURIComponent(result.path)}`;
         link.download = "application_pack.zip"; document.body.append(link); link.click(); link.remove();
+        if ($("#jobs-dialog").open) await openJobs();
       } catch (error) { toast(error.message, "err"); }
-      finally { button.disabled = false; button.textContent = "Download CSV + PDFs"; }
+      finally { button.disabled = false; button.textContent = "Download everything (ZIP)"; }
     });
     document.querySelectorAll(".tab").forEach((tab) => {
       tab.addEventListener("click", () => switchTab(tab.dataset.tab));
     });
 
     $("#run-btn").addEventListener("click", () => {
-      startRun(["intake", "source", "evaluate", "tailor", "apply", "track"]);
+      startRun(["intake", "source", "evaluate", "tailor", "apply", "track", "prep"]);
     });
 
     $("#cancel-btn").addEventListener("click", async () => {

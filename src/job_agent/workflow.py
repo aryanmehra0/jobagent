@@ -36,6 +36,11 @@ def publish_outputs(*, bundle: bool = False) -> dict[str, Any]:
         published["warnings"].append(f"Database sync failed: {exc}")
     if bundle:
         try:
+            from job_agent.tracking.supplements import sync_tracker
+            sync_tracker()
+        except Exception as exc:
+            published["warnings"].append(f"Preparation/outcome tracker update failed: {exc}")
+        try:
             from job_agent.tracking.bundle import build_application_pack
             path = build_application_pack()
             published["files"]["application_pack"] = str(path)

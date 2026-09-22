@@ -55,6 +55,7 @@ class ResumeTailoringPipeline:
         limit: Optional[int] = None,
         mode: Optional[str] = None,
         country: Optional[str] = None,
+        cover_letter: bool = False,
     ) -> List[Dict[str, Any]]:
         """Tailor and compile a bespoke resume for each qualified target job."""
         selected_mode = mode or ("regional" if country else settings.tailoring_mode)
@@ -190,6 +191,13 @@ class ResumeTailoringPipeline:
         self._archive_foreign_resumes(profile)
 
         self._render_summary(records, manifest_path)
+        if cover_letter:
+            from job_agent.tailoring.cover_letter import generate
+            generated_ids = {record.job_id for record in records}
+            for evaluated in qualified:
+                if evaluated.job.id in generated_ids:
+                    check_cancelled()
+                    generate(profile, evaluated.job, country=country)
         return results
 
     # --- Faithful tailoring ----------------------------------------------------

@@ -468,6 +468,7 @@ def _phase_tailor(options: Dict[str, Any], cancel: threading.Event) -> Dict[str,
     from job_agent.tailoring.pipeline import ResumeTailoringPipeline
 
     records = ResumeTailoringPipeline().run_tailoring(limit=options.get("limit"),
+                                                    cover_letter=bool(options.get("cover_letter", False)),
                                                     mode=options.get("tailoring_mode"),
                                                     country=options.get("resume_country"))
 
@@ -514,7 +515,14 @@ def _phase_track(options: Dict[str, Any], cancel: threading.Event) -> Dict[str, 
     return {"logged": len(records), "tracker": str(settings.tracker_path)}
 
 
+def _phase_prep(options, cancel):
+    from job_agent.interview.pipeline import InterviewPrepPipeline
+    records = InterviewPrepPipeline().run(job_id=options.get("job_id"), limit=options.get("limit"))
+    return {"guides": len(records)}
+
+
 _PHASE_IMPLS: Dict[str, Callable[[Dict[str, Any], threading.Event], Dict[str, Any]]] = {
+    "prep": _phase_prep,
     "intake": _phase_intake,
     "source": _phase_source,
     "evaluate": _phase_evaluate,

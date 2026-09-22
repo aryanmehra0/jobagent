@@ -1,0 +1,53 @@
+name: CI
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      browser_tests:
+        description: Run isolated Chromium tests
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  DEFAULT_LLM_PROVIDER: none
+  JOB_AGENT_LOAD_DOTENV: '0'
+  ANONYMIZED_TELEMETRY: 'false'
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: python -m pip install -r requirements.txt
+      - run: python -m pytest -ra --ignore=tests/test_browser_integration.py
+      # No linter or formatter is configured in pyproject.toml.
+  browser:
+    if: github.event_name == 'workflow_dispatch' && inputs.browser_tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      JOB_AGENT_BROWSER_TESTS: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: python -m pip install -r requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - run: python -m pytest -ra tests/test_browser_integration.py

@@ -191,6 +191,43 @@ Covered by `tests/test_faithful_tailoring.py`.
 
 ## Reproduce
 
+### Roadmap additions (2026-09-22)
+
+The secret-free regression suite covers all original functionality plus grounded
+interview answers, one-page cover-letter PDFs, read-only fake IMAP replies,
+idempotent message processing, outcome analytics, conservative public team leads,
+per-user hosted HTTP authorization and the expanded download pack.
+`tests/test_roadmap.py` exercises the real tailoring → interview prep → CSV/ZIP
+publication path, including rejection of documents after a profile change.
+`scripts/test_without_keys.py` removes provider secrets and disables `.env` in
+the test subprocess; the real environment file is unchanged.
+
+Chromium fixture tests cover Workday-style multi-step navigation, leaving
+demographic choices untouched, stopping for unanswered required fields/account
+access, and never clicking final Submit. Normal public-form submission tests
+still use intercepted local pages only.
+
+Read-only live observations, checked 2026-09-21 UTC (no fields filled, no account
+created, no application submitted):
+
+| Listing | Observed | Implication |
+| --- | --- | --- |
+| [NVIDIA JR2021172](https://nvidia.wd5.myworkdayjobs.com/en-US/NVIDIAExternalCareerSite/job/Senior-Software-Engineer--CUDA-Core-Libraries_JR2021172) | HTTP 200, Workday shell with Sign In/Loading; no form fields exposed | Public application flow could not be validated |
+| [Workday JR-0109507](https://workday.wd5.myworkdayjobs.com/Workday/job/USA-CO-Boulder/Software-Engineer-Senior-Software-Engineer---AI-Platform--Agent-Runtime-_JR-0109507) | HTTP 200, Workday shell with Sign In/Loading; no form fields exposed | Public application flow could not be validated |
+| [Walmart R-2463275](https://walmart.wd5.myworkdayjobs.com/en-US/WalmartExternal/job/Staff--Software-Engineer_R-2463275-1) | HTTP 500 and service-interruption page | Tenant unavailable during inspection |
+
+Raw results: `data/outputs/validation/workday_readonly.json`. Reproduce with
+`python scripts/check_workday_readonly.py <up-to-five-Workday-listing-URLs>`.
+These observations do **not** establish live Workday application support. The
+new mode is assisted filling with manual final review; automatic submission is
+disabled. iCIMS, Taleo and SuccessFactors remain outside the new adapter scope.
+
+Hosted auth is tested with local SQLite and two users over HTTP. The Postgres
+implementation uses the same owner-scoped schema but has not been exercised
+against a live server in this validation. No real mailbox was connected and no
+remote GitHub workflow was run. See [implementation status](ROADMAP_IMPLEMENTATION.md)
+for configuration and deployment limits.
+
 ```powershell
 python main.py doctor
 python -m pytest -ra

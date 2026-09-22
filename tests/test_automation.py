@@ -80,6 +80,19 @@ def test_form_filler_name_and_screening_answers(test_profile, test_job):
     assert ans_exp is None  # Total tenure does not establish tenure with a tool.
 
 
+def test_form_filler_remote_worldwide_answers_authorized_yes(test_profile, test_job):
+    """A remote job with no named country still resolves "authorized to work"
+    to Yes when the candidate has declared worldwide remote authorization,
+    instead of leaving it unanswered for the human-in-the-loop pause."""
+    test_profile.work_authorization.authorized_countries = ["United States"]
+    test_profile.work_authorization.remote_worldwide = True
+    test_profile.seal_profile()
+    filler = FormFiller(test_profile, test_job)  # test_job.location == "Remote", is_remote=True
+
+    ans_auth = filler.answer_screening_question("Are you authorized to work in this position's country?")
+    assert ans_auth == "Yes"
+
+
 def test_challenge_handler_detection_rules():
     """Verify ChallengeHandler correctly identifies known CAPTCHA selectors."""
     handler = ChallengeHandler()

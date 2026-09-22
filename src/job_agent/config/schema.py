@@ -210,6 +210,24 @@ class StrictModel(BaseModel):
 # CANDIDATE PROFILE SCHEMA (profile.json)
 # ==============================================================================
 
+class InterviewQuestion(StrictModel):
+    bucket: Literal["technical", "behavioral", "company-fit"]
+    question: str
+    star: Dict[str, str] = Field(default_factory=dict)
+    evidence: List[str] = Field(default_factory=list)
+
+
+class InterviewPrep(StrictModel):
+    job_id: str
+    company: str
+    title: str
+    profile_hash: str
+    questions: List[InterviewQuestion] = Field(min_length=8, max_length=12)
+    emphasis: List[str] = Field(default_factory=list)
+    panel_hypothesis: str
+    questions_to_ask: List[str]
+
+
 class ContactInfo(StrictModel):
     """Candidate personal and contact information."""
 

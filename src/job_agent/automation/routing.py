@@ -116,8 +116,16 @@ def resolve_apply_url(job_url: Optional[str], direct_url: Optional[str]) -> Opti
     return None
 
 
-def route_application(job: JobPosting) -> ApplicationRoute:
+def is_workday(url: Optional[str]) -> bool:
+    return _on_domain(url, ("myworkdayjobs.com", "myworkdaysite.com"))
+
+
+def route_application(job: JobPosting, *, assist_workday: bool = False) -> ApplicationRoute:
     """Choose how to apply to a job, and say plainly when automation cannot."""
+    for candidate in (job.apply_url, job.job_url):
+        if is_workday(candidate):
+            return ApplicationRoute("workday_assisted" if assist_workday else "account_required", candidate,
+                                    assist_workday, "Workday requires user-assisted account access and final review. Automatic submission is disabled.")
     for candidate in (job.apply_url, job.job_url):
         form = ats_form_url(candidate)
         if form:

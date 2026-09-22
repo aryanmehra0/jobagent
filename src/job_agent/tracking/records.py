@@ -24,12 +24,13 @@ from job_agent.config.settings import settings
 STATUS_RANK: Dict[str, int] = {
     "found": 0, "evaluated": 1, "qualified": 2, "tailored": 3,
     "manual_apply": 4, "skipped": 4, "failed": 4, "dry_run": 4, "applied": 5,
+    "replied_other": 6, "replied_rejection": 6, "replied_interview": 6, "replied_offer": 6,
 }
 
 
 def promote_status(current: str, new: str) -> str:
     """Keep the furthest stage reached, so re-sourcing cannot reset "applied"."""
-    if current == "applied":
+    if current == "applied" and not new.startswith("replied_"):
         return current
     return new if STATUS_RANK.get(new, -1) >= STATUS_RANK.get(current, -1) else current
 
@@ -137,6 +138,10 @@ def collect_records(outputs_dir: Optional[Path] = None) -> Dict[str, JobRecord]:
             record.status = "applied"
             record.notes = "Marked as applied by the candidate on " + entry.get("at", "")
 
+    from job_agent.tracking.inbox import latest_replies
+    for job_id, entry in latest_replies(_read_json(out / "inbox_events.json", {})).items():
+        if job_id in records:
+            records[job_id].status = entry["status"]
     return records
 
 

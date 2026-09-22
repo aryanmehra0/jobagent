@@ -36,6 +36,8 @@ COLUMNS = [
     "Email Draft File", "Notes", "Target Country", "Resume Format", "Remote Eligibility",
     "Eligibility Notes", "Email Verification", "Matched Skills", "Missing Skills", "Search Batch",
     "Last Seen In Search", "Search Data", "Posting Freshness", "Application Readiness", "Next Step",
+    "Score Reasoning", "Skills Found In Profile", "Interview Prep", "Cover Letter", "Possible Contacts",
+    "Applied At", "Last Reply At",
 ]
 
 _SOURCE_LABELS = {"job_post": "Job post", "company_site": "Company website", "hunter": "Hunter.io"}
@@ -155,6 +157,7 @@ class JobsCsvExporter:
             values["Remote Eligibility"], values["Eligibility Notes"] = remote_eligibility(record.job, current_country)
             values["Matched Skills"] = "; ".join(record.evaluation.get("matching_skills") or [])
             values["Missing Skills"] = "; ".join(record.evaluation.get("missing_skills") or [])
+            values["Score Reasoning"] = record.evaluation.get("reasoning") or ""
             if record.fit_score is not None:
                 values["Fit Score"] = f"{record.fit_score:.1f}"
             values["Tailored Resume"] = record.tailored_resume or ""
@@ -182,6 +185,8 @@ class JobsCsvExporter:
                 row["Email Draft File"] = Path(draft["eml"]).name if draft.get("eml") else ""
 
         self._refresh_resume_columns(rows)
+        from job_agent.tracking.supplements import enrich_rows
+        enrich_rows(rows, self.outputs_dir, profile)
         self._refresh_readiness(rows, profile.get("profile_hash"))
         self._write(rows.values())
         latest_export = JobsCsvExporter(csv_path=self.csv_path.parent / "jobs_latest.csv", outputs_dir=self.outputs_dir)
@@ -196,7 +201,7 @@ class JobsCsvExporter:
                     if isinstance(item, dict)}
         for job_id, row in rows.items():
             row["Application Readiness"] = "Needs preparation"
-            if row.get("Status") == "applied":
+            if row.get("Status") == "applied" or row.get("Status", "").startswith("replied_"):
                 row["Application Readiness"] = "Already applied"
                 row["Next Step"] = "Track the employer response; do not apply again."
                 continue

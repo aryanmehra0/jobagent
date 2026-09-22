@@ -23,10 +23,11 @@ MAX_BODY_BYTES = 128 * 1024
 class HostedApiServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, handler_class, *, token: str, queue: Optional[HostedQueue] = None):
+    def __init__(self, address, handler_class, *, queue: Optional[HostedQueue] = None, identities=None):
         super().__init__(address, handler_class)
-        self.token = token
         self.queue = queue or HostedQueue()
+        from job_agent.hosted.auth import HostedIdentityStore
+        self.identities = identities or HostedIdentityStore(self.queue)
 
 
 class HostedApiHandler(BaseHTTPRequestHandler):
@@ -51,7 +52,7 @@ class HostedApiHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             raise ValueError("Invalid Content-Length.")
-        if length > MAX_BODY_BYTES:
+        if length < 0 or length > MAX_BODY_BYTES:
             raise ValueError("Request body is too large.")
         if not length:
             return {}
@@ -64,10 +65,10 @@ class HostedApiHandler(BaseHTTPRequestHandler):
         return payload
 
     def _authorized(self) -> bool:
-        expected = self.server.token
         supplied = self.headers.get("Authorization", "")
         prefix = "Bearer "
-        return supplied.startswith(prefix) and secrets.compare_digest(supplied[len(prefix):], expected)
+        self.user_id = self.server.identities.authenticate(supplied[len(prefix):]) if supplied.startswith(prefix) else None
+        return self.user_id is not None
 
     def do_GET(self) -> None:  # noqa: N802
         route = urlparse(self.path).path
@@ -75,17 +76,16 @@ class HostedApiHandler(BaseHTTPRequestHandler):
             self._send(HTTPStatus.OK, {"ok": True, "service": "job-agent-hosted-api"})
             return
         if route == "/ready":
-            self._send(HTTPStatus.OK, {"ok": True, "queue": self.server.queue.counts()})
+            with self.server.identities.connect() as connection:
+                connection.execute('SELECT 1')
+            self._send(HTTPStatus.OK, {"ok": True})
             return
         if route in ("/jobs", "/jobs/stats"):
             if not self._authorized():
                 self._send(HTTPStatus.UNAUTHORIZED, {"error": "Missing or invalid bearer token."})
                 return
-            from job_agent.storage.jobs_db import JobsDatabase
-
-            database = JobsDatabase()
             if route == "/jobs/stats":
-                self._send(HTTPStatus.OK, database.stats())
+                self._send(HTTPStatus.OK, {"jobs": self.server.identities.job_count(self.user_id)})
                 return
             query = parse_qs(urlparse(self.path).query)
 
@@ -96,12 +96,7 @@ class HostedApiHandler(BaseHTTPRequestHandler):
                 except (TypeError, ValueError):
                     return default
 
-            self._send(HTTPStatus.OK, {"jobs": database.jobs(
-                limit=min(one("limit", int, 50) or 50, 500),
-                status=one("status", str), company=one("company", str),
-                with_email=one("with_email", str, "") in ("1", "true", "yes"),
-                min_score=one("min_score", float),
-            )})
+            self._send(HTTPStatus.OK, {"jobs": self.server.identities.jobs(self.user_id, one("limit", int, 50) or 50)})
             return
         if route.startswith("/runs/"):
             if not self._authorized():
@@ -113,7 +108,7 @@ class HostedApiHandler(BaseHTTPRequestHandler):
                 self._send(HTTPStatus.BAD_REQUEST, {"error": "Run id must be an integer."})
                 return
             run = self.server.queue.get(run_id)
-            if run is None:
+            if run is None or run.user_id != self.user_id:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "Run not found."})
                 return
             self._send(HTTPStatus.OK, {"run": run.__dict__})
@@ -130,8 +125,11 @@ class HostedApiHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = self._read_json()
+            if payload.get("user_id") not in (None, self.user_id):
+                self._send(HTTPStatus.FORBIDDEN, {"error": "user_id must match the authenticated user."})
+                return
             run = self.server.queue.enqueue(
-                user_id=str(payload.get("user_id") or ""),
+                user_id=self.user_id,
                 phases=list(payload.get("phases") or []),
                 options=dict(payload.get("options") or {}),
             )
@@ -142,10 +140,7 @@ class HostedApiHandler(BaseHTTPRequestHandler):
 
 
 def run(host: str = "0.0.0.0", port: int = 8080) -> None:
-    token = os.environ.get("HOSTED_API_TOKEN", "").strip()
-    if not token:
-        raise SystemExit("HOSTED_API_TOKEN is required for the hosted API.")
-    server = HostedApiServer((host, port), HostedApiHandler, token=token)
+    server = HostedApiServer((host, port), HostedApiHandler)
     print(f"Hosted control-plane API listening on http://{host}:{port}")
     try:
         server.serve_forever()

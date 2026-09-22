@@ -30,7 +30,8 @@ BASE_DIR = Path(__file__).resolve().parents[3]
 
 # Pre-load .env file if it exists.
 dotenv_path = BASE_DIR / ".env"
-if dotenv_path.exists():
+load_local_env = os.environ.get("JOB_AGENT_LOAD_DOTENV", "1") != "0"
+if load_local_env and dotenv_path.exists():
     load_dotenv(dotenv_path)
 
 # Enforce telemetry shutdown immediately and silence the HF symlink warning on Windows.
@@ -45,7 +46,7 @@ class Settings(BaseSettings):
     """Global configuration for the autonomous job search agent."""
 
     model_config = SettingsConfigDict(
-        env_file=str(dotenv_path),
+        env_file=str(dotenv_path) if load_local_env else None,
         env_file_encoding="utf-8",
         extra="ignore",
     )

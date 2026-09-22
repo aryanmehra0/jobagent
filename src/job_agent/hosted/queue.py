@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterator, Optional
 
 from job_agent.config.settings import settings
 
-VALID_PHASES = ("intake", "source", "evaluate", "tailor", "apply", "track", "run-pipeline")
+VALID_PHASES = ("intake", "source", "evaluate", "tailor", "apply", "track", "prep", "run-pipeline")
 
 
 @dataclass(frozen=True)

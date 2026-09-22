@@ -91,8 +91,8 @@ class FormFiller:
             authorized = authorization.is_authorized_in(question)
             if authorized is None:
                 authorized = authorization.is_authorized_in(self.job.location)
-                if authorized is None and self.job.is_remote and authorization.remote_worldwide:
-                    authorized = True
+            if authorized is None and self.job.is_remote and authorization.remote_worldwide:
+                authorized = True
             if authorized is None:
                 return None
             return _YES if authorized else _NO
@@ -137,6 +137,9 @@ class FormFiller:
 
     def _llm_answer(self, question: str) -> Optional[str]:
         """Draft an open-ended answer from profile facts, or None if no LLM is configured."""
+        from job_agent.automation.routing import is_workday
+        if is_workday(self.job.apply_url) or is_workday(self.job.job_url):
+            return None  # Workday screening answers require explicit profile fields.
         if settings.active_provider not in ("openai", "groq", "openai_compatible"):
             return None
         try:
@@ -199,6 +202,29 @@ class FormFiller:
         contact = self.profile.contact
         first_name, last_name = self._split_name()
 
+        descriptor = ' '.join(str(field.get(k) or '') for k in ('label', 'name', 'id', 'aria_label')).lower()
+        if any(term in descriptor for term in ('gender', 'race', 'ethnic', 'veteran', 'disabilit', 'sexual orientation', 'demographic')):
+            # Never infer sensitive disclosures, even from other profile text.
+            return self._skip(label, 'voluntary disclosure requires your own choice')
+
+        if field_type in ('password', 'hidden'):
+            return False
+
+        if field.get('role') == 'combobox' and tag not in ('input', 'select'):
+            answer = (self.profile.work_authorization.current_country if label.strip(' *') in ('country', 'country of residence')
+                      else self.answer_screening_question(label))
+            if answer == 'Unspecified':
+                answer = None
+            if not answer:
+                return self._skip(label, 'no profile fact determines this dropdown')
+            locator.click()
+            option = locator.page.get_by_role('option', name=answer, exact=True)
+            if option.count() == 1 and option.is_visible():
+                option.click()
+                return True
+            locator.press('Escape')
+            return self._skip(label, 'no exact matching dropdown option')
+
         if self._is_search_field(field):
             # Job sites put a search bar ("Location", "Keywords") above the form;
             # filling it with profile data navigates away or corrupts the page.
@@ -206,6 +232,13 @@ class FormFiller:
 
         try:
             if field_type == "file":
+                if 'cover' in descriptor:
+                    from job_agent.tracking.supplements import document_links
+                    letter = document_links(profile_hash=self.profile.profile_hash).get(self.job.id, {}).get('Cover Letter')
+                    if not letter:
+                        return self._skip(label, 'no validated cover letter was requested')
+                    locator.set_input_files(letter)
+                    return True
                 if pdf_resume_path and Path(pdf_resume_path).exists():
                     console.print(f"  - Uploading tailored resume: [cyan]{Path(pdf_resume_path).name}[/cyan]")
                     locator.set_input_files(str(pdf_resume_path))

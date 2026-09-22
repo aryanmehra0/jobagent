@@ -67,7 +67,10 @@ def test_hosted_worker_completes_a_validation_run(tmp_path):
 
 def test_hosted_api_requires_token_and_enqueues_runs(tmp_path):
     queue = HostedQueue(tmp_path / "hosted.db")
-    server = HostedApiServer(("127.0.0.1", 0), partial(HostedApiHandler), token="secret", queue=queue)
+    from job_agent.hosted.auth import HostedIdentityStore
+    identities = HostedIdentityStore(queue)
+    token = identities.issue_key("u1")
+    server = HostedApiServer(("127.0.0.1", 0), partial(HostedApiHandler), queue=queue, identities=identities)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base = f"http://127.0.0.1:{server.server_address[1]}"
@@ -80,12 +83,12 @@ def test_hosted_api_requires_token_and_enqueues_runs(tmp_path):
         status, payload = _request(f"{base}/runs", "POST", body=body)
         assert status == 401
 
-        status, payload = _request(f"{base}/runs", "POST", token="secret", body=body)
+        status, payload = _request(f"{base}/runs", "POST", token=token, body=body)
         assert status == 202
         run_id = payload["run"]["id"]
         assert queue.get(run_id).status == "pending"
 
-        status, payload = _request(f"{base}/runs/{run_id}", token="secret")
+        status, payload = _request(f"{base}/runs/{run_id}", token=token)
         assert status == 200
         assert payload["run"]["user_id"] == "u1"
     finally:

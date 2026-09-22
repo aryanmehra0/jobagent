@@ -62,7 +62,7 @@ class DOMNavigator:
         fields: List[Dict[str, Any]] = []
 
         # Find all inputs, selects, textareas
-        elements = self.page.locator("input, select, textarea").all()
+        elements = self.page.locator("input, select, textarea, [role='combobox']").all()
 
         for el in elements:
             try:
@@ -87,6 +87,8 @@ class DOMNavigator:
                         label_text = label_el.inner_text().strip()
 
                 if not label_text:
+                    label_text = el.evaluate("""el => (el.getAttribute('aria-labelledby') || '').split(/\\s+/).map(id => document.getElementById(id)?.textContent || '').join(' ').trim()""")
+                if not label_text:
                     # Check parent label or preceding text
                     label_text = el.evaluate(
                         """el => {
@@ -107,6 +109,7 @@ class DOMNavigator:
                     "label": label_text or aria_label or el_placeholder or el_name or el_id,
                     "placeholder": el_placeholder,
                     "aria_label": aria_label,
+                    "role": el.get_attribute("role") or "",
                 }
                 fields.append(field_descriptor)
             except Exception:
@@ -138,11 +141,16 @@ class DOMNavigator:
                 return None
         elif action_type == "next":
             patterns = [
+                "button[data-automation-id='bottom-navigation-next-button']",
                 "button:has-text('Next')",
                 "button:has-text('Continue')",
                 "button:has-text('Save & Continue')",
                 "button:has-text('Proceed')",
             ]
+            from job_agent.automation.routing import is_workday
+            if is_workday(getattr(self.page, 'url', '')) and not self.has_application_form():
+                patterns += ["button[data-automation-id='applyManually']", "a[data-automation-id='adventureButton']",
+                             "a[data-automation-id='applyButton']", "button[data-automation-id='applyButton']"]
         else:
             patterns = [f"button:has-text('{action_type}')"]
 
@@ -167,6 +175,9 @@ class DOMNavigator:
         """
         try:
             if self.page.locator("input[type='file']").count():
+                return True
+            from job_agent.automation.routing import is_workday
+            if is_workday(getattr(self.page, 'url', '')) and self.page.locator("[data-automation-id='applicationPage'], [data-automation-id='applicationReview']").count():
                 return True
             email = self.page.locator(
                 "input[type='email'], input[name*='email' i], input[id*='email' i], input[autocomplete='email']"

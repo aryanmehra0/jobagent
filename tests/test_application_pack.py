@@ -65,6 +65,12 @@ def test_pack_roundtrip_has_relative_links_and_byte_exact_resume(monkeypatch, tm
         assert "resumes/resume_job1.pdf" in archive.read("index.html").decode()
         assert not json.loads(archive.read("manifest.json"))["omitted_pdfs"]
         assert str(out) not in archive.read("jobs.csv").decode("utf-8-sig")
+        from openpyxl import load_workbook
+        workbook = load_workbook(io.BytesIO(archive.read('applications_tracker.xlsx')), read_only=True)
+        assert workbook.sheetnames == ['Ready for review', 'Latest search', 'All saved jobs']
+        workbook.close()
+        assert 'Extract the entire ZIP' in archive.read('index.html').decode()
+        assert 'applications_ready.csv' in archive.read('index.html').decode()
 
 
 @pytest.mark.parametrize("change", ["tampered", "foreign_profile", "failed_check", "missing"])

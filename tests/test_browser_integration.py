@@ -8,6 +8,55 @@ from job_agent.config.schema import CandidateProfile, ContactInfo, JobPosting, S
 from job_agent.sourcing.delta_store import DeltaStore
 
 
+@pytest.mark.skipif(os.environ.get('JOB_AGENT_BROWSER_TESTS') != '1', reason='Opt-in Chromium')
+@pytest.mark.parametrize('kind', ['wizard', 'unknown_required', 'account'])
+def test_workday_assistance_never_submits(tmp_path, kind):
+    from playwright.sync_api import sync_playwright
+    import json
+    profile = CandidateProfile(contact=ContactInfo(full_name='Test Candidate',email='candidate@example.com'), summary='Test software engineer',work_authorization=WorkAuthorization(current_country='India'),
+                               skills=SkillSet(languages=['Python']),years_of_experience=0)
+    profile.seal_profile()
+    posting = JobPosting(id='workday',title='Engineer',company='Example',source='workday',
+                         job_url='https://example.wd5.myworkdayjobs.com/jobs/123')
+    pdf = tmp_path/'resume.pdf'
+    pdf.write_bytes(b'%PDF-1.4\n%%EOF')
+    review = '<div data-automation-id="applicationReview"><h1>Review</h1><button onclick="window.sent()">Submit</button></div>'
+    html = '''<div data-automation-id="applicationPage"><form onsubmit="event.preventDefault(); window.values({name:document.querySelector('#name').value,race:document.querySelector('#race').value});document.body.innerHTML=window.review">
+    <label for="name">Full name</label><input id="name" required>
+    <label for="email">Email</label><input id="email" type="email" required>
+    <label for="race">Race</label><select id="race"><option value="">Choose</option><option value="private">Disclose</option></select>
+    <button data-automation-id="bottom-navigation-next-button" type="submit">Save & Continue</button></form></div>
+    <script>window.review=''' + json.dumps(review) + ';</script>'
+    if kind == 'unknown_required':
+        html = html.replace('<label for="name">','<label for="code">Required referral code</label><input id="code" required><label for="name">')
+    elif kind == 'account':
+        html = '<input type="email"><input type="password"><button>Sign In</button>'
+    values, sent, reviews = [], [], []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context()
+        context.route('**/*', lambda route: route.fulfill(content_type='text/html',body=html))
+        context.expose_function('values',lambda value: values.append(value))
+        context.expose_function('sent',lambda: sent.append(True))
+        class Session:
+            def new_stealth_page(self): return context.new_page()
+            def close(self): context.close()
+        agent = AutoApplyAgent(session_manager=Session(),delta_store=DeltaStore(tmp_path/'delta.db'))
+        try:
+            result = agent.apply_to_job(profile,posting,pdf,assist_workday=True,review_callback=lambda page,message: reviews.append(message))
+            assert result['status'] == 'skipped'
+            assert not sent
+            if kind == 'wizard':
+                assert values == [{'name':'Test Candidate','race':''}]
+                assert 'Automatic submission is disabled' in reviews[-1]
+            else:
+                assert not values
+                assert 'requires your action' in result['error'] if kind == 'account' else 'Required fields' in result['error']
+        finally:
+            agent.close()
+            browser.close()
+
+
 @pytest.mark.skipif(os.environ.get("JOB_AGENT_BROWSER_TESTS") != "1",
                     reason="Set JOB_AGENT_BROWSER_TESTS=1 to exercise installed Chromium")
 @pytest.mark.parametrize("kind", ["single", "multi", "missing_required"])
