@@ -34,6 +34,12 @@ def publish_outputs(*, bundle: bool = False) -> dict[str, Any]:
             published["warnings"].append("Database sync failed; CSV files remain available. See the run log.")
     except Exception as exc:
         published["warnings"].append(f"Database sync failed: {exc}")
+    try:
+        from job_agent.tracking.quality import write_quality_report
+        path = write_quality_report()
+        published["files"]["quality_report"] = str(path)
+    except Exception as exc:
+        published["warnings"].append(f"Quality report failed: {exc}")
     if bundle:
         try:
             from job_agent.tracking.supplements import sync_tracker

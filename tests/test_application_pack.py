@@ -10,7 +10,7 @@ import pytest
 from job_agent.config.schema import JobPosting
 from job_agent.config.settings import settings
 from job_agent.tailoring.regional import regional_policy, remote_eligibility
-from job_agent.tracking.bundle import build_application_pack
+from job_agent.tracking.bundle import build_application_pack, validate_application_pack
 from job_agent.tracking.export import JobsCsvExporter
 
 
@@ -58,7 +58,13 @@ def prepare(monkeypatch, tmp_path):
 
 def test_pack_roundtrip_has_relative_links_and_byte_exact_resume(monkeypatch, tmp_path):
     out, folder, _ = prepare(monkeypatch, tmp_path)
-    with ZipFile(build_application_pack(out)) as archive:
+    (out / "quality_report.json").write_text(json.dumps({"grade_out_of_10": 8.5}), encoding="utf-8")
+    pack = build_application_pack(out)
+    assert validate_application_pack(pack) == {
+        "jobs": 1, "resumes": 1, "supporting_documents": 0,
+        "checked_documents": 1, "valid": True,
+    }
+    with ZipFile(pack) as archive:
         rows = list(csv.DictReader(io.StringIO(archive.read("jobs.csv").decode("utf-8-sig"))))
         assert rows[0]["Open Resume"] == "resumes/resume_job1.pdf"
         assert archive.read(rows[0]["Open Resume"]) == (folder / "resume_job1.pdf").read_bytes()
@@ -71,6 +77,7 @@ def test_pack_roundtrip_has_relative_links_and_byte_exact_resume(monkeypatch, tm
         workbook.close()
         assert 'Extract the entire ZIP' in archive.read('index.html').decode()
         assert 'applications_ready.csv' in archive.read('index.html').decode()
+        assert json.loads(archive.read("quality_report.json"))["grade_out_of_10"] == 8.5
 
 
 @pytest.mark.parametrize("change", ["tampered", "foreign_profile", "failed_check", "missing"])
@@ -88,6 +95,20 @@ def test_pack_refuses_untrusted_attachments(monkeypatch, tmp_path, change):
     with ZipFile(build_application_pack(out)) as archive:
         assert not any(name.endswith(".pdf") for name in archive.namelist())
         assert json.loads(archive.read("manifest.json"))["omitted_pdfs"]
+
+
+def test_pack_validator_rejects_manifest_hash_mismatch(monkeypatch, tmp_path):
+    out, _, _ = prepare(monkeypatch, tmp_path)
+    pack = build_application_pack(out)
+    broken = tmp_path / "broken.zip"
+    with ZipFile(pack) as source, ZipFile(broken, "w") as target:
+        for name in source.namelist():
+            contents = source.read(name)
+            if name == "resumes/resume_job1.pdf":
+                contents = b"%PDF-1.7 tampered"
+            target.writestr(name, contents)
+    with pytest.raises(ValueError, match="hash mismatch"):
+        validate_application_pack(broken)
 
 
 def test_external_csv_text_is_not_executable_and_scores_sort_numerically(monkeypatch, tmp_path):

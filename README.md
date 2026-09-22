@@ -9,6 +9,8 @@ actually is (not what it aspires to be):
 
 | Feature | Command / trigger | Dashboard? |
 | --- | --- | --- |
+| Daily application pack | `python main.py daily --limit 5` | Same engine as Run all phases |
+| Quality score | `python main.py quality` | Included as `quality_report.json` in the ZIP |
 | Interview prep (Phase 7) | `python main.py prep [--job-id] [--offline]` | Yes — its own phase node |
 | Cover letters | `--cover-letter` on `tailor`, or the dashboard run toggle | Yes — run-form checkbox |
 | Outcome analytics | automatic once jobs are tracked | Yes — Inspector "Analytics" tab |

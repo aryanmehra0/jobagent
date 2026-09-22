@@ -48,11 +48,11 @@ def pack_index(rows, coverage, table_rows):
                             if row.get(col))
         url = row.get('Apply URL') or row.get('Job URL') or ''
         apply = f'<a href="{escape(url, quote=True)}" target="_blank" rel="noopener noreferrer">Open employer listing</a>' if url.startswith(('https://', 'http://')) else ''
-        cards.append(f'<article><h3>{escape(row.get("Title", ""))}</h3><p>{escape(row.get("Company", ""))} · {escape(row.get("Location", ""))}</p>'
-                     f'<p>Fit: {escape(row.get("Fit Score", ""))}/10 · {escape(row.get("Remote Eligibility", "Review eligibility"))}</p>'
+        cards.append(f'<article><h3>{escape(row.get("Title", ""))}</h3><p>{escape(row.get("Company", ""))} - {escape(row.get("Location", ""))}</p>'
+                     f'<p>Fit: {escape(row.get("Fit Score", ""))}/10 - {escape(row.get("Remote Eligibility", "Review eligibility"))}</p>'
                      f'<nav>{documents}{apply}</nav><p>{escape(row.get("HR / Careers Email") or "No published email; use the application link.")}</p></article>')
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">'
-            '<title>Start here — your application pack</title><style>'
+            '<title>Start here - your application pack</title><style>'
             'body{font:16px/1.6 system-ui;margin:0;background:#f5f7fb;color:#17253d}main{max-width:1120px;margin:auto;padding:28px}'
             'nav{display:flex;gap:12px;flex-wrap:wrap}a{color:#155ac0}nav a{background:#eaf0ff;border-radius:8px;padding:10px 14px}'
             'article{background:white;border:1px solid #dde3ee;border-radius:12px;padding:22px;margin:18px 0}'
@@ -65,9 +65,37 @@ def pack_index(rows, coverage, table_rows):
             '<a download href="jobs.csv">All saved jobs CSV</a><a download href="applications_tracker.xlsx">Excel workbook</a></nav>'
             f'<h2>Ready for your review ({len(ready)})</h2>' + (''.join(cards) or '<p>No current applications have validated PDFs. Return to the agent and run evaluation and tailoring.</p>') +
             '<p>Interview guides contain practice prompts, not verified company interview questions. Published email addresses are not deliverability verified. Creating this pack sends nothing.</p>'
-            f'<details><summary>All saved jobs ({len(rows)}) — includes older searches</summary><div class="table"><table><thead><tr>'
+            f'<details><summary>All saved jobs ({len(rows)}) - includes older searches</summary><div class="table"><table><thead><tr>'
             '<th>Role</th><th>Company</th><th>Location</th><th>Fit</th><th>Contact</th><th>Eligibility</th><th>Job</th><th>Documents</th>'
             '</tr></thead><tbody>' + ''.join(table_rows) + '</tbody></table></div></details></main></body></html>')
+
+
+def validate_application_pack(path: Path) -> dict[str, int | bool]:
+    """Verify that the portable pack has its core files and matching document hashes."""
+    required = {"index.html", "jobs.csv", "jobs_latest.csv", "applications_ready.csv", "applications_tracker.xlsx", "manifest.json"}
+    with ZipFile(path) as archive:
+        names = set(archive.namelist())
+        missing = sorted(required - names)
+        if missing:
+            raise ValueError(f"Application pack is missing: {', '.join(missing)}")
+        manifest = json.loads(archive.read("manifest.json"))
+        checked = 0
+        for item in manifest.get("pdfs", []) + manifest.get("documents", []):
+            file_name = item.get("file")
+            expected = item.get("sha256")
+            if not file_name or file_name not in names:
+                raise ValueError(f"Application pack manifest points to a missing file: {file_name}")
+            digest = hashlib.sha256(archive.read(file_name)).hexdigest()
+            if digest != expected:
+                raise ValueError(f"Application pack hash mismatch: {file_name}")
+            checked += 1
+        return {
+            "jobs": int(manifest.get("jobs") or 0),
+            "resumes": len(manifest.get("pdfs", [])),
+            "supporting_documents": len(manifest.get("documents", [])),
+            "checked_documents": checked,
+            "valid": True,
+        }
 
 
 @exclusive_run
@@ -164,7 +192,11 @@ def build_application_pack(outputs_dir: Path | None = None) -> Path:
             report = out / "run_report.json"
             if report.is_file():
                 archive.write(report, "run_report.json")
+            quality = out / "quality_report.json"
+            if quality.is_file():
+                archive.write(quality, "quality_report.json")
         temporary.replace(target)
+        validate_application_pack(target)
     finally:
         temporary.unlink(missing_ok=True)
     return target

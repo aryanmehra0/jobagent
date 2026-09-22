@@ -166,6 +166,57 @@ def test_cli_full_run_uses_shared_flow_and_defaults_to_dry_run(monkeypatch, tmp_
     assert calls[0][1]["tailoring_mode"] == "regional"
 
 
+def test_cli_daily_builds_cover_letter_pack_by_default(monkeypatch, tmp_path, candidate_profile):
+    from click.testing import CliRunner
+    from job_agent.cli import cli
+    profile = tmp_path / "profile.json"
+    profile.write_text(candidate_profile.model_dump_json())
+    monkeypatch.setattr(settings, "profile_path", profile)
+    pack = tmp_path / "application_pack.zip"
+    calls = []
+
+    def run_sync(self, phases, options):
+        calls.append((phases, options))
+        return {"status": "ok", "report": {"files": {"application_pack": str(pack)}, "warnings": []}}
+
+    monkeypatch.setattr(run.PipelineRunner, "run_sync", run_sync)
+    monkeypatch.setattr("job_agent.tracking.bundle.validate_application_pack",
+                        lambda path: {"jobs": 3, "resumes": 2, "supporting_documents": 4, "checked_documents": 6, "valid": True})
+    result = CliRunner().invoke(cli, ["daily", "--limit", "2"])
+    assert result.exit_code == 0, result.output
+    assert calls[0][0] == ["source", "evaluate", "tailor", "apply", "track", "prep"]
+    assert calls[0][1]["dry_run"] is True
+    assert calls[0][1]["cover_letter"] is True
+    assert calls[0][1]["limit"] == 2
+    assert "Pack verified" in result.output
+
+
+def test_cli_quality_scores_current_outputs(monkeypatch, tmp_path, candidate_profile):
+    from click.testing import CliRunner
+    from job_agent.cli import cli
+    out = settings.outputs_dir
+    out.mkdir(parents=True)
+    profile = tmp_path / "profile.json"
+    profile.write_text(candidate_profile.model_dump_json())
+    monkeypatch.setattr(settings, "profile_path", profile)
+    for name in ("jobs_master.csv", "jobs_latest.csv", "applications_ready.csv"):
+        (out / name).write_text(
+            "Job ID,Status,HR / Careers Email,Application Readiness\n"
+            "fresh,qualified,jobs@example.com,Ready for your review\n",
+            encoding="utf-8-sig",
+        )
+    (out / "source_coverage.json").write_text(json.dumps({"checked_at": utc_now_iso(), "hours_old": 48}))
+    (out / "evaluation_progress.json").write_text(json.dumps({"scored": 1, "missing_descriptions": 0, "failed": 0}))
+    monkeypatch.setattr("job_agent.tracking.quality.validate_application_pack",
+                        lambda path: {"jobs": 1, "resumes": 1, "supporting_documents": 2, "checked_documents": 3, "valid": True})
+    result = CliRunner().invoke(cli, ["quality"])
+    assert result.exit_code == 0, result.output
+    assert "Quality score" in result.output
+    report = json.loads((out / "quality_report.json").read_text(encoding="utf-8"))
+    assert report["grade_out_of_10"] >= 8.0
+    assert report["jobs"] == {"master": 1, "latest": 1, "ready": 1}
+
+
 def test_missing_descriptions_are_counted_and_never_sent_to_scoring(tmp_path, candidate_profile):
     from job_agent.evaluation.pipeline import SemanticEvaluationPipeline
     out = settings.outputs_dir

@@ -21,6 +21,27 @@ Open a terminal in this project and start the dashboard:
 python main.py ui
 ```
 
+Or prepare a fresh dry-run application pack from the terminal:
+
+```powershell
+python main.py daily --limit 5
+```
+
+`daily` runs sourcing, scoring, country-specific resume tailoring, dry-run apply
+routing, tracking, interview prep, cover letters and the final ZIP export. It
+prints a pack verification line before it finishes. Add `--live` only when you
+intend to submit through supported public forms.
+
+To see what is holding the run back from a 10/10, run:
+
+```powershell
+python main.py quality
+```
+
+It scores freshness, profile integrity, evaluation coverage, ready applications,
+download-pack integrity, hiring-email coverage and outcome tracking. The same
+report is saved as `data/outputs/quality_report.json` and included in the ZIP.
+
 **To download your results:** click **Jobs & downloads → Download everything
 (ZIP)**, right-click the saved ZIP and choose **Extract All**, then open
 `index.html`. It shows the review shortlist first and links to each included

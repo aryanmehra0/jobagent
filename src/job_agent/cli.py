@@ -65,7 +65,7 @@ def cli(ctx: click.Context) -> None:
 # PHASE 1: INTAKE & PARAMETERIZATION
 # ==============================================================================
 
-_PHASE_COMMANDS = {"source", "evaluate", "tailor", "apply", "track", "prep", "contacts", "run-pipeline"}
+_PHASE_COMMANDS = {"source", "evaluate", "tailor", "apply", "track", "prep", "contacts", "run-pipeline", "daily"}
 
 
 @cli.result_callback()
@@ -74,7 +74,7 @@ def _refresh_jobs_sheet(ctx: click.Context, *_: object, **__: object) -> None:
     """Keep the jobs sheet and the database current after any phase that changes the artifacts."""
     if ctx.invoked_subcommand not in _PHASE_COMMANDS:
         return
-    if ctx.invoked_subcommand == "run-pipeline":
+    if ctx.invoked_subcommand in {"run-pipeline", "daily"}:
         return  # The shared runner exports after each phase and publishes the ZIP.
     import time
     from datetime import datetime, timezone
@@ -296,7 +296,9 @@ def export_command(output: Optional[Path], bundle: bool = False) -> None:
 
     if bundle:
         from job_agent.tracking.bundle import build_application_pack
+        from job_agent.tracking.quality import write_quality_report
         try:
+            write_quality_report()
             path = build_application_pack()
             if output and output.resolve() != path.resolve():
                 output.parent.mkdir(parents=True, exist_ok=True)
@@ -763,6 +765,66 @@ def contacts_command(job_id, limit):
 # FULL PIPELINE
 # ==============================================================================
 
+def _run_pipeline_sync(
+    *,
+    resume: Optional[Path],
+    dry_run: bool,
+    skip_intake: bool,
+    threshold: Optional[float],
+    limit: Optional[int],
+    assume_yes: bool,
+    mode: str,
+    cover_letter: bool,
+    title: str,
+) -> dict:
+    """Run the shared seven-phase flow and print the files a user should open next."""
+    from job_agent.web.runner import PipelineRunner
+    from job_agent.tracking.bundle import validate_application_pack
+
+    console.print(
+        Panel.fit(
+            f"[bold cyan]{title}[/bold cyan]\n"
+            + ("[yellow]Dry run: no application will be submitted.[/yellow]" if dry_run
+               else "[red]LIVE run: real applications will be submitted.[/red]"),
+            border_style="cyan",
+        )
+    )
+
+    phases = ["source", "evaluate", "tailor", "apply", "track", "prep"]
+    if not skip_intake:
+        phases.insert(0, "intake")
+    else:
+        _require(settings.profile_path, "profile.json", "Run: python main.py intake --resume <pdf>")
+    result = PipelineRunner().run_sync(phases, {
+        "resume": str(resume) if resume else None, "dry_run": dry_run,
+        "threshold": threshold, "limit": limit, "tailoring_mode": mode,
+        "track_all": True, "assume_yes": assume_yes, "started_from": "cli",
+        "cover_letter": cover_letter,
+    })
+    report = result.get("report", {})
+    console.print(f"\nPipeline status: [bold]{result.get('status', 'error')}[/bold]")
+    if report.get("halt_reason"):
+        console.print(report["halt_reason"])
+    for label, path in report.get("files", {}).items():
+        console.print(f"  {label}: {path}")
+    pack = report.get("files", {}).get("application_pack")
+    if pack:
+        try:
+            stats = validate_application_pack(Path(pack))
+            console.print(
+                "[bold green]Pack verified:[/bold green] "
+                f"{stats['jobs']} job(s), {stats['resumes']} resume(s), "
+                f"{stats['supporting_documents']} supporting document(s)."
+            )
+        except Exception as exc:
+            report.setdefault("warnings", []).append(f"Application pack validation failed: {exc}")
+    for warning in report.get("warnings", []):
+        console.print(f"[yellow]{warning}[/yellow]")
+    if result.get("status") == "error":
+        _fail(result.get("error") or "Pipeline failed; review data/outputs/run_report.json.")
+    return result
+
+
 @cli.command("run-pipeline")
 @click.option("--cover-letter", is_flag=True, help="Include optional cover letters during tailoring.")
 @click.option("--resume", "-r", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
@@ -788,38 +850,39 @@ def run_pipeline_command(
     A phase that produces nothing stops the run cleanly rather than letting the
     next phase fail on a missing artifact.
     """
-    from job_agent.web.runner import PipelineRunner
-
-    console.print(
-        Panel.fit(
-            "[bold cyan]Autonomous pipeline: phases 1-7[/bold cyan]\n"
-            + ("[yellow]Dry run: no application will be submitted.[/yellow]" if dry_run
-               else "[red]LIVE run: real applications will be submitted.[/red]"),
-            border_style="cyan",
-        )
+    _run_pipeline_sync(
+        resume=resume, dry_run=dry_run, skip_intake=skip_intake, threshold=threshold,
+        limit=limit, assume_yes=assume_yes, mode=mode, cover_letter=cover_letter,
+        title="Autonomous pipeline: phases 1-7",
     )
 
-    phases = ["source", "evaluate", "tailor", "apply", "track", "prep"]
-    if not skip_intake:
-        phases.insert(0, "intake")
-    else:
-        _require(settings.profile_path, "profile.json", "Run: python main.py intake --resume <pdf>")
-    result = PipelineRunner().run_sync(phases, {
-        "resume": str(resume) if resume else None, "dry_run": dry_run,
-        "threshold": threshold, "limit": limit, "tailoring_mode": mode,
-        "track_all": True, "assume_yes": assume_yes, "started_from": "cli",
-        "cover_letter": cover_letter,
-    })
-    report = result.get("report", {})
-    console.print(f"\nPipeline status: [bold]{result.get('status', 'error')}[/bold]")
-    if report.get("halt_reason"):
-        console.print(report["halt_reason"])
-    for label, path in report.get("files", {}).items():
-        console.print(f"  {label}: {path}")
-    for warning in report.get("warnings", []):
-        console.print(f"[yellow]{warning}[/yellow]")
-    if result.get("status") == "error":
-        _fail(result.get("error") or "Pipeline failed; review data/outputs/run_report.json.")
+
+@cli.command("daily")
+@click.option("--resume", "-r", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
+              help="Optional new resume to parse before the run.")
+@click.option("--dry-run/--live", default=True, help="Default: prepare results without submitting. --live enables applications.")
+@click.option("--mode", type=click.Choice(["auto", "faithful", "generated", "regional"]), default="regional", show_default=True)
+@click.option("--threshold", "-t", type=click.FloatRange(0.0, 1.0), default=None, help="Tier 1 cutoff.")
+@click.option("--limit", "-n", type=click.IntRange(1), default=None, help="Cap jobs per phase after evaluation.")
+@click.option("--cover-letter/--no-cover-letter", default=True, show_default=True,
+              help="Create grounded cover letters for the ready shortlist.")
+@click.option("--yes", "assume_yes", is_flag=True, help="Skip the live-submission confirmation prompt.")
+@exclusive_run
+def daily_command(
+    resume: Optional[Path],
+    dry_run: bool,
+    threshold: Optional[float],
+    limit: Optional[int],
+    assume_yes: bool,
+    mode: str = "regional",
+    cover_letter: bool = True,
+) -> None:
+    """Daily search-to-download workflow for preparing today's application pack."""
+    _run_pipeline_sync(
+        resume=resume, dry_run=dry_run, skip_intake=resume is None, threshold=threshold,
+        limit=limit, assume_yes=assume_yes, mode=mode, cover_letter=cover_letter,
+        title="Daily application pack: source, score, tailor, track, prep, export",
+    )
 
 
 # ==============================================================================
@@ -910,6 +973,35 @@ def doctor_command(live: bool = False) -> None:
             console.print("[green]Live Groq connection verified.[/green]")
         except LLMError as exc:
             _fail(str(exc))
+
+
+@cli.command("quality")
+@click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Optional path to write the quality report JSON.")
+def quality_command(json_out: Optional[Path] = None) -> None:
+    """Score today's data, documents, contacts and tracking readiness."""
+    from job_agent.tracking.quality import quality_report
+
+    report = quality_report()
+    if json_out:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    else:
+        target = settings.outputs_dir / "quality_report.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    table = Table(title=f"Quality score: {report['grade_out_of_10']}/10", show_header=True, header_style="bold magenta")
+    table.add_column("Check", style="cyan")
+    table.add_column("Score", justify="right")
+    table.add_column("Detail", style="white")
+    for item in report["checks"]:
+        table.add_row(item["name"].replace("_", " ").title(), f"{item['points']}/{item['max']}", item["detail"])
+    console.print(table)
+    if report["next_actions"]:
+        console.print("[bold yellow]Best next actions[/bold yellow]")
+        for action in report["next_actions"]:
+            console.print(f"  - {action}")
 
 
 @cli.command("production-check")

@@ -28,6 +28,24 @@ browser profiles and old email attachments. Draft email text remains in the CSV;
 review it and attach the current PDF yourself. Downloading refreshes the export,
 not the underlying job search.
 
+For a fresh terminal run, use `python main.py daily --limit 5`. It runs the same
+safe dry-run pipeline as the dashboard, includes cover letters by default, exports
+the ZIP and verifies the pack's required files and document hashes before reporting
+success.
+
+Use `python main.py quality` after a run to get a numeric readiness score. The
+report is saved as `quality_report.json` and is bundled into the ZIP. It currently
+scores the profile seal, source freshness, evaluation coverage, ready rows,
+document-hash validation, hiring-email coverage and observed outcome tracking.
+
+Tech-stack decision: keep the core local stack (`pydantic`, `PyMuPDF`/
+`pdfplumber`, `Playwright`, `Typst`, SQLite/Postgres) because it already supports
+the privacy and zero-key requirements. The next optional stack upgrade should be
+provider-agnostic structured LLM output through native OpenAI Structured Outputs
+or Instructor-style Pydantic retries, and Docling as an optional resume extraction
+fallback for difficult PDFs. Both should stay optional so the offline path remains
+fast and installable.
+
 ## Reproduce validation
 
 Final local verification: **505 tests passed** with provider secrets removed and
