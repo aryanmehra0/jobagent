@@ -38,6 +38,11 @@ report is saved as `quality_report.json` and is bundled into the ZIP. It current
 scores the profile seal, source freshness, evaluation coverage, ready rows,
 document-hash validation, hiring-email coverage and observed outcome tracking.
 
+Use `python main.py repair` when quality is held back by thin source data. It
+attempts bounded detail-page enrichment for saved jobs with short or missing
+descriptions, then reruns evaluation, tailoring, dry-run routing, tracking and
+interview prep only if descriptions were actually improved.
+
 Tech-stack decision: keep the core local stack (`pydantic`, `PyMuPDF`/
 `pdfplumber`, `Playwright`, `Typst`, SQLite/Postgres) because it already supports
 the privacy and zero-key requirements. The next optional stack upgrade should be

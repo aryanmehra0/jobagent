@@ -42,6 +42,16 @@ It scores freshness, profile integrity, evaluation coverage, ready applications,
 download-pack integrity, hiring-email coverage and outcome tracking. The same
 report is saved as `data/outputs/quality_report.json` and included in the ZIP.
 
+To repair the current saved run before applying, use:
+
+```powershell
+python main.py repair
+```
+
+`repair` tries to fill thin or missing job descriptions from the saved job links,
+then reruns evaluation, tailoring, dry-run routing, tracking and interview prep
+only if it actually improved the source data. It still does not submit anything.
+
 **To download your results:** click **Jobs & downloads → Download everything
 (ZIP)**, right-click the saved ZIP and choose **Extract All**, then open
 `index.html`. It shows the review shortlist first and links to each included

@@ -564,18 +564,18 @@ class OmnichannelScraper:
 
         self._print_summary(raw_count, in_sweep_duplicates, previously_seen, unseen)
 
-        from job_agent.sourcing.details import enrich_linkedin_details
-        unseen, detail_report = enrich_linkedin_details(
+        from job_agent.sourcing.details import enrich_job_details
+        unseen, detail_report = enrich_job_details(
             unseen, proxy=self.proxy_mgr.get_proxy_for_board("linkedin"))
         if detail_report["requested"]:
-            console.print(f"[cyan]Descriptions: {detail_report['fetched']}/{detail_report['requested']} eligible LinkedIn jobs fetched.[/cyan]")
+            console.print(f"[cyan]Descriptions: {detail_report['fetched']}/{detail_report['requested']} thin job descriptions fetched.[/cyan]")
 
         if unseen and self.params.find_contacts:
             unseen = self._find_contacts(unseen)
 
         backlog = self._unevaluated_backlog(target_output, {job.id for job in unseen})
         if backlog:
-            backlog, backlog_details = enrich_linkedin_details(
+            backlog, backlog_details = enrich_job_details(
                 backlog, proxy=self.proxy_mgr.get_proxy_for_board("linkedin"))
             for key, value in backlog_details.items():
                 detail_report[key] += value

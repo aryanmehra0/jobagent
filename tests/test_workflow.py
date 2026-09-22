@@ -127,8 +127,36 @@ def test_description_requests_skip_irrelevant_and_already_complete_jobs():
     class Session:
         def get(self, *args, **kwargs):
             pytest.fail("A complete description must not trigger another request")
-    jobs, report = enrich_linkedin_details([posting()], session=Session())
+    complete = posting().model_copy(update={
+        "description": "Build machine learning services in Python with experimentation, analytics, stakeholder collaboration, and production support."
+    })
+    jobs, report = enrich_linkedin_details([complete], session=Session())
     assert len(jobs) == 1 and report["requested"] == 0
+
+
+def test_generic_detail_enrichment_uses_jsonld_description():
+    from job_agent.sourcing.details import enrich_job_details
+
+    class Response:
+        headers = {"content-type": "text/html"}
+        def raise_for_status(self):
+            return None
+        def iter_content(self, chunk_size=65536, decode_unicode=True):
+            html = """
+            <html><head><script type="application/ld+json">
+            {"@type":"JobPosting","description":"Build AI product workflows with Python, evaluation, dashboards, and customer-facing automation for product teams."}
+            </script></head><body>Apply now</body></html>
+            """
+            yield html
+
+    class Session:
+        def get(self, *args, **kwargs):
+            return Response()
+
+    thin = posting().model_copy(update={"description": "", "source": "indeed", "job_url": "https://example.ai/jobs/1"})
+    jobs, report = enrich_job_details([thin], session=Session())
+    assert report["requested"] == report["fetched"] == 1
+    assert "AI product workflows" in jobs[0].description
 
 
 def test_manual_applied_marker_is_reversible_and_updates_downloads(monkeypatch, tmp_path):
@@ -215,6 +243,38 @@ def test_cli_quality_scores_current_outputs(monkeypatch, tmp_path, candidate_pro
     report = json.loads((out / "quality_report.json").read_text(encoding="utf-8"))
     assert report["grade_out_of_10"] >= 8.0
     assert report["jobs"] == {"master": 1, "latest": 1, "ready": 1}
+
+
+def test_cli_repair_enriches_saved_descriptions_and_reruns_downstream(monkeypatch, tmp_path, candidate_profile):
+    from click.testing import CliRunner
+    from job_agent.cli import cli
+    from job_agent.config.schema import JobPosting
+
+    out = settings.outputs_dir
+    out.mkdir(parents=True)
+    profile = tmp_path / "profile.json"
+    profile.write_text(candidate_profile.model_dump_json())
+    monkeypatch.setattr(settings, "profile_path", profile)
+    thin = posting().model_copy(update={"description": "", "job_url": "https://example.ai/jobs/1"})
+    for name in ("scraped_jobs.json", "latest_jobs.json"):
+        (out / name).write_text(json.dumps([thin.model_dump()]), encoding="utf-8")
+    monkeypatch.setattr("job_agent.tracking.quality.quality_report",
+                        lambda: {"grade_out_of_10": 6.0, "checks": [], "next_actions": [], "jobs": {}})
+
+    def enrich(jobs, *args, **kwargs):
+        return [JobPosting.model_validate({**jobs[0].model_dump(), "description": "A detailed product AI role using Python and analytics."})], {
+            "requested": 1, "fetched": 1, "unavailable": 0,
+        }
+
+    calls = []
+    monkeypatch.setattr("job_agent.sourcing.details.enrich_job_details", enrich)
+    monkeypatch.setattr(run.PipelineRunner, "run_sync",
+                        lambda self, phases, options: calls.append((phases, options)) or {"status": "ok", "report": {"files": {}, "warnings": []}})
+    result = CliRunner().invoke(cli, ["repair", "--detail-limit", "1"])
+    assert result.exit_code == 0, result.output
+    assert calls and calls[0][0] == ["evaluate", "tailor", "apply", "track", "prep"]
+    saved = json.loads((out / "scraped_jobs.json").read_text(encoding="utf-8"))[0]
+    assert "detailed product AI" in saved["description"]
 
 
 def test_missing_descriptions_are_counted_and_never_sent_to_scoring(tmp_path, candidate_profile):

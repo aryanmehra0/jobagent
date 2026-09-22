@@ -65,7 +65,7 @@ def cli(ctx: click.Context) -> None:
 # PHASE 1: INTAKE & PARAMETERIZATION
 # ==============================================================================
 
-_PHASE_COMMANDS = {"source", "evaluate", "tailor", "apply", "track", "prep", "contacts", "run-pipeline", "daily"}
+_PHASE_COMMANDS = {"source", "evaluate", "tailor", "apply", "track", "prep", "contacts", "run-pipeline", "daily", "repair"}
 
 
 @cli.result_callback()
@@ -74,7 +74,7 @@ def _refresh_jobs_sheet(ctx: click.Context, *_: object, **__: object) -> None:
     """Keep the jobs sheet and the database current after any phase that changes the artifacts."""
     if ctx.invoked_subcommand not in _PHASE_COMMANDS:
         return
-    if ctx.invoked_subcommand in {"run-pipeline", "daily"}:
+    if ctx.invoked_subcommand in {"run-pipeline", "daily", "repair"}:
         return  # The shared runner exports after each phase and publishes the ZIP.
     import time
     from datetime import datetime, timezone
@@ -883,6 +883,90 @@ def daily_command(
         limit=limit, assume_yes=assume_yes, mode=mode, cover_letter=cover_letter,
         title="Daily application pack: source, score, tailor, track, prep, export",
     )
+
+
+def _enrich_saved_descriptions(limit: int) -> dict[str, int]:
+    """Try to fill thin descriptions in saved source artifacts, bounded by limit."""
+    from job_agent.config.schema import JobPosting
+    from job_agent.sourcing.details import enrich_job_details
+
+    outputs = settings.outputs_dir
+    totals = {"requested": 0, "fetched": 0, "unavailable": 0, "files_changed": 0}
+    for name in ("scraped_jobs.json", "latest_jobs.json"):
+        path = outputs / name
+        if not path.is_file():
+            continue
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            jobs = [JobPosting.model_validate(item) for item in raw if isinstance(item, dict)]
+        except Exception:
+            continue
+        thin_ids = [job.id for job in jobs if len((job.description or "").strip()) < 80]
+        if not thin_ids:
+            continue
+        selected = set(thin_ids[:max(0, limit - totals["requested"])])
+        if not selected:
+            break
+        before = {job.id: len(job.description or "") for job in jobs}
+        enriched_subset, report = enrich_job_details([job for job in jobs if job.id in selected])
+        enriched_by_id = {job.id: job for job in enriched_subset}
+        merged = [enriched_by_id.get(job.id, job) for job in jobs]
+        changed = any(len(job.description or "") > before.get(job.id, 0) for job in merged if job.id in selected)
+        for key in ("requested", "fetched", "unavailable"):
+            totals[key] += int(report.get(key) or 0)
+        if changed:
+            path.write_text(json.dumps([job.model_dump() for job in merged], indent=2), encoding="utf-8")
+            totals["files_changed"] += 1
+        if totals["requested"] >= limit:
+            break
+    return totals
+
+
+@cli.command("repair")
+@click.option("--fetch-details/--no-fetch-details", default=True, show_default=True,
+              help="Try to enrich thin saved job descriptions before rebuilding outputs.")
+@click.option("--detail-limit", type=click.IntRange(1, 100), default=20, show_default=True,
+              help="Maximum saved jobs to fetch detail pages for.")
+@click.option("--limit", "-n", type=click.IntRange(1), default=None,
+              help="Cap downstream jobs if descriptions were repaired.")
+@click.option("--cover-letter/--no-cover-letter", default=True, show_default=True,
+              help="Create grounded cover letters when downstream tailoring reruns.")
+@exclusive_run
+def repair_command(fetch_details: bool, detail_limit: int, limit: Optional[int], cover_letter: bool) -> None:
+    """Repair saved outputs, improve weak descriptions, rebuild the pack, and rescore if needed."""
+    from job_agent.tracking.quality import quality_report
+    from job_agent.workflow import publish_outputs
+    from job_agent.web.runner import PipelineRunner
+
+    before = quality_report()
+    console.print(f"[cyan]Starting quality:[/cyan] {before['grade_out_of_10']}/10")
+    enrichment = {"requested": 0, "fetched": 0, "unavailable": 0, "files_changed": 0}
+    if fetch_details:
+        enrichment = _enrich_saved_descriptions(detail_limit)
+        console.print(
+            "[cyan]Description repair:[/cyan] "
+            f"{enrichment['fetched']}/{enrichment['requested']} fetched; "
+            f"{enrichment['files_changed']} source file(s) updated."
+        )
+
+    if enrichment["fetched"]:
+        result = PipelineRunner().run_sync(["evaluate", "tailor", "apply", "track", "prep"], {
+            "dry_run": True, "limit": limit, "tailoring_mode": "regional",
+            "track_all": True, "assume_yes": False, "started_from": "cli",
+            "cover_letter": cover_letter,
+        })
+        if result.get("status") == "error":
+            _fail(result.get("error") or "Repair pipeline failed; review data/outputs/run_report.json.")
+        report = result.get("report", {})
+    else:
+        report = publish_outputs(bundle=True)
+
+    after = quality_report()
+    console.print(f"[bold green]Final quality:[/bold green] {after['grade_out_of_10']}/10")
+    for label, path in report.get("files", {}).items():
+        console.print(f"  {label}: {path}")
+    for warning in report.get("warnings", []):
+        console.print(f"[yellow]{warning}[/yellow]")
 
 
 # ==============================================================================
