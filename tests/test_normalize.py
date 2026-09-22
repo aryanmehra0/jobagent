@@ -47,6 +47,13 @@ def test_clean_text_strips_other_control_characters():
     assert clean_text("Reduced\x01 costs\x1f here") == "Reduced costs here"
 
 
+def test_clean_text_strips_byte_order_mark():
+    """A leading BOM (left over from decoding a UTF-8-with-BOM page as plain
+    "utf-8", which doesn't strip it the way "utf-8-sig" would) must not become
+    part of a saved job description or any other cleaned text."""
+    assert clean_text("﻿Senior Engineer role") == "Senior Engineer role"
+
+
 @pytest.mark.parametrize(
     "line,expected",
     [

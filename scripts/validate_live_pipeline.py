@@ -37,6 +37,22 @@ def main():
     settings.profile_path = root / "profile.json"
     settings.tracker_path = root / "applications_tracker.xlsx"
     settings.llm_strict = True
+
+    # Isolate resume resolution too, not just outputs/profile: tailoring's
+    # demo-vs-real-resume guard (tailoring/pipeline.py's _faithful_source)
+    # calls choose_resume(), which by default scans the shared
+    # data/raw_resumes/ directory. Without this, the guard correctly detects
+    # the operator's own real resume sitting there and refuses to tailor from
+    # the sample -- meaning this script could only validate Phase 4 on a
+    # machine that had never actually been used, which defeats the point of
+    # a live validation run. Point it at an isolated copy of just the sample
+    # resume so this script is self-contained regardless of real usage.
+    isolated_resumes = root / "raw_resumes"
+    isolated_resumes.mkdir(parents=True, exist_ok=True)
+    isolated_sample = isolated_resumes / "sample_resume.pdf"
+    if not isolated_sample.exists():
+        isolated_sample.write_bytes((settings.raw_resumes_dir / "sample_resume.pdf").read_bytes())
+    settings.raw_resumes_dir = isolated_resumes
     report = {"directory": str(root), "provider": settings.active_provider, "model": settings.groq_model}
     try:
         store = DeltaStore()

@@ -28,7 +28,11 @@ _WHITESPACE_RE = re.compile(r"[ \t   ]+")
 # PDF generators encode list bullets with symbol-font code points (DEL, or the
 # U+F0xx private-use block); those carry the "this line is a bullet" signal.
 _BULLET_GLYPH_RE = re.compile(r"[-]")
-_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x80-\x9f]")
+# ﻿ is a byte-order mark that survives a plain "utf-8" decode (only
+# "utf-8-sig" strips it automatically) whenever a fetched page or document
+# declares that encoding without a BOM-aware codec; left in place it became
+# the leading character of the resulting text.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x80-\x9f﻿]")
 
 # pdfplumber writes "(cid:127)" when a font maps a glyph to a code it cannot
 # resolve to a character. In resumes these are nearly always list bullets from a
