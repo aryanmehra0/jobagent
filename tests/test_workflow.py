@@ -134,20 +134,33 @@ def test_description_requests_skip_irrelevant_and_already_complete_jobs():
     assert len(jobs) == 1 and report["requested"] == 0
 
 
-def test_generic_detail_enrichment_uses_jsonld_description():
+def test_generic_detail_enrichment_uses_jsonld_description(monkeypatch):
+    import job_agent.sourcing.details as details_module
     from job_agent.sourcing.details import enrich_job_details
+
+    monkeypatch.setattr(details_module, "_resolves_to_public_address", lambda hostname, port: True)
+
+    html = b"""
+    <html><head><script type="application/ld+json">
+    {"@type":"JobPosting","description":"Build AI product workflows with Python, evaluation, dashboards, and customer-facing automation for product teams."}
+    </script></head><body>Apply now</body></html>
+    """
+
+    class Raw:
+        def read(self, n, decode_content=True):
+            return html
 
     class Response:
         headers = {"content-type": "text/html"}
+        encoding = "utf-8"
+        apparent_encoding = "utf-8"
+        raw = Raw()
         def raise_for_status(self):
             return None
-        def iter_content(self, chunk_size=65536, decode_unicode=True):
-            html = """
-            <html><head><script type="application/ld+json">
-            {"@type":"JobPosting","description":"Build AI product workflows with Python, evaluation, dashboards, and customer-facing automation for product teams."}
-            </script></head><body>Apply now</body></html>
-            """
-            yield html
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc_info):
+            return False
 
     class Session:
         def get(self, *args, **kwargs):
@@ -157,6 +170,59 @@ def test_generic_detail_enrichment_uses_jsonld_description():
     jobs, report = enrich_job_details([thin], session=Session())
     assert report["requested"] == report["fetched"] == 1
     assert "AI product workflows" in jobs[0].description
+
+
+def test_extract_description_prefers_jsonld_over_longer_page_chrome():
+    """A short, accurate JSON-LD description must win over longer nav/footer
+    boilerplate that happens to match a generic selector like <main> or the
+    whole-body fallback -- length alone is not a proxy for correctness."""
+    from job_agent.sourcing.details import extract_description
+
+    html = """
+    <html><body>
+    <script type="application/ld+json">
+    {"@type": "JobPosting", "description": "Own the roadmap for our AI evaluation platform: define metrics, run experiments, ship weekly."}
+    </script>
+    <main>
+      Sign in Join now Jobs Messaging Notifications
+      People also viewed: Data Scientist at Acme, Analyst at Beta, PM at Gamma, Lead at Delta
+      About Accessibility Help Center Privacy Policy Cookie Policy Copyright Trademark
+    </main>
+    </body></html>
+    """
+    description = extract_description(html)
+    assert "roadmap for our AI evaluation platform" in description
+    assert "People also viewed" not in description
+
+
+def test_repair_description_enrichment_shares_results_across_saved_files(monkeypatch, tmp_path):
+    """scraped_jobs.json and latest_jobs.json usually contain the same job from
+    the same sweep; enriching it once must not issue a second live fetch for
+    the other file, and the result must still land in both files."""
+    from job_agent.cli import _enrich_saved_descriptions
+    from job_agent.sourcing import details as details_module
+
+    out = settings.outputs_dir
+    out.mkdir(parents=True, exist_ok=True)
+    thin = posting().model_copy(update={"description": "", "job_url": "https://example.ai/jobs/1"})
+    for name in ("scraped_jobs.json", "latest_jobs.json"):
+        (out / name).write_text(json.dumps([thin.model_dump()]), encoding="utf-8")
+
+    calls = []
+
+    def fake_enrich(jobs, *args, **kwargs):
+        calls.append([job.id for job in jobs])
+        enriched = [job.model_copy(update={"description": "A fully written role description here."}) for job in jobs]
+        return enriched, {"requested": len(jobs), "fetched": len(jobs), "unavailable": 0}
+
+    monkeypatch.setattr(details_module, "enrich_job_details", fake_enrich)
+
+    totals = _enrich_saved_descriptions(20)
+    assert len(calls) == 1  # only fetched once, not once per file
+    assert totals["fetched"] == 1
+    for name in ("scraped_jobs.json", "latest_jobs.json"):
+        saved = json.loads((out / name).read_text(encoding="utf-8"))
+        assert saved[0]["description"] == "A fully written role description here."
 
 
 def test_manual_applied_marker_is_reversible_and_updates_downloads(monkeypatch, tmp_path):

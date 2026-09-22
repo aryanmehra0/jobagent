@@ -888,10 +888,16 @@ def daily_command(
 def _enrich_saved_descriptions(limit: int) -> dict[str, int]:
     """Try to fill thin descriptions in saved source artifacts, bounded by limit."""
     from job_agent.config.schema import JobPosting
-    from job_agent.sourcing.details import enrich_job_details
+    from job_agent.sourcing.details import _thin, enrich_job_details
 
     outputs = settings.outputs_dir
     totals = {"requested": 0, "fetched": 0, "unavailable": 0, "files_changed": 0}
+    # scraped_jobs.json and latest_jobs.json usually share the same jobs from
+    # the same sweep; a job already resolved (successfully or not) while
+    # enriching one file is reused for the other instead of fetched twice.
+    enriched_cache: dict[str, JobPosting] = {}
+    attempted_ids: set[str] = set()
+
     for name in ("scraped_jobs.json", "latest_jobs.json"):
         path = outputs / name
         if not path.is_file():
@@ -899,23 +905,35 @@ def _enrich_saved_descriptions(limit: int) -> dict[str, int]:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             jobs = [JobPosting.model_validate(item) for item in raw if isinstance(item, dict)]
-        except Exception:
+        except Exception as exc:
+            console.print(f"[yellow]Skipping {name}: could not read it ({exc}).[/yellow]")
             continue
-        thin_ids = [job.id for job in jobs if len((job.description or "").strip()) < 80]
-        if not thin_ids:
-            continue
+
+        changed = False
+        for i, job in enumerate(jobs):
+            cached = enriched_cache.get(job.id)
+            if cached is not None and cached.description != job.description:
+                jobs[i] = cached
+                changed = True
+
+        # Same threshold and normalization enrich_job_details itself uses for
+        # "thin", so this selection and its own skip logic never disagree.
+        thin_ids = [job.id for job in jobs if job.id not in attempted_ids and _thin(job.description)]
         selected = set(thin_ids[:max(0, limit - totals["requested"])])
-        if not selected:
-            break
-        before = {job.id: len(job.description or "") for job in jobs}
-        enriched_subset, report = enrich_job_details([job for job in jobs if job.id in selected])
-        enriched_by_id = {job.id: job for job in enriched_subset}
-        merged = [enriched_by_id.get(job.id, job) for job in jobs]
-        changed = any(len(job.description or "") > before.get(job.id, 0) for job in merged if job.id in selected)
-        for key in ("requested", "fetched", "unavailable"):
-            totals[key] += int(report.get(key) or 0)
+        if selected:
+            enriched_subset, report = enrich_job_details([job for job in jobs if job.id in selected])
+            enriched_by_id = {job.id: job for job in enriched_subset}
+            for i, job in enumerate(jobs):
+                if job.id in selected:
+                    jobs[i] = enriched_by_id.get(job.id, job)
+                    enriched_cache[job.id] = jobs[i]
+            attempted_ids |= selected
+            for key in ("requested", "fetched", "unavailable"):
+                totals[key] += int(report.get(key) or 0)
+            changed = changed or bool(report.get("fetched"))
+
         if changed:
-            path.write_text(json.dumps([job.model_dump() for job in merged], indent=2), encoding="utf-8")
+            path.write_text(json.dumps([job.model_dump() for job in jobs], indent=2), encoding="utf-8")
             totals["files_changed"] += 1
         if totals["requested"] >= limit:
             break
@@ -934,10 +952,15 @@ def _enrich_saved_descriptions(limit: int) -> dict[str, int]:
 @exclusive_run
 def repair_command(fetch_details: bool, detail_limit: int, limit: Optional[int], cover_letter: bool) -> None:
     """Repair saved outputs, improve weak descriptions, rebuild the pack, and rescore if needed."""
+    import time
+    from datetime import datetime, timezone
+
     from job_agent.tracking.quality import quality_report
     from job_agent.workflow import publish_outputs
     from job_agent.web.runner import PipelineRunner
 
+    started_at = datetime.now(timezone.utc).isoformat()
+    clock = time.perf_counter()
     before = quality_report()
     console.print(f"[cyan]Starting quality:[/cyan] {before['grade_out_of_10']}/10")
     enrichment = {"requested": 0, "fetched": 0, "unavailable": 0, "files_changed": 0}
@@ -959,7 +982,18 @@ def repair_command(fetch_details: bool, detail_limit: int, limit: Optional[int],
             _fail(result.get("error") or "Repair pipeline failed; review data/outputs/run_report.json.")
         report = result.get("report", {})
     else:
+        # PipelineRunner records its own sub-phases in phase_runs when it
+        # runs; when it doesn't (nothing needed fetching, or --no-fetch-details),
+        # repair records itself so it still shows up in the run history.
+        from job_agent.storage.jobs_db import record_phase
+
         report = publish_outputs(bundle=True)
+        record_phase(
+            "repair", "warning" if report.get("warnings") else "ok", started_at=started_at,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+            duration_seconds=round(time.perf_counter() - clock, 2),
+            summary={"enrichment": enrichment, **report}, started_from="cli",
+        )
 
     after = quality_report()
     console.print(f"[bold green]Final quality:[/bold green] {after['grade_out_of_10']}/10")

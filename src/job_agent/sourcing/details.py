@@ -64,51 +64,92 @@ def _jsonld_descriptions(soup: BeautifulSoup) -> list[str]:
 
 
 def extract_description(html: str) -> str:
+    """The most reliable candidate wins, not the longest.
+
+    Priority order: structured JSON-LD (most reliable), then a targeted
+    selector match, then the whole page body as a last resort. Sorting every
+    tier together by raw length let generic page chrome (nav bars, "people
+    also viewed" lists, footer/legal text) outscore a short, accurate,
+    structured description just by being longer.
+    """
     soup = BeautifulSoup(html, "html.parser")
-    candidates = _jsonld_descriptions(soup)
+
+    jsonld = _jsonld_descriptions(soup)
+    if jsonld:
+        return clean_text(max(jsonld, key=len))[:20000]
+
+    selector_candidates: list[str] = []
     for selector in DETAIL_SELECTORS:
         for node in soup.select(selector):
             text = strip_html(str(node))
             if len(text) >= DESCRIPTION_MIN_CHARS:
-                candidates.append(text)
+                selector_candidates.append(text)
+    if selector_candidates:
+        return clean_text(max(selector_candidates, key=len))[:20000]
+
     body = soup.body
     if body:
         for noisy in body.select("nav, header, footer, script, style, noscript, svg, form"):
             noisy.decompose()
         text = strip_html(str(body))
         if len(text) >= DESCRIPTION_MIN_CHARS:
-            candidates.append(text)
-    if not candidates:
-        return ""
-    candidates.sort(key=len, reverse=True)
-    return clean_text(candidates[0])[:20000]
+            return clean_text(text)[:20000]
+    return ""
+
+
+def _resolves_to_public_address(hostname: str, port: int) -> bool:
+    """Whether every address a hostname resolves to is a public, routable one.
+
+    Refuses loopback/private/link-local targets so a job_url from scrape/feed
+    data can't be used to reach an internal service. Split out from
+    _fetch_description so tests can substitute a fake resolver instead of
+    depending on live DNS for a placeholder domain (mirrors the same check in
+    contacts/finder.py's CompanySiteCrawler._get).
+    """
+    import ipaddress
+    import socket
+
+    try:
+        addresses = socket.getaddrinfo(hostname, port)
+    except OSError:
+        return False
+    return bool(addresses) and all(ipaddress.ip_address(item[4][0]).is_global for item in addresses)
 
 
 def _fetch_description(job: JobPosting, session, proxy: str | None = None) -> str:
+    """Fetch and extract a job's description, refusing anything not a public host.
+
+    Job URLs come from third-party scrape/feed data, not user input, but this
+    is still the only place in the codebase that fetches arbitrary
+    caller-supplied URLs for non-LinkedIn sources, so it gets the same
+    resolves-to-a-public-address check used for employer site crawling.
+    """
     parsed = urlsplit(job.job_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return ""
-    response = session.get(
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    if not _resolves_to_public_address(parsed.hostname, port):
+        return ""
+
+    with session.get(
         job.job_url,
         timeout=10,
         stream=True,
         proxies={"http": proxy, "https": proxy} if proxy else None,
         headers={"User-Agent": "Mozilla/5.0 JobAgent/0.2 (+local job search assistant)"},
-    )
-    response.raise_for_status()
-    content_type = (response.headers.get("content-type") or "").lower()
-    if content_type and not any(part in content_type for part in ("html", "text", "json")):
-        return ""
-    chunks = []
-    total = 0
-    for chunk in response.iter_content(chunk_size=65536, decode_unicode=True):
-        if not chunk:
-            continue
-        total += len(chunk.encode("utf-8", errors="ignore") if isinstance(chunk, str) else chunk)
-        if total > MAX_DETAIL_BYTES:
-            break
-        chunks.append(chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else chunk)
-    return extract_description("".join(chunks))
+    ) as response:
+        response.raise_for_status()
+        content_type = (response.headers.get("content-type") or "").lower()
+        if content_type and not any(part in content_type for part in ("html", "text", "json")):
+            return ""
+        # One bounded read and one decode, using the server-declared (or
+        # sniffed) encoding, instead of iterating decoded chunks: chunking a
+        # str stream can split a multi-byte character across chunk
+        # boundaries, and re-encoding each chunk just to count its bytes was
+        # pure overhead.
+        raw = response.raw.read(MAX_DETAIL_BYTES, decode_content=True)
+        html = raw.decode(response.encoding or response.apparent_encoding or "utf-8", errors="replace")
+    return extract_description(html)
 
 
 def enrich_job_details(jobs: list[JobPosting], session=None, proxy: str | None = None, minimum_chars: int = DESCRIPTION_MIN_CHARS):
