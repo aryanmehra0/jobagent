@@ -15,6 +15,76 @@ to loopback and uses local files for state.
 | Hosted API scaffold | A safe public control plane smoke test | `docker compose -f docker-compose.hosted.yml up --build` |
 | Public SaaS | Many users | Hosted API + real auth, per-user storage, managed queue, isolated browser workers |
 
+## Opening the dashboard from your other devices (private, not public)
+
+The flow console still binds to loopback only (`run_server` refuses any other
+host) — that has not changed and should not change, because it can start
+browser automation and submit real applications under your identity. To reach
+it from your phone or another computer without putting it on the open
+internet, run it through a private tunnel *you* control, and require a login
+in front of it.
+
+1. **Set a login.** In `.env`:
+
+   ```env
+   DASHBOARD_USERNAME=your-name
+   DASHBOARD_PASSWORD=a-long-random-password
+   ```
+
+   With both set, every request needs this login (HTTP Basic Auth) on top of
+   the existing loopback bind and per-session token — without them, the
+   console behaves exactly as before (no login prompt).
+
+2. **Start the dashboard as usual:**
+
+   ```powershell
+   python main.py ui
+   ```
+
+3. **Install Tailscale** (a private mesh network between only your own
+   devices; free for personal use) and sign in — this step needs your own
+   browser and account, so it can't be automated on your behalf:
+
+   ```powershell
+   winget install Tailscale.Tailscale
+   tailscale up
+   ```
+
+   `tailscale up` opens a browser for you to log in (Google/Microsoft/GitHub/
+   email). Do this on the same machine running the dashboard.
+
+4. **Serve the loopback port over your tailnet:**
+
+   ```powershell
+   tailscale serve https / http://127.0.0.1:8765
+   ```
+
+   This gives you an HTTPS URL like `https://your-device.your-tailnet.ts.net`,
+   reachable only from devices signed into your own Tailscale account — not
+   the public internet. Run `tailscale serve status` to see it, and
+   `tailscale serve reset` to stop sharing it.
+
+5. **Add that hostname to `.env`** so the app's own Host/Origin check accepts
+   it (this check exists to block DNS-rebinding attacks, so it only accepts
+   hostnames you explicitly list):
+
+   ```env
+   DASHBOARD_ALLOWED_HOSTS=your-device.your-tailnet.ts.net
+   ```
+
+   Restart `python main.py ui` after changing `.env`.
+
+6. **Open that HTTPS URL from your phone or laptop**, signed into the same
+   Tailscale account, and log in with the username/password from step 1.
+
+Prefer Cloudflare Tunnel instead of Tailscale? The same steps 1, 2 and 5 apply
+— only step 3-4 change to `cloudflared tunnel --url http://127.0.0.1:8765`
+(quick tunnels) or a named tunnel with Cloudflare Access in front for login at
+the edge too. Either way: **never** set `DASHBOARD_ALLOWED_HOSTS` without also
+setting `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` — the server prints a
+warning at startup if you do, because that combination would let anyone who
+can reach the tunnel hostname use the console with no login at all.
+
 ## Local production run
 
 1. Install Python 3.10 or newer.

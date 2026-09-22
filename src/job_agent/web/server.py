@@ -53,6 +53,12 @@ MAX_BODY_BYTES = 1 * 1024 * 1024
 SSE_HEARTBEAT_SECONDS = 20.0
 
 
+def _allowed_hosts() -> set:
+    """Extra Host/Origin hostnames accepted, from DASHBOARD_ALLOWED_HOSTS. Empty by default."""
+    raw = settings.dashboard_allowed_hosts or ""
+    return {part.strip().lower() for part in raw.split(",") if part.strip()}
+
+
 class FlowConsoleServer(ThreadingHTTPServer):
     """Threading HTTP server carrying the shared runner and session token."""
 
@@ -136,15 +142,20 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         """Reject requests whose Host or Origin is not this loopback server.
 
         Without this, a page on the open internet could resolve its own hostname
-        to 127.0.0.1 and reach the console despite the loopback bind.
+        to 127.0.0.1 and reach the console despite the loopback bind. DASHBOARD_ALLOWED_HOSTS
+        extends this set for a private tunnel (e.g. `tailscale serve`) that
+        presents its own hostname to the browser while still forwarding to this
+        loopback port; it is empty by default, so the accepted set is unchanged
+        unless an operator opts in.
         """
+        allowed = {"127.0.0.1", "localhost", "[::1]", "::1"} | _allowed_hosts()
         host = (self.headers.get("Host") or "").split(":")[0]
-        if host not in ("127.0.0.1", "localhost", "[::1]", "::1"):
+        if host.lower() not in allowed:
             return False
         origin = self.headers.get("Origin")
         if origin:
-            hostname = urlparse(origin).hostname
-            if hostname not in ("127.0.0.1", "localhost", "::1"):
+            hostname = (urlparse(origin).hostname or "")
+            if hostname.lower() not in (allowed - {"[::1]"}):
                 return False
         return True
 
@@ -153,10 +164,48 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         supplied = self.headers.get("X-Session-Token") or ""
         return secrets.compare_digest(supplied, self.server.token)
 
+    def _check_auth(self) -> bool:
+        """HTTP Basic Auth, only enforced once both DASHBOARD_USERNAME and
+        DASHBOARD_PASSWORD are set.
+
+        Unset (the default), this always passes: a purely local install with
+        nothing but the loopback bind and the per-session token is unchanged.
+        Set, it gates every request -- including the login page itself -- so a
+        console reached through a tunnel or shared network still requires a
+        real login rather than only the loopback Host/Origin check.
+        """
+        import base64
+        import binascii
+
+        username, password = settings.dashboard_username, settings.dashboard_password
+        if not username or not password:
+            return True
+        header = self.headers.get("Authorization") or ""
+        if not header.startswith("Basic "):
+            return False
+        try:
+            decoded = base64.b64decode(header[len("Basic "):]).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError):
+            return False
+        supplied_user, _, supplied_pass = decoded.partition(":")
+        return secrets.compare_digest(supplied_user, username) & secrets.compare_digest(supplied_pass, password)
+
+    def _require_auth(self) -> bool:
+        """Check Basic Auth, sending the 401 challenge if it fails. Returns whether to continue."""
+        if self._check_auth():
+            return True
+        self._send(
+            HTTPStatus.UNAUTHORIZED, json.dumps({"error": "Login required."}).encode("utf-8"),
+            extra_headers={"WWW-Authenticate": 'Basic realm="Job Agent", charset="UTF-8"'},
+        )
+        return False
+
     # --- Routing --------------------------------------------------------------
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
         """Serve the dashboard, its assets, and read-only API endpoints."""
+        if not self._require_auth():
+            return
         if not self._check_origin():
             self._error(HTTPStatus.FORBIDDEN, "Requests are accepted from localhost only.")
             return
@@ -204,6 +253,8 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         """Handle the mutating endpoints, all of which require the session token."""
+        if not self._require_auth():
+            return
         if not self._check_origin():
             self._error(HTTPStatus.FORBIDDEN, "Requests are accepted from localhost only.")
             return
@@ -696,6 +747,18 @@ def run_server(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = T
     url = f"http://{host}:{port}/"
 
     print(f"Flow console running at {url}")
+    if settings.dashboard_username and settings.dashboard_password:
+        print(f"Login required: username '{settings.dashboard_username}' (see DASHBOARD_PASSWORD in .env).")
+    else:
+        print("Login: disabled (DASHBOARD_USERNAME/DASHBOARD_PASSWORD not set).")
+    extra_hosts = _allowed_hosts()
+    if extra_hosts:
+        print(f"Extra accepted hostnames (DASHBOARD_ALLOWED_HOSTS): {', '.join(sorted(extra_hosts))}")
+        if not (settings.dashboard_username and settings.dashboard_password):
+            print(
+                "WARNING: DASHBOARD_ALLOWED_HOSTS is set without a login. Anyone who can reach "
+                "that hostname can use this console. Set DASHBOARD_USERNAME and DASHBOARD_PASSWORD too."
+            )
     print("Press Ctrl+C to stop.\n")
 
     if open_browser:

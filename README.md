@@ -277,7 +277,11 @@ server `postgres`, user `job_agent`, password `job_agent_dev_password`, database
 
 The included dashboard is intentionally local-only. It can launch browser
 automation and submit real applications, so it binds to loopback and must not be
-put directly behind a public domain.
+put directly behind a public domain. To reach it from your other devices
+without exposing it publicly, set `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` in
+`.env` and put it behind a private tunnel you control (Tailscale, Cloudflare
+Tunnel) — see [`DEPLOYMENT.md`](DEPLOYMENT.md#opening-the-dashboard-from-your-other-devices-private-not-public)
+for the exact steps.
 
 For a safe hosted smoke test, run the separate token-protected control plane:
 

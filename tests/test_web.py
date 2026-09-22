@@ -274,6 +274,74 @@ def test_rebound_host_header_is_rejected(console):
     assert status == 403
 
 
+@pytest.fixture
+def auth_console(monkeypatch):
+    """A dedicated server (not the shared module-scoped one) with a login configured."""
+    from job_agent.config.settings import settings
+    monkeypatch.setattr(settings, "dashboard_username", "candidate")
+    monkeypatch.setattr(settings, "dashboard_password", "correct horse battery staple")
+    server = FlowConsoleServer(("127.0.0.1", 0), partial(FlowConsoleHandler), "auth-test-token")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", server.token
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _basic_auth_header(user: str, password: str) -> dict:
+    import base64
+    return {"Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()}
+
+
+def test_login_is_not_required_by_default(console):
+    """Without DASHBOARD_USERNAME/DASHBOARD_PASSWORD set, behavior is unchanged."""
+    base, _ = console
+    status, _ = _request(f"{base}/")
+    assert status == 200
+
+
+def test_login_is_required_once_configured(auth_console):
+    base, _ = auth_console
+    status, _ = _request(f"{base}/")
+    assert status == 401
+
+
+def test_wrong_login_credentials_are_rejected(auth_console):
+    base, _ = auth_console
+    status, _ = _request(f"{base}/", headers=_basic_auth_header("candidate", "wrong password"))
+    assert status == 401
+    status, _ = _request(f"{base}/", headers=_basic_auth_header("someone-else", "correct horse battery staple"))
+    assert status == 401
+
+
+def test_correct_login_credentials_are_accepted(auth_console):
+    base, token = auth_console
+    status, body = _request(f"{base}/", headers=_basic_auth_header("candidate", "correct horse battery staple"))
+    assert status == 200
+    assert token in body.decode("utf-8")
+
+
+def test_allowed_hosts_extends_the_accepted_host_and_origin(monkeypatch):
+    """DASHBOARD_ALLOWED_HOSTS lets a tunnel's hostname through without weakening
+    the default loopback-only check for everyone who hasn't set it."""
+    from job_agent.config.settings import settings
+    monkeypatch.setattr(settings, "dashboard_allowed_hosts", "mydevice.example.ts.net")
+    server = FlowConsoleServer(("127.0.0.1", 0), partial(FlowConsoleHandler), "hosts-test-token")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        status, _ = _request(f"{base}/api/state", headers={"Host": "mydevice.example.ts.net"})
+        assert status == 200
+        status, _ = _request(f"{base}/api/state", headers={"Host": "some-other-host.example.com"})
+        assert status == 403
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_live_applying_requires_explicit_confirmation(console):
     """No single request may cause real applications to be submitted."""
     base, token = console

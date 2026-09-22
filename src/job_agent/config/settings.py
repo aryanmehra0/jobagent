@@ -116,6 +116,18 @@ class Settings(BaseSettings):
         description="Pause for explicit consent before the first live (non-dry-run) submission",
     )
 
+    # --- Dashboard remote-access hardening ---
+    # The console still binds to loopback only (see web/server.py's run_server);
+    # these exist for reaching that loopback port through a private tunnel you
+    # control (e.g. `tailscale serve`), not for putting it on the open internet.
+    # Unset, behavior is unchanged: no login prompt, only loopback Host/Origin
+    # accepted, matching every release before this setting existed.
+    dashboard_username: Optional[str] = Field(default=None, validation_alias="DASHBOARD_USERNAME")
+    dashboard_password: Optional[str] = Field(default=None, validation_alias="DASHBOARD_PASSWORD")
+    # Comma-separated extra Host/Origin hostnames to accept, e.g. the hostname a
+    # tunnel presents to the browser (mydevice.tailnnnn.ts.net).
+    dashboard_allowed_hosts: Optional[str] = Field(default=None, validation_alias="DASHBOARD_ALLOWED_HOSTS")
+
     # --- Core directories and paths ---
     base_dir: Path = BASE_DIR
     data_dir: Path = BASE_DIR / "data"
