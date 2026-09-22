@@ -8,7 +8,13 @@ from pathlib import Path
 
 import pytest
 
-from job_agent.config.schema import JobPosting
+from job_agent.config.schema import (
+    CandidateProfile,
+    ContactInfo,
+    JobPosting,
+    SkillSet,
+    WorkAuthorization,
+)
 from job_agent.storage.jobs_db import JobsDatabase
 from job_agent.tracking.export import JOBS_CSV_NAME
 
@@ -324,7 +330,22 @@ def test_a_cli_phase_records_itself_in_the_run_history(tmp_path, monkeypatch, ou
     from job_agent.cli import cli
     from job_agent.config.settings import settings
 
+    # `track` refuses to run without a sealed profile at settings.profile_path.
+    # Point it at an isolated, sealed fixture rather than relying on whatever
+    # profile.json a developer happens to have on disk — that ambient
+    # dependency is exactly what let this test pass locally while failing on
+    # a clean CI checkout with no data/profiles/profile.json at all.
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
     monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
     _write_artifacts(outputs, [_job()])
     result = CliRunner().invoke(cli, ["export"])
     assert result.exit_code == 0
@@ -334,6 +355,7 @@ def test_a_cli_phase_records_itself_in_the_run_history(tmp_path, monkeypatch, ou
     assert rows == []          # export is not a phase
 
     result = CliRunner().invoke(cli, ["track", "--all"])
+    assert result.exit_code == 0, f"track --all failed: {result.output}"
     with JobsDatabase()._connect() as conn:
         rows = [dict(row) for row in conn.execute("SELECT phase, status, started_from FROM phase_runs")]
     assert rows and rows[-1]["phase"] == "track" and rows[-1]["started_from"] == "cli"
