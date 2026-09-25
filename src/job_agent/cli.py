@@ -1186,8 +1186,8 @@ def production_check_command() -> None:
         "Keep docker-compose.hosted.yml in the repository.")
     add("Hosted env example", (settings.base_dir / "config" / "hosted.example.env").exists(),
         "Documented hosted environment variables.", "Keep config/hosted.example.env in the repository.")
-    add("Deployment guide", (settings.base_dir / "DEPLOYMENT.md").exists(), "Hosting and scale instructions.",
-        "Keep DEPLOYMENT.md in the repository.")
+    add("Deployment guide", (settings.base_dir / "docs" / "DEPLOYMENT.md").exists(), "Hosting and scale instructions.",
+        "Keep docs/DEPLOYMENT.md in the repository.")
 
     table = Table(title="Production readiness", show_header=True, header_style="bold magenta")
     table.add_column("Check", style="cyan")

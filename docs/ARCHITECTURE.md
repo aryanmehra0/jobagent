@@ -1,8 +1,10 @@
 # Autonomous AI Job Search & Application Agent — Complete Architecture Reference
 
-> **Version**: 0.3.0 · **Last verified**: 2026-09-22 · **Tests**: 500 passed, 6 skipped (506 total) · **Phases**: 7
+> **Version**: 0.3.0 · **Last verified**: 2026-09-25 · **Tests**: 513 passed, 6 opt-in skipped (519 total) · **Phases**: 7 core + 2 opt-in (reply tracking, warm contacts)
 
-This document is the **single source of truth** for any AI agent (Claude, Codex, Gemini, etc.) or developer working on this codebase. It maps every file, class, function, constant, data flow, and design invariant so you can make changes without reading all 60+ source files.
+This document is the **single source of truth** for any AI agent (Claude, Codex, Gemini, etc.) or developer working on this codebase. It maps every file, class, function, constant, data flow, and design invariant so you can make changes without reading all 78 source files.
+
+> A previous revision of this document named several files that do not exist in this codebase (`prep/pipeline.py`, `hosted/db.py`, `tracking/contacts.py`, `automation/workday.py`). The directory tree and every file reference below were re-verified against the actual filesystem (`find src/job_agent -name "*.py"`) before being written down — do the same before trusting any file path in a doc, including this one, since docs drift and code doesn't lie.
 
 ---
 
@@ -19,14 +21,13 @@ This document is the **single source of truth** for any AI agent (Claude, Codex,
 9. [Phase 3 — Evaluation & Scoring](#9-phase-3--evaluation--scoring)
 10. [Phase 4 — Tailoring & Cover Letters](#10-phase-4--tailoring--cover-letters)
 11. [Phase 5 — Auto-Apply & Workday Assist](#11-phase-5--auto-apply--workday-assist)
-12. [Phase 6 — Tracking, Contacts & Bundles](#12-phase-6--tracking-contacts--bundles)
+12. [Phase 6 — Tracking, Warm Contacts & Bundles](#12-phase-6--tracking-warm-contacts--bundles)
 13. [Phase 7 — Interview Prep & STAR Briefings](#13-phase-7--interview-prep--star-briefings)
 14. [Web UI (Visual Flow Console)](#14-web-ui-visual-flow-console)
-15. [CLI Reference (26 Subcommands)](#15-cli-reference-26-subcommands)
+15. [CLI Reference (26 Subcommands + `db` group)](#15-cli-reference-26-subcommands--db-group)
 16. [Environment Variables](#16-environment-variables)
-17. [Dependencies](#17-dependencies)
-18. [Test Suite (506 Tests)](#18-test-suite-506-tests)
-19. [Key Design Invariants](#19-key-design-invariants)
+17. [Test Suite (519 Tests)](#17-test-suite-519-tests)
+18. [Key Design Invariants](#18-key-design-invariants)
 
 ---
 
@@ -44,132 +45,75 @@ Resume PDF → profile.json → scraped_jobs.json → qualified_jobs.json → ta
 
 ## 2. Directory Tree
 
+Verified against `find src/job_agent -name "*.py"` on 2026-09-25 — every path below exists.
+
 ```
-c:\Users\Nithya\Desktop\job agent\
+job agent/
 ├── main.py                          # Thin entrypoint, adds src/ to sys.path, delegates to cli
 ├── pyproject.toml                   # Package config, dependencies, pytest configuration
 ├── requirements.txt                 # Flat dependency list
 ├── .env.example                     # Environment variables with defaults
 ├── .gitignore                       # Protects secrets, candidate resumes, outputs
-├── README.md                        # Primary user documentation
-├── START_HERE.md                    # Quickstart guide
-├── ROADMAP_IMPLEMENTATION.md        # Feature roadmap & prompt recipes
-├── ARCHITECTURE.md                  # Comprehensive architecture blueprint & AI reference
+├── README.md                        # Primary user documentation (repo root)
+├── docs/                            # Everything else: START_HERE, DEPLOYMENT, VALIDATION,
+│                                     # ARCHITECTURE (this file), ROADMAP_IMPLEMENTATION,
+│                                     # IMPROVEMENT_ROADMAP
 │
 ├── config/
-│   └── searches.yaml                # Search parameters (domains, boards, locations, ATS targets)
+│   ├── searches.yaml                # Search parameters (domains, boards, locations, ATS targets)
+│   └── hosted.example.env           # Hosted control-plane env template
 │
 ├── templates/
 │   ├── resume.typ                   # Typst template for single-column ATS resume compilation
 │   └── cover_letter.typ             # Typst template for single-page grounded cover letters
 │
-├── data/                            # Runtime data (gitignored except sample resume)
-│   ├── raw_resumes/                 # User resume drop folder
-│   │   ├── sample_resume.pdf        # Bundled demo resume fixture
-│   │   └── Raj_Aryan_APM_FatakPay.pdf # Current candidate resume
-│   ├── profiles/
-│   │   └── profile.json             # Sealed candidate profile with SHA-256 fact seal
-│   ├── outputs/
-│   │   ├── scraped_jobs.json        # Phase 2: Sourced job postings
-│   │   ├── evaluated_jobs.json      # Phase 3: All scored jobs
-│   │   ├── qualified_jobs.json      # Phase 3: Qualified shortlist (fit >= threshold)
-│   │   ├── manifest.json            # Phase 4: Tailoring audit & metric restoration log
-│   │   ├── tailored_resumes/        # Phase 4: ATS PDF resumes and cover letters
-│   │   ├── application_results.json # Phase 5: Browser automation & fallback routing results
-│   │   ├── applications_tracker.xlsx# Phase 6: Master Excel tracking workbook
-│   │   ├── application_pack.zip     # Phase 6: Portable offline review bundle with HTML index
-│   │   ├── interview_prep.json      # Phase 7: Role briefings, STAR evidence & practice questions
-│   │   ├── delta_store.db           # SQLite persistent deduplication store
-│   │   └── jobs.db                  # Relational job search cache
+├── scripts/                         # Operator scripts, not part of the package
+│   ├── start_dashboard.ps1          # One command: tailscale serve + launch the dashboard
+│   ├── validate_live_pipeline.py    # Isolated live end-to-end check (real network+LLM, demo data)
+│   ├── check_live.py, check_sources.py, check_workday_readonly.py, test_without_keys.py
+│
+├── data/                            # Runtime data (gitignored except the sample resume)
+│   ├── raw_resumes/sample_resume.pdf
+│   ├── profiles/profile.json        # Sealed candidate profile with SHA-256 fact seal
+│   ├── outputs/                     # scraped/evaluated/qualified jobs, tailored_resumes/,
+│   │                                 # cover_letters/, interview_prep/, applications_tracker.xlsx,
+│   │                                 # application_pack.zip, delta_store.db, jobs.db, hosted_queue.db
 │   └── browser_profile/             # Persistent Chromium session (cookies, logins)
 │
-├── src/
-│   └── job_agent/                   # Core package
-│       ├── __init__.py              # __version__ = "0.3.0"
-│       ├── __main__.py              # python -m job_agent support
-│       ├── cli.py                   # 26 Click subcommands with lazy imports
-│       ├── workflow.py              # Shared seven-phase pipeline execution engine
-│       │
-│       ├── config/                  # Configuration & normalization
-│       │   ├── __init__.py
-│       │   ├── normalize.py         # NFKC Unicode, date interval merging, E.164 phones, sanitizers
-│       │   ├── schema.py            # 17+ StrictModel Pydantic models with field & model validators
-│       │   └── settings.py          # pydantic-settings loader with provider selection & privacy defaults
-│       │
-│       ├── intake/                  # Phase 1: Intake & Readiness
-│       │   ├── __init__.py
-│       │   ├── cli.py               # Interactive YAML search configuration
-│       │   ├── heuristic.py         # Deterministic regex parser (zero LLM dependency)
-│       │   ├── layout.py            # PDF column detection & reading-order reconstruction
-│       │   ├── parser.py            # Extraction ladder: LlamaParse → pdfplumber → pypdf → LLM → heuristic
-│       │   ├── readiness.py         # Non-destructive pre-flight diagnostic (0-100 score)
-│       │   └── validator.py         # Metric extraction, source audit, SHA-256 fact sealing
-│       │
-│       ├── sourcing/                # Phase 2: Sourcing & Dedup
-│       │   ├── __init__.py
-│       │   ├── scraper.py           # OmnichannelScraper (JobSpy + sticky proxies + filters)
-│       │   ├── ats_direct.py        # Greenhouse, Lever, Ashby public API ingestion
-│       │   ├── delta_store.py       # SQLite WAL-mode lifetime status tracking
-│       │   ├── proxy_manager.py     # Sticky residential proxy rotation
-│       │   └── public_feeds.py      # Aggregated public job feeds & token extractors
-│       │
-│       ├── evaluation/              # Phase 3: Evaluation & Scoring
-│       │   ├── __init__.py
-│       │   ├── embedder.py          # Dense vector similarity (sentence-transformers / TF-IDF)
-│       │   ├── reranker.py          # LLM judge (Groq/OpenAI/Anthropic + heuristic fallback)
-│       │   └── pipeline.py          # Two-tier pipeline coordinator with atomic checkpoints
-│       │
-│       ├── tailoring/               # Phase 4: Tailoring & Cover Letters
-│       │   ├── __init__.py
-│       │   ├── compiler.py          # Typst compiler (<100ms ATS PDFs)
-│       │   ├── cover_letter.py      # Grounded cover letter generator
-│       │   ├── pipeline.py          # Tailoring pipeline coordinator
-│       │   ├── regional.py          # Regional formatting & remote eligibility rules
-│       │   └── rewriter.py          # Bullet rewriter with metric restoration & fabrication gate
-│       │
-│       ├── automation/              # Phase 5: Browser Auto-Apply & Assist
-│       │   ├── __init__.py
-│       │   ├── agent.py             # Step-bounded execution loop (max 25 steps)
-│       │   ├── browser_session.py   # Persistent Chromium context with stealth evasions
-│       │   ├── form_filler.py       # Fact-grounded DOM form filler
-│       │   ├── hitl.py              # Human-in-the-loop CAPTCHA/MFA pause
-│       │   ├── navigator.py         # DOM perception & action button scanner
-│       │   ├── pipeline.py          # Auto-apply coordinator with live confirmation gate
-│       │   └── workday.py           # Assistive filling for Workday career portals
-│       │
-│       ├── tracking/                # Phase 6: Tracking, Contacts & Bundles
-│       │   ├── __init__.py
-│       │   ├── bundle.py            # Portable application pack ZIP builder & validator
-│       │   ├── cold_email.py        # Fact-grounded cold outreach email synthesizer
-│       │   ├── contacts.py          # Warm contact discovery & email pattern generator
-│       │   ├── export.py            # Master CSV and portable exports
-│       │   ├── inbox.py             # IMAP reply sync & outcome status updater
-│       │   ├── pipeline.py          # Fallback tracking pipeline coordinator
-│       │   ├── quality.py           # Readiness & data quality assessment (score / 10)
-│       │   ├── styler.py            # openpyxl workbook styling with score-based priority fills
-│       │   └── tracker.py           # Idempotent Excel tracker with hidden Job ID index
-│       │
-│       ├── prep/                    # Phase 7: Interview Prep & STAR Briefings
-│       │   ├── __init__.py
-│       │   └── pipeline.py          # Role briefing, STAR evidence mapping & practice prompts
-│       │
-│       ├── hosted/                  # Self-Hosted Control Plane
-│       │   ├── __init__.py
-│       │   ├── auth.py              # Bearer token authentication & key generation
-│       │   ├── db.py                # PostgreSQL / SQLite queue database
-│       │   └── worker.py            # Background job consumer
-│       │
-│       └── web/                     # Visual Flow Console
-│           ├── __init__.py
-│           ├── runner.py            # Background PipelineRunner with line-tee SSE streaming
-│           ├── server.py            # Python stdlib HTTP server with CSRF & DNS-rebinding guards
-│           ├── state.py             # Stateless disk-backed snapshot builder for all 7 phases
-│           └── static/
-│               ├── index.html       # Single-page dashboard shell
-│               ├── styles.css       # Dark/light responsive CSS & node-graph layout
-│               └── app.js           # Vanilla JS controller: graph, wizard, SSE, inspector
+├── src/job_agent/                   # Core package (78 .py files)
+│   ├── __init__.py, __main__.py, cli.py (26 @cli.command entries + a `db` group)
+│   ├── workflow.py                  # Shared multi-phase pipeline execution engine
+│   ├── generation.py                # Shared LLM-completion + anti-hallucination evidence
+│   │                                 # helpers reused by interview prep and cover letters
+│   ├── llm.py                       # Provider-agnostic LLM client (groq/openai/anthropic/
+│   │                                 # openai_compatible), strict-mode error propagation
+│   ├── runtime.py                   # Cross-process pipeline lock, @exclusive_run, cancellation
+│   │
+│   ├── config/            normalize.py, schema.py, settings.py
+│   ├── intake/             Phase 1 — cli.py, heuristic.py, layout.py, parser.py,
+│   │                        preferences.py, readiness.py, validator.py
+│   ├── sourcing/           Phase 2 — scraper.py, ats_direct.py, delta_store.py, details.py,
+│   │                        proxy_manager.py, public_feeds.py, relevance.py
+│   ├── evaluation/         Phase 3 — embedder.py, reranker.py, pipeline.py, gaps.py
+│   ├── tailoring/          Phase 4 — rewriter.py, compiler.py, cover_letter.py, faithful.py,
+│   │                        pipeline.py, regional.py
+│   ├── automation/         Phase 5 — agent.py, browser_session.py, form_filler.py, hitl.py,
+│   │                        navigator.py, pipeline.py, routing.py (Workday detection/assist
+│   │                        logic lives here + in agent.py/form_filler.py/navigator.py, not
+│   │                        a separate workday.py file)
+│   ├── tracking/           Phase 6 — bundle.py, cold_email.py, export.py, inbox.py, manual.py,
+│   │                        outreach.py, pipeline.py, quality.py, records.py, styler.py,
+│   │                        supplements.py, tracker.py
+│   ├── interview/          Phase 7 — pipeline.py (module is `interview`, not `prep`)
+│   ├── contacts/           Warm contact leads (separate top-level package, not under tracking/)
+│   │                        — extract.py, finder.py, warm.py
+│   ├── storage/            jobs_db.py — the queryable jobs.db/Postgres layer
+│   ├── hosted/             Separate control-plane scaffold — api.py, auth.py, queue.py,
+│   │                        worker.py (queue+auth storage is queue.py, there is no db.py)
+│   └── web/                Flow console — runner.py, server.py, state.py, analytics.py,
+│                            static/{index.html,styles.css,app.js}
 │
-└── tests/                           # 34 test files, 506 tests (500 passed, 6 skipped)
+└── tests/                            # 31 test files, 519 tests (513 pass, 6 opt-in browser tests)
 ```
 
 ---
@@ -270,26 +214,27 @@ Key models in `schema.py` (all inherit from `StrictModel` with `extra="forbid"`)
 ## 11. Phase 5 — Auto-Apply & Workday Assist
 - `agent.py`: Step-bounded browser automation loop (capped at 25 steps, max 3 consecutive errors).
 - `browser_session.py`: Persistent Chromium user profile preserving cookies and session logins across runs.
-- `form_filler.py`: DOM perception and factual question answering. Unknown questions are skipped, never guessed.
+- `form_filler.py`: DOM perception and factual question answering. Unknown questions are skipped, never guessed. Refuses to fill demographic/voluntary-disclosure fields (race, veteran status, disability, gender) on any channel.
 - `hitl.py`: Human-in-the-loop pause for CAPTCHA and MFA challenges.
-- `workday.py`: Specialized assistant for complex Workday multi-page application flows.
+- `routing.py`: Detects Workday listings and routes them to the assisted flow (`workday-assist` CLI command) instead of the normal auto-apply path; there is no separate `workday.py` module. Assisted mode fills the form and always stops before submit — it never clicks it.
 
 ---
 
-## 12. Phase 6 — Tracking, Contacts & Bundles
+## 12. Phase 6 — Tracking, Warm Contacts & Bundles
 - `tracker.py`: `applications_tracker.xlsx` master workbook with navy headers, priority color fills, and idempotent rows via hidden Job ID column.
-- `contacts.py`: Discovers published hiring team members and generates corporate email patterns (`first.last@company.com`).
-- `inbox.py`: Connects via IMAP to read application updates and synchronize interview invitations or rejections into tracking records.
+- `contacts/warm.py` (a separate top-level package, not `tracking/contacts.py`): reads an employer's public team/about pages for named staff with a visible title, as a possible referral lead. Never guesses an email address or pattern, never crawls social platforms, never claims a relationship — every result is labelled "unverified public team lead."
+- `tracking/inbox.py`: Opt-in, read-only IMAP sync that classifies replies (rejection/interview/offer/other) and updates tracking records. Requires four env vars to be set explicitly; never sends mail.
 - `bundle.py`: Assembles `application_pack.zip` containing an interactive HTML dashboard, verified PDFs, CSV exports, and SHA-256 hash manifest.
 - `quality.py`: Computes an end-to-end quality score out of 10 for profile integrity, freshness, document coverage, and tracking readiness.
+- `supplements.py`: Cross-references interview-prep/cover-letter manifests and warm-contact leads against actual files on disk (re-verifying the profile hash) before exposing a link, so a stale document from a superseded profile is hidden.
 
 ---
 
 ## 13. Phase 7 — Interview Prep & STAR Briefings
-- `prep/pipeline.py`: Generates tailored interview preparation packets for each qualified role.
-- **STAR Evidence Mapping**: Aligns verified resume achievements with target job requirements.
-- **Role Briefings**: Synthesizes company mission, tech stack highlights, and practice interview questions.
-- **Offline Fallback**: Fully functional without external API keys.
+- `interview/pipeline.py` (the module is `interview`, **not** `prep`): `InterviewPrepPipeline.run()` generates 10 questions per qualified job — 4 technical, 3 behavioral, 3 company-fit.
+- **STAR Evidence Mapping**: Behavioral answers are built only from bullets/locked facts already in the sealed profile, via the same `enforce_metric_integrity` gate tailoring uses (through the shared `generation.py` helpers) — an answer cannot claim anything the resume doesn't.
+- **Role Briefings**: A "likely panel composition" line is explicitly labelled a hypothesis, not confirmed company information.
+- **Offline Fallback**: `prep --offline` selects evidence without any provider call.
 
 ---
 
@@ -301,7 +246,7 @@ Key models in `schema.py` (all inherit from `StrictModel` with `extra="forbid"`)
 
 ---
 
-## 15. CLI Reference (26 Subcommands)
+## 15. CLI Reference (26 Subcommands + `db` group)
 
 ```powershell
 # Core Lifecycle
@@ -353,7 +298,7 @@ Configured via `.env` file (see `.env.example`):
 
 ---
 
-## 17. Test Suite (506 Tests)
+## 17. Test Suite (519 Tests)
 
 Run with `python -m pytest -v`:
 - **Current status**: 500 passed, 6 skipped (browser integration tests opt-in via `JOB_AGENT_BROWSER_TESTS=1`).

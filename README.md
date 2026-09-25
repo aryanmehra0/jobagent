@@ -1,10 +1,30 @@
 ﻿# Autonomous AI Job Search & Application Agent
 
+A local, seven-stage pipeline that parses your resume into a cryptographically
+sealed profile, sources and scores real job postings, tailors your resume and
+cover letter per role, auto-applies where it safely can, tracks outcomes, and
+drafts interview prep — with a rule that never bends: **no stage may assert a
+fact about you that isn't in your resume.**
+
+## Documentation map
+
+This file covers day-to-day use end to end. Everything else lives in
+[`docs/`](docs/):
+
+| Doc | What it's for |
+| --- | --- |
+| [`docs/START_HERE.md`](docs/START_HERE.md) | The shortest path from a fresh checkout to your first download |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, Postgres, the hosted API scaffold, and reaching the dashboard remotely over Tailscale |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | File-by-file map of the codebase, for anyone (human or AI) changing the code |
+| [`docs/VALIDATION.md`](docs/VALIDATION.md) | What's been verified against live data and how to reproduce it |
+| [`docs/ROADMAP_IMPLEMENTATION.md`](docs/ROADMAP_IMPLEMENTATION.md) | Status and limits of each shipped feature |
+| [`docs/IMPROVEMENT_ROADMAP.md`](docs/IMPROVEMENT_ROADMAP.md) | Historical: the original feature proposals, now implemented |
+
 ## Job shortlist and portable downloads
 
 Nine roadmap improvements landed on top of the six-stage core; full detail,
 verification notes and known limits are in
-[Implementation status](ROADMAP_IMPLEMENTATION.md). Summary of what each one
+[Implementation status](docs/ROADMAP_IMPLEMENTATION.md). Summary of what each one
 actually is (not what it aspires to be):
 
 | Feature | Command / trigger | Dashboard? |
@@ -26,12 +46,12 @@ Reply tracking, warm contacts and Workday assist are real, tested capabilities,
 but they're CLI-first: you run the command, and the dashboard only reflects
 what it produced. Hosted auth is a per-user API-key/token layer over the
 existing hosted scaffold (isolated request access, not a running multi-tenant
-worker yet) — see [Implementation status](ROADMAP_IMPLEMENTATION.md) and
-[`DEPLOYMENT.md`](DEPLOYMENT.md) for exactly what's still scaffolding.
+worker yet) — see [Implementation status](docs/ROADMAP_IMPLEMENTATION.md) and
+[`DEPLOYMENT.md`](docs/DEPLOYMENT.md) for exactly what's still scaffolding.
 
 [![CI](https://github.com/aryanmehra0/jobagent/actions/workflows/ci.yml/badge.svg)](https://github.com/aryanmehra0/jobagent/actions/workflows/ci.yml)
 
-For the complete daily workflow, read [Start here](START_HERE.md). Full runs now
+For the complete daily workflow, read [Start here](docs/START_HERE.md). Full runs now
 share one CLI/dashboard engine and automatically publish `jobs_latest.csv`,
 `applications_ready.csv`, the master CSV, and the PDF pack. `run_report.json`
 records warnings, failures and incomplete scoring. The full CLI pipeline defaults
@@ -280,7 +300,7 @@ automation and submit real applications, so it binds to loopback and must not be
 put directly behind a public domain. To reach it from your other devices
 without exposing it publicly, set `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` in
 `.env` and put it behind a private tunnel you control (Tailscale, Cloudflare
-Tunnel) — see [`DEPLOYMENT.md`](DEPLOYMENT.md#opening-the-dashboard-from-your-other-devices-private-not-public)
+Tunnel) — see [`DEPLOYMENT.md`](docs/DEPLOYMENT.md#opening-the-dashboard-from-your-other-devices-private-not-public)
 for the exact steps. Once that's set up once, `.\scripts\start_dashboard.ps1`
 starts it and prints your tailnet URL in one step.
 
@@ -298,7 +318,7 @@ For an open-source hosted product with many users, use this repository as the
 worker engine and put a multi-user web layer in front of it: authenticated web
 app, per-user storage, a queue, isolated browser workers, managed secrets, and a
 database such as Postgres instead of shared local SQLite files. See
-[`DEPLOYMENT.md`](DEPLOYMENT.md) for the exact hosting model and scale checklist.
+[`DEPLOYMENT.md`](docs/DEPLOYMENT.md) for the exact hosting model and scale checklist.
 
 The local repo still keeps single-user artifacts in `data/`: `delta_store.db`
 tracks seen jobs, lifecycle status, application attempts and outreach. The hosted
@@ -893,7 +913,7 @@ timing-safe comparison. `/runs` and `/runs/<id>` on the hosted API are now
 scoped to the authenticated user — one user's key cannot see or enumerate
 another's runs. This replaces the earlier single shared `HOSTED_API_TOKEN`.
 It authenticates and isolates hosted API requests; it does not by itself add
-a running multi-user worker — see [`DEPLOYMENT.md`](DEPLOYMENT.md) for what's
+a running multi-user worker — see [`DEPLOYMENT.md`](docs/DEPLOYMENT.md) for what's
 still needed before this is a real hosted product.
 
 ### Everything at once
@@ -996,7 +1016,7 @@ Tests cover the six stages and the console. The ones worth knowing about:
 - **Hosted per-user API keys authenticate and isolate requests to the hosted
   control-plane scaffold; they are not a running multi-tenant product.**
   There is still no worker that executes queued per-user jobs in isolation —
-  see [`DEPLOYMENT.md`](DEPLOYMENT.md).
+  see [`DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 - **CI runs only after this workflow is pushed.** The badge above reflects
   `.github/workflows/ci.yml`'s actual run history on GitHub, not a local
   guarantee.
