@@ -51,6 +51,15 @@ python main.py repair
 `repair` tries to fill thin or missing job descriptions from the saved job links,
 then reruns evaluation, tailoring, dry-run routing, tracking and interview prep
 only if it actually improved the source data. It still does not submit anything.
+By default, a provider error during that rerun falls back to deterministic
+scoring rather than aborting the whole repair; add `--strict-llm` to abort
+instead, matching `LLM_STRICT=true` if you have that set in `.env`. Either way,
+which jobs actually used the LLM versus the fallback is recorded per job; see
+it with:
+
+```powershell
+python main.py db query "SELECT j.company, e.scored_by FROM job_evaluations e JOIN jobs j ON j.job_id = e.job_id"
+```
 
 **To download your results:** click **Jobs & downloads → Download everything
 (ZIP)**, right-click the saved ZIP and choose **Extract All**, then open

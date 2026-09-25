@@ -333,12 +333,19 @@ def test_cli_repair_enriches_saved_descriptions_and_reruns_downstream(monkeypatc
         }
 
     calls = []
+    monkeypatch.setattr(settings, "llm_strict", True)
+
+    def run_sync(self, phases, options):
+        calls.append((phases, options, settings.llm_strict))
+        return {"status": "ok", "report": {"files": {}, "warnings": []}}
+
     monkeypatch.setattr("job_agent.sourcing.details.enrich_job_details", enrich)
-    monkeypatch.setattr(run.PipelineRunner, "run_sync",
-                        lambda self, phases, options: calls.append((phases, options)) or {"status": "ok", "report": {"files": {}, "warnings": []}})
+    monkeypatch.setattr(run.PipelineRunner, "run_sync", run_sync)
     result = CliRunner().invoke(cli, ["repair", "--detail-limit", "1"])
     assert result.exit_code == 0, result.output
     assert calls and calls[0][0] == ["evaluate", "tailor", "apply", "track", "prep"]
+    assert calls[0][2] is False
+    assert settings.llm_strict is True
     saved = json.loads((out / "scraped_jobs.json").read_text(encoding="utf-8"))[0]
     assert "detailed product AI" in saved["description"]
 

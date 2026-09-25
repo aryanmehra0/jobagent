@@ -949,8 +949,16 @@ def _enrich_saved_descriptions(limit: int) -> dict[str, int]:
               help="Cap downstream jobs if descriptions were repaired.")
 @click.option("--cover-letter/--no-cover-letter", default=True, show_default=True,
               help="Create grounded cover letters when downstream tailoring reruns.")
+@click.option("--strict-llm/--fallback-on-llm-error", default=False, show_default=True,
+              help="Abort on provider errors instead of falling back to deterministic scoring.")
 @exclusive_run
-def repair_command(fetch_details: bool, detail_limit: int, limit: Optional[int], cover_letter: bool) -> None:
+def repair_command(
+    fetch_details: bool,
+    detail_limit: int,
+    limit: Optional[int],
+    cover_letter: bool,
+    strict_llm: bool,
+) -> None:
     """Repair saved outputs, improve weak descriptions, rebuild the pack, and rescore if needed."""
     import time
     from datetime import datetime, timezone
@@ -973,11 +981,16 @@ def repair_command(fetch_details: bool, detail_limit: int, limit: Optional[int],
         )
 
     if enrichment["fetched"]:
-        result = PipelineRunner().run_sync(["evaluate", "tailor", "apply", "track", "prep"], {
-            "dry_run": True, "limit": limit, "tailoring_mode": "regional",
-            "track_all": True, "assume_yes": False, "started_from": "cli",
-            "cover_letter": cover_letter,
-        })
+        original_strict = settings.llm_strict
+        settings.llm_strict = bool(strict_llm)
+        try:
+            result = PipelineRunner().run_sync(["evaluate", "tailor", "apply", "track", "prep"], {
+                "dry_run": True, "limit": limit, "tailoring_mode": "regional",
+                "track_all": True, "assume_yes": False, "started_from": "cli",
+                "cover_letter": cover_letter,
+            })
+        finally:
+            settings.llm_strict = original_strict
         if result.get("status") == "error":
             _fail(result.get("error") or "Repair pipeline failed; review data/outputs/run_report.json.")
         report = result.get("report", {})
