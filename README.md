@@ -281,7 +281,8 @@ put directly behind a public domain. To reach it from your other devices
 without exposing it publicly, set `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` in
 `.env` and put it behind a private tunnel you control (Tailscale, Cloudflare
 Tunnel) — see [`DEPLOYMENT.md`](DEPLOYMENT.md#opening-the-dashboard-from-your-other-devices-private-not-public)
-for the exact steps.
+for the exact steps. Once that's set up once, `.\scripts\start_dashboard.ps1`
+starts it and prints your tailnet URL in one step.
 
 For a safe hosted smoke test, run the separate token-protected control plane:
 

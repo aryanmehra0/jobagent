@@ -24,6 +24,13 @@ it from your phone or another computer without putting it on the open
 internet, run it through a private tunnel *you* control, and require a login
 in front of it.
 
+**Already set up once and just want to start it?** Run
+`.\scripts\start_dashboard.ps1` — it points `tailscale serve` at the
+dashboard's port, warns if `DASHBOARD_USERNAME`/`DASHBOARD_PASSWORD` aren't
+set, prints the tailnet HTTPS URL, and starts the dashboard. The one-time
+setup below still has to happen first (installing Tailscale, signing in,
+setting the login, and enabling Serve on your tailnet the first time it asks).
+
 1. **Set a login.** In `.env`:
 
    ```env
@@ -56,8 +63,14 @@ in front of it.
 4. **Serve the loopback port over your tailnet:**
 
    ```powershell
-   tailscale serve https / http://127.0.0.1:8765
+   tailscale serve --bg http://127.0.0.1:8765
    ```
+
+   (Older Tailscale versions use `tailscale serve https / http://127.0.0.1:8765`
+   — if the command errors naming the syntax that changed, use the form it
+   suggests.) The first time you do this, Tailscale may print a link to
+   *enable Serve on your tailnet* — that's a one-time, one-click account
+   setting, then re-run the command above.
 
    This gives you an HTTPS URL like `https://your-device.your-tailnet.ts.net`,
    reachable only from devices signed into your own Tailscale account — not
