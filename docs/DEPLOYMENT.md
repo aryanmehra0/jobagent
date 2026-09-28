@@ -90,6 +90,30 @@ setting the login, and enabling Serve on your tailnet the first time it asks).
 6. **Open that HTTPS URL from your phone or laptop**, signed into the same
    Tailscale account, and log in with the username/password from step 1.
 
+7. **Make it survive a reboot or a crash, so you stop having to notice and
+   restart it:**
+
+   ```powershell
+   .\scripts\install_autostart.ps1
+   ```
+
+   Registers a `JobAgentDashboard` Windows scheduled task that runs
+   `start_dashboard.ps1` at logon, **and again every 15 minutes forever** as a
+   safety net. The 15-minute check matters because a laptop that mostly sleeps
+   instead of fully logging out won't re-fire an "at logon" trigger for days —
+   confirmed the hard way: `tailscale serve` kept proxying to port 8765 for
+   three days after the dashboard process had died, silently returning `502`
+   to anyone who tried the URL, because nothing was left to notice and restart
+   it. Windows Task Scheduler's own "restart the task if it fails" setting was
+   tested against this same task and did not work (it did not restart a killed
+   process even after minutes, with the setting configured correctly) — that's
+   a known unreliability in Task Scheduler for logon-triggered tasks, not a
+   configuration mistake, which is why `start_dashboard.ps1` has its own
+   internal retry loop and the 15-minute trigger exists as a second, unrelated
+   safety net rather than depending on that setting working.
+
+   Remove it later with `Unregister-ScheduledTask -TaskName JobAgentDashboard -Confirm:$false`.
+
 Prefer Cloudflare Tunnel instead of Tailscale? The same steps 1, 2 and 5 apply
 — only step 3-4 change to `cloudflared tunnel --url http://127.0.0.1:8765`
 (quick tunnels) or a named tunnel with Cloudflare Access in front for login at
