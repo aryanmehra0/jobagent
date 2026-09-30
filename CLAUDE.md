@@ -9,13 +9,17 @@ and don't trust it blindly either — verify a path exists (`find src/job_agent
 version of `ARCHITECTURE.md` once named four files that didn't exist; nobody
 caught it until someone actually ran `find`.
 
-**This repository is public on GitHub** (`github.com/aryanmehra0/jobagent`).
-Never commit real personal data: the candidate's name, email, resume, sealed
-profile, API keys, or Tailscale/dashboard credentials. `.gitignore` already
-protects `.env`, `data/profiles/`, and `data/raw_resumes/*.pdf` (except the
-bundled fictional `sample_resume.pdf`) — keep it that way. If you're ever
-about to write a real name, email, or key into a file that will be committed,
-stop and use a placeholder instead.
+**Check whether this repository's GitHub remote is public before assuming
+either way** (`gh repo view --json visibility`, or the visibility field from
+the GitHub API for whatever `git remote get-url origin` currently points at —
+the account and repo name have changed before and will likely change again).
+Treat it as public unless you've just confirmed otherwise: never commit real
+personal data — the candidate's name, email, resume, sealed profile, API
+keys, or Tailscale/dashboard credentials. `.gitignore` already protects
+`.env`, `data/profiles/`, and `data/raw_resumes/*.pdf` (except the bundled
+fictional `sample_resume.pdf`) — keep it that way. If you're ever about to
+write a real name, email, or key into a file that will be committed, stop and
+use a placeholder instead.
 
 ## What this project is
 
@@ -83,10 +87,12 @@ real-`.env` settings for tests — **extend it whenever you add a new
 bug this comment is describing.
 
 After every push, **confirm CI actually passed** — don't assume from "it
-pushed cleanly":
+pushed cleanly". Derive the repo from the actual remote rather than
+hardcoding an owner/name that will go stale the next time it changes:
 
 ```bash
-curl -s 'https://api.github.com/repos/aryanmehra0/jobagent/actions/runs?per_page=1'
+REMOTE=$(git remote get-url origin | sed -E 's#.*[:/]([^/]+/[^/.]+)(\.git)?$#\1#')
+curl -s "https://api.github.com/repos/$REMOTE/actions/runs?per_page=1"
 ```
 
 Unit tests aren't the ceiling either. This repo has a live, isolated,
