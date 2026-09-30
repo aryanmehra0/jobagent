@@ -38,6 +38,11 @@ report is saved as `quality_report.json` and is bundled into the ZIP. It current
 scores the profile seal, source freshness, evaluation coverage, ready rows,
 document-hash validation, hiring-email coverage and observed outcome tracking.
 
+Use `python main.py performance` to inspect latency from the local phase history.
+It writes `performance_report.json`, includes it in the ZIP, and highlights slow
+phases such as broad sourcing, provider-rate-limited evaluation and outreach
+drafting.
+
 Use `python main.py repair` when quality is held back by thin source data. It
 attempts bounded detail-page enrichment for saved jobs with short or missing
 descriptions, then reruns evaluation, tailoring, dry-run routing, tracking and

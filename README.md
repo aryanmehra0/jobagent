@@ -31,7 +31,9 @@ actually is (not what it aspires to be):
 | --- | --- | --- |
 | Daily application pack | `python main.py daily --limit 5` | Same engine as Run all phases |
 | Repair current run | `python main.py repair` | Rebuilds outputs; reruns downstream phases if descriptions improve |
+| Database audit | `python main.py db audit` | Cross-checks DB, CSV, JSON artifacts and ZIP |
 | Quality score | `python main.py quality` | Included as `quality_report.json` in the ZIP |
+| Performance report | `python main.py performance` | Included as `performance_report.json` in the ZIP |
 | Interview prep (Phase 7) | `python main.py prep [--job-id] [--offline]` | Yes — its own phase node |
 | Cover letters | `--cover-letter` on `tailor`, or the dashboard run toggle | Yes — run-form checkbox |
 | Outcome analytics | automatic once jobs are tracked | Yes — Inspector "Analytics" tab |

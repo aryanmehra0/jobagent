@@ -142,6 +142,37 @@ def db_stats_command() -> None:
     console.print(table)
 
 
+@db_group.command("audit")
+@click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Optional path to write the audit JSON.")
+def db_audit_command(json_out) -> None:
+    """Validate that database rows, CSVs, JSON artifacts and the ZIP agree."""
+    from job_agent.tracking.audit import audit_report
+
+    try:
+        report = audit_report()
+    except Exception as exc:
+        _fail(f"Database audit failed: {exc}")
+    target = json_out or (settings.outputs_dir / "audit_report.json")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    console.print(f"[bold cyan]Database audit[/bold cyan] ({report['database']['backend']}): {report['database']['location']}\n")
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Check", style="cyan")
+    table.add_column("Status", justify="center")
+    table.add_column("Detail")
+    for item in report["checks"]:
+        table.add_row(item["name"].replace("_", " ").title(), "[green]OK[/green]" if item["ok"] else "[red]FAIL[/red]", item["detail"])
+    console.print(table)
+    console.print(
+        f"Jobs: DB {report['database']['counts']['jobs']} | CSV {report['artifacts']['jobs_master_rows']} | "
+        f"Ready {report['artifacts']['ready_rows']} | Pack docs {report['pack'].get('checked_documents', 0)}"
+    )
+    if not report["ok"]:
+        _fail("Audit found mismatches.", f"Review {target}")
+
+
 @db_group.command("jobs")
 @click.option("--limit", "-n", type=click.IntRange(1), default=20, help="How many jobs to show.")
 @click.option("--status", help="Only this stage, e.g. qualified, tailored, manual_apply.")
@@ -296,9 +327,14 @@ def export_command(output: Optional[Path], bundle: bool = False) -> None:
 
     if bundle:
         from job_agent.tracking.bundle import build_application_pack
+        from job_agent.tracking.audit import write_audit_report
+        from job_agent.tracking.performance import write_performance_report
         from job_agent.tracking.quality import write_quality_report
         try:
             write_quality_report()
+            write_performance_report()
+            build_application_pack()
+            write_audit_report()
             path = build_application_pack()
             if output and output.resolve() != path.resolve():
                 output.parent.mkdir(parents=True, exist_ok=True)
@@ -1133,6 +1169,39 @@ def quality_command(json_out: Optional[Path] = None) -> None:
         console.print("[bold yellow]Best next actions[/bold yellow]")
         for action in report["next_actions"]:
             console.print(f"  - {action}")
+
+
+@cli.command("performance")
+@click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Optional path to write the performance report JSON.")
+def performance_command(json_out: Optional[Path] = None) -> None:
+    """Show recent phase latency and fast-run recommendations."""
+    from job_agent.tracking.performance import performance_report
+
+    report = performance_report()
+    target = json_out or (settings.outputs_dir / "performance_report.json")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    table = Table(title="Performance report", show_header=True, header_style="bold magenta")
+    table.add_column("Phase", style="cyan")
+    table.add_column("Runs", justify="right")
+    table.add_column("Latest", justify="right")
+    table.add_column("Average", justify="right")
+    table.add_column("Status")
+    for item in report["phase_stats"]:
+        status = "[yellow]slow[/yellow]" if item["slow"] else "[green]ok[/green]"
+        table.add_row(
+            item["phase"],
+            str(item["runs"]),
+            f"{item['latest_seconds']:.1f}s",
+            f"{item['average_seconds']:.1f}s",
+            status,
+        )
+    console.print(table)
+    console.print("[bold]Recommendations[/bold]")
+    for action in report["recommendations"]:
+        console.print(f"  - {action}")
 
 
 @cli.command("production-check")

@@ -311,6 +311,22 @@ def test_cli_quality_scores_current_outputs(monkeypatch, tmp_path, candidate_pro
     assert report["jobs"] == {"master": 1, "latest": 1, "ready": 1}
 
 
+def test_cli_performance_reports_slow_phases(tmp_path):
+    from click.testing import CliRunner
+    from job_agent.cli import cli
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    database = JobsDatabase()
+    database.record_phase_run("evaluate", "ok", duration_seconds=900.0, started_at=utc_now_iso(), summary={"scored": 10})
+    database.record_phase_run("tailor", "ok", duration_seconds=5.0, started_at=utc_now_iso(), summary={"compiled": 3})
+    result = CliRunner().invoke(cli, ["performance"])
+    assert result.exit_code == 0, result.output
+    assert "Evaluation is the latency bottleneck" in result.output
+    report = json.loads((settings.outputs_dir / "performance_report.json").read_text(encoding="utf-8"))
+    evaluate = next(item for item in report["phase_stats"] if item["phase"] == "evaluate")
+    assert evaluate["slow"] is True
+
+
 def test_cli_repair_enriches_saved_descriptions_and_reruns_downstream(monkeypatch, tmp_path, candidate_profile):
     from click.testing import CliRunner
     from job_agent.cli import cli

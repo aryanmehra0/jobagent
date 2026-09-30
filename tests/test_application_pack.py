@@ -59,6 +59,7 @@ def prepare(monkeypatch, tmp_path):
 def test_pack_roundtrip_has_relative_links_and_byte_exact_resume(monkeypatch, tmp_path):
     out, folder, _ = prepare(monkeypatch, tmp_path)
     (out / "quality_report.json").write_text(json.dumps({"grade_out_of_10": 8.5}), encoding="utf-8")
+    (out / "audit_report.json").write_text(json.dumps({"ok": True}), encoding="utf-8")
     pack = build_application_pack(out)
     assert validate_application_pack(pack) == {
         "jobs": 1, "resumes": 1, "supporting_documents": 0,
@@ -78,6 +79,7 @@ def test_pack_roundtrip_has_relative_links_and_byte_exact_resume(monkeypatch, tm
         assert 'Extract the entire ZIP' in archive.read('index.html').decode()
         assert 'applications_ready.csv' in archive.read('index.html').decode()
         assert json.loads(archive.read("quality_report.json"))["grade_out_of_10"] == 8.5
+        assert json.loads(archive.read("audit_report.json"))["ok"] is True
 
 
 @pytest.mark.parametrize("change", ["tampered", "foreign_profile", "failed_check", "missing"])

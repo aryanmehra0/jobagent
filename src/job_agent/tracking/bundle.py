@@ -195,6 +195,12 @@ def build_application_pack(outputs_dir: Path | None = None) -> Path:
             quality = out / "quality_report.json"
             if quality.is_file():
                 archive.write(quality, "quality_report.json")
+            performance = out / "performance_report.json"
+            if performance.is_file():
+                archive.write(performance, "performance_report.json")
+            audit = out / "audit_report.json"
+            if audit.is_file():
+                archive.write(audit, "audit_report.json")
         temporary.replace(target)
         validate_application_pack(target)
     finally:

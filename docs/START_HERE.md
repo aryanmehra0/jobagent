@@ -42,6 +42,25 @@ It scores freshness, profile integrity, evaluation coverage, ready applications,
 download-pack integrity, hiring-email coverage and outcome tracking. The same
 report is saved as `data/outputs/quality_report.json` and included in the ZIP.
 
+To check latency and fast-run recommendations:
+
+```powershell
+python main.py performance
+```
+
+It reads the local phase history and points out slow phases such as sourcing,
+LLM evaluation or tracking. The report is saved as `performance_report.json`
+and included in the ZIP.
+
+To validate that the database and downloadable files agree:
+
+```powershell
+python main.py db audit
+```
+
+It syncs the local jobs database, compares database counts against the CSVs,
+JSON artifacts and ZIP manifest, then writes `data/outputs/audit_report.json`.
+
 To repair the current saved run before applying, use:
 
 ```powershell

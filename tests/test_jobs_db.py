@@ -359,3 +359,31 @@ def test_a_cli_phase_records_itself_in_the_run_history(tmp_path, monkeypatch, ou
     with JobsDatabase()._connect() as conn:
         rows = [dict(row) for row in conn.execute("SELECT phase, status, started_from FROM phase_runs")]
     assert rows and rows[-1]["phase"] == "track" and rows[-1]["started_from"] == "cli"
+
+
+def test_db_audit_cross_checks_artifacts(tmp_path, monkeypatch, outputs):
+    from click.testing import CliRunner
+
+    from job_agent.cli import cli
+    from job_agent.config.settings import settings
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    _write_artifacts(outputs, [_job()])
+    assert CliRunner().invoke(cli, ["export", "--bundle"]).exit_code == 0
+
+    result = CliRunner().invoke(cli, ["db", "audit"])
+    assert result.exit_code == 0, result.output
+    assert "Database Matches Master Csv" in result.output
+    report = json.loads((outputs / "audit_report.json").read_text(encoding="utf-8"))
+    assert report["ok"] is True
+    assert report["database"]["counts"]["jobs"] == report["artifacts"]["jobs_master_rows"] == 1

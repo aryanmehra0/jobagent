@@ -40,6 +40,12 @@ def publish_outputs(*, bundle: bool = False) -> dict[str, Any]:
         published["files"]["quality_report"] = str(path)
     except Exception as exc:
         published["warnings"].append(f"Quality report failed: {exc}")
+    try:
+        from job_agent.tracking.performance import write_performance_report
+        path = write_performance_report()
+        published["files"]["performance_report"] = str(path)
+    except Exception as exc:
+        published["warnings"].append(f"Performance report failed: {exc}")
     if bundle:
         try:
             from job_agent.tracking.supplements import sync_tracker
@@ -52,4 +58,13 @@ def publish_outputs(*, bundle: bool = False) -> dict[str, Any]:
             published["files"]["application_pack"] = str(path)
         except Exception as exc:
             published["warnings"].append(f"PDF pack export failed: {exc}")
+    try:
+        from job_agent.tracking.audit import write_audit_report
+        path = write_audit_report()
+        published["files"]["audit_report"] = str(path)
+        if bundle and "application_pack" in published["files"]:
+            from job_agent.tracking.bundle import build_application_pack
+            published["files"]["application_pack"] = str(build_application_pack())
+    except Exception as exc:
+        published["warnings"].append(f"Audit report failed: {exc}")
     return published
