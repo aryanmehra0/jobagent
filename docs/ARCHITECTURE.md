@@ -55,9 +55,11 @@ job agent/
 ├── .env.example                     # Environment variables with defaults
 ├── .gitignore                       # Protects secrets, candidate resumes, outputs
 ├── README.md                        # Primary user documentation (repo root)
+├── CLAUDE.md                        # Per-session orientation for any AI coding agent
+├── AGENTS.md                        # One-line pointer to CLAUDE.md (cross-tool convention)
 ├── docs/                            # Everything else: START_HERE, DEPLOYMENT, VALIDATION,
-│                                     # ARCHITECTURE (this file), ROADMAP_IMPLEMENTATION,
-│                                     # IMPROVEMENT_ROADMAP
+│                                     # ARCHITECTURE (this file), AGENT_DESIGN,
+│                                     # ROADMAP_IMPLEMENTATION, IMPROVEMENT_ROADMAP
 │
 ├── config/
 │   ├── searches.yaml                # Search parameters (domains, boards, locations, ATS targets)
