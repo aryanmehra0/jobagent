@@ -16,6 +16,7 @@ This file covers day-to-day use end to end. Everything else lives in
 | [`docs/START_HERE.md`](docs/START_HERE.md) | The shortest path from a fresh checkout to your first download |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, Postgres, the hosted API scaffold, and reaching the dashboard remotely over Tailscale |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | File-by-file map of the codebase, for anyone (human or AI) changing the code |
+| [`docs/AGENT_DESIGN.md`](docs/AGENT_DESIGN.md) | How this maps onto the Perceive/Reason/Memory/Plan/Act/Observe agent loop, and every guardrail, with file references |
 | [`docs/VALIDATION.md`](docs/VALIDATION.md) | What's been verified against live data and how to reproduce it |
 | [`docs/ROADMAP_IMPLEMENTATION.md`](docs/ROADMAP_IMPLEMENTATION.md) | Status and limits of each shipped feature |
 | [`docs/IMPROVEMENT_ROADMAP.md`](docs/IMPROVEMENT_ROADMAP.md) | Historical: the original feature proposals, now implemented |

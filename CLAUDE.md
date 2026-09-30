@@ -7,7 +7,11 @@ the full, file-by-file architecture map, read
 and don't trust it blindly either — verify a path exists (`find src/job_agent
 -name "*.py"`) before citing it, the way this file itself was built. A stale
 version of `ARCHITECTURE.md` once named four files that didn't exist; nobody
-caught it until someone actually ran `find`.
+caught it until someone actually ran `find`. For how the system maps onto the
+Perceive/Reason/Memory/Plan/Act/Observe agent loop and the full guardrail
+list, read [`docs/AGENT_DESIGN.md`](docs/AGENT_DESIGN.md) — match its
+patterns (which gate a new feature routes through, which bound a new action
+respects) instead of inventing a new one.
 
 **Check whether this repository's GitHub remote is public before assuming
 either way** (`gh repo view --json visibility`, or the visibility field from
