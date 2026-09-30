@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, Optional
 
 from job_agent.config.schema import JobPosting
 from job_agent.config.settings import settings
@@ -143,13 +143,3 @@ def collect_records(outputs_dir: Optional[Path] = None) -> Dict[str, JobRecord]:
         if job_id in records:
             records[job_id].status = entry["status"]
     return records
-
-
-def sorted_records(records: Dict[str, JobRecord]) -> List[JobRecord]:
-    """Best first: highest fit score, then most recently discovered."""
-    return sorted(
-        records.values(),
-        key=lambda record: (record.fit_score if record.fit_score is not None else -1.0,
-                            record.job.discovered_at or ""),
-        reverse=True,
-    )

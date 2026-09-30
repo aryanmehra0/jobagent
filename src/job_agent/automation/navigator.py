@@ -117,13 +117,6 @@ class DOMNavigator:
 
         return fields
 
-    def find_file_upload_input(self) -> Optional[Locator]:
-        """Locate file upload element for submitting tailored PDF resume."""
-        file_inputs = self.page.locator("input[type='file']").all()
-        if file_inputs:
-            return file_inputs[0]
-        return None
-
     def find_action_button(self, action_type: str = "submit") -> Optional[Locator]:
         """Locate navigation buttons ('Submit', 'Next', 'Continue', 'Apply')."""
         if action_type == "submit":

@@ -13,7 +13,7 @@ import json
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Set
+from typing import Dict, Iterator, List, Optional, Sequence
 
 from job_agent.config.schema import JobPosting, job_fingerprint
 from job_agent.config.settings import settings
@@ -116,11 +116,6 @@ class DeltaStore:
         """Whether a job ID exists in the store."""
         with self._connect() as conn:
             return conn.execute("SELECT 1 FROM seen_jobs WHERE job_id = ?", (job_id,)).fetchone() is not None
-
-    def get_all_seen_ids(self) -> Set[str]:
-        """Every seen job ID, as an in-memory set for fast filtering."""
-        with self._connect() as conn:
-            return {row[0] for row in conn.execute("SELECT job_id FROM seen_jobs")}
 
     def get_seen_count(self) -> int:
         """Total number of tracked listings."""

@@ -150,7 +150,7 @@ def test_anti_hallucination_metric_restoration(candidate_profile, qualified_job)
     }
 
     # Pass through anti-hallucination verification
-    enforced = tailorer._verify_and_enforce_metric_integrity(candidate_profile, stripped_llm_output)
+    enforced, restored, dropped = tailorer.enforce_metric_integrity(candidate_profile, stripped_llm_output)
     bullets = enforced["tailored_experience"][0]["tailored_bullets"]
 
     # The original locked bullets must have been restored!

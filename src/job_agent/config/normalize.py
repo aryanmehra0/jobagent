@@ -275,8 +275,6 @@ PHONE_RE = re.compile(
     r"|\d{3,5}[\s.\-]\d{2,5}[\s.\-]\d{2,5}(?:[\s.\-]\d{2,5})?"      # three or more groups
     r")"
 )
-URL_RE = re.compile(r"(?:https?://)?(?:www\.)?[A-Za-z0-9\-]+\.[A-Za-z]{2,}(?:/[^\s,|]*)?")
-
 
 def normalize_url(value: Optional[str], *, require_host: bool = True) -> Optional[str]:
     """Add a scheme to a bare URL and reject anything that is not host-shaped.

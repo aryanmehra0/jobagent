@@ -18,12 +18,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from rich.console import Console
-
 from job_agent.config.schema import JobPosting
 from job_agent.config.settings import settings
-
-console = Console()
 
 JOBS_CSV_NAME = "jobs_master.csv"
 
@@ -297,19 +293,3 @@ def spreadsheet_text(value: Any) -> str:
     if text.lstrip(" \t\r\n").startswith(("=", "+", "-", "@")) or text.startswith(("\t", "\r", "\n")):
         return "'" + text
     return text
-
-
-def export_jobs_csv(quiet: bool = False) -> Optional[Path]:
-    """Refresh the jobs CSV, reporting rather than raising on failure.
-
-    Called after each phase; a sheet left open in Excel must not fail the phase
-    whose real work has already been saved.
-    """
-    try:
-        path = JobsCsvExporter().export()
-    except Exception as exc:
-        console.print(f"[yellow]Jobs CSV not updated: {exc}[/yellow]")
-        return None
-    if not quiet:
-        console.print(f"[bold green]Jobs sheet updated:[/bold green] [yellow]{path}[/yellow]")
-    return path

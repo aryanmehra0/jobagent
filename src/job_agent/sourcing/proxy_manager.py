@@ -9,7 +9,6 @@ from __future__ import annotations
 import random
 from pathlib import Path
 from typing import Optional, List, Dict
-import requests
 from rich.console import Console
 
 from job_agent.config.settings import settings
@@ -90,13 +89,4 @@ class ProxyManager:
                 del self.sticky_sessions[board_name]
 
         return self.get_proxy_for_board(board_name, force_rotate=True)
-
-    def test_proxy(self, proxy_url: str, timeout: int = 5) -> bool:
-        """Test proxy connectivity by pinging an IP check endpoint."""
-        proxies = {"http": proxy_url, "https": proxy_url}
-        try:
-            resp = requests.get("https://httpbin.org/ip", proxies=proxies, timeout=timeout)
-            return resp.status_code == 200
-        except Exception:
-            return False
 

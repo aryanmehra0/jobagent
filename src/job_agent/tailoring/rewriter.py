@@ -373,17 +373,6 @@ class ResumeTailorer:
         """Collapse whitespace, commas, and case so metric comparison is format-insensitive."""
         return re.sub(r"[\s,]", "", clean_text(text)).lower()
 
-    # Retained under the original private name for backwards compatibility with
-    # callers and tests written against the previous API.
-    def _verify_and_enforce_metric_integrity(
-        self,
-        original_profile: CandidateProfile,
-        tailored_data: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """Backwards-compatible wrapper around `enforce_metric_integrity`."""
-        repaired, _, _ = self.enforce_metric_integrity(original_profile, tailored_data)
-        return repaired
-
     # --- Orchestration --------------------------------------------------------
 
     def generate_tailored_profile_data(

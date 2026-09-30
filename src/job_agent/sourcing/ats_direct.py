@@ -11,6 +11,7 @@ domain of "Senior Distributed Systems Engineer" matches a posting titled
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -236,7 +237,7 @@ class ATSDirectIngestion:
         """
         if len(wanted) <= 1:
             return 1
-        return max(2, -(-len(wanted) * 10 // 20))  # ceil(len * MIN_TOKEN_OVERLAP_RATIO)
+        return max(2, math.ceil(len(wanted) * MIN_TOKEN_OVERLAP_RATIO))
 
     def matches_domain(self, posting: JobPosting, domains: List[str]) -> bool:
         """Whether a posting is relevant to any target domain.

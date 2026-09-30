@@ -15,7 +15,7 @@ import yaml
 from pydantic import ValidationError
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, FloatPrompt, IntPrompt, Prompt
+from rich.prompt import FloatPrompt, IntPrompt, Prompt
 
 from job_agent.config.schema import SUPPORTED_JOB_BOARDS, SUPPORTED_PUBLIC_SOURCES, SearchParameters
 from job_agent.config.settings import settings

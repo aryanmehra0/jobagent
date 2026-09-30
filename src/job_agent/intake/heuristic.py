@@ -344,11 +344,6 @@ def _looks_like_company(text: str) -> bool:
     return any(word.strip(".") in {k.strip(".") for k in COMPANY_KEYWORDS} for word in words)
 
 
-def _split_company_and_title(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """Split a single-line experience header into (company, title)."""
-    return _resolve_company_title([text])
-
-
 def _resolve_company_title(fragments: List[str]) -> Tuple[Optional[str], Optional[str]]:
     """Work out (company, title) from one or more header fragments.
 

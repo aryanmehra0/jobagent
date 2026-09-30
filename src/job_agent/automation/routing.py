@@ -31,8 +31,6 @@ ACCOUNT_REQUIRED_DOMAINS = (
     "taleo.net", "oraclecloud.com", "amazon.jobs", "brassring.com", "kenexa.com", "avature.net",
 )
 
-AUTO_APPLY_CHANNELS = ("greenhouse", "lever", "ashby")
-
 
 @dataclass(frozen=True)
 class ApplicationRoute:
@@ -93,11 +91,6 @@ def ats_form_url(url: Optional[str]) -> Optional[tuple]:
             return "ashby", f"https://jobs.ashbyhq.com/{organization}/{job_id}/application"
 
     return None
-
-
-def greenhouse_form_url(board_token: str, job_id) -> str:
-    """The embeddable Greenhouse application form for a board's job."""
-    return f"https://job-boards.greenhouse.io/embed/job_app?for={board_token}&token={job_id}"
 
 
 def resolve_apply_url(job_url: Optional[str], direct_url: Optional[str]) -> Optional[str]:
