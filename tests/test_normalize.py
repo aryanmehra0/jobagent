@@ -155,7 +155,7 @@ def test_looks_like_person_name_accepts_all_caps():
     module, which knows the heading list; this check stays deliberately permissive.
     """
     assert looks_like_person_name("Alex Rivera")
-    assert looks_like_person_name("RAJ ARYAN")
+    assert looks_like_person_name("ASHA VERMA")
     assert looks_like_person_name("MARIE-CLAIRE O'BRIEN")
 
 

@@ -28,7 +28,7 @@ from job_agent.sourcing.delta_store import DeltaStore
 
 def _profile(**auth) -> CandidateProfile:
     profile = CandidateProfile(
-        contact=ContactInfo(full_name="Raj Aryan", email="raj@example.org", phone="+91-9876543210", location="Gurugram"),
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org", phone="+91-9876543210", location="Gurugram"),
         summary="Product manager with AI and analytics experience.",
         work_authorization=WorkAuthorization(**auth),
         skills=SkillSet(languages=["Python", "SQL"]),
@@ -287,11 +287,11 @@ def test_email_draft_file_opens_as_unsent_with_resume_attached(tmp_path):
     pdf = tmp_path / "resume.pdf"
     pdf.write_bytes(b"%PDF-1.4 test")
     path = outreach.write_eml(tmp_path / "d.eml", _profile(**INDIA), "careers@acme.com",
-                              "Product Manager - Raj Aryan", "Hello", pdf)
+                              "Product Manager - Asha Verma", "Hello", pdf)
     message = email.message_from_bytes(path.read_bytes())
     assert message["To"] == "careers@acme.com" and message["X-Unsent"] == "1"
     attachments = [part.get_filename() for part in message.walk() if part.get_filename()]
-    assert attachments == ["Raj_Aryan_Resume.pdf"]
+    assert attachments == ["Asha_Verma_Resume.pdf"]
 
 
 def test_split_subject():
@@ -324,7 +324,7 @@ def test_tracking_twice_drafts_once_and_the_csv_carries_the_email(tmp_path, monk
     class _Generator:
         def generate_email(self, profile, job, fit_score=8.0):
             calls.append(job.id)
-            return "Subject: Product Manager - Raj Aryan\n\nHi Acme Hiring Team,\n\nBody."
+            return "Subject: Product Manager - Asha Verma\n\nHi Acme Hiring Team,\n\nBody."
 
     store = DeltaStore(outputs / "delta.db")
     make = lambda: FallbackTrackingPipeline(email_generator=_Generator(), delta_store=store,
@@ -341,7 +341,7 @@ def test_tracking_twice_drafts_once_and_the_csv_carries_the_email(tmp_path, monk
         row = next(csv.DictReader(handle))
     assert row["HR / Careers Email"] == "hr@acme.com"
     assert row["Outreach To"] == "hr@acme.com"
-    assert row["Cold Email Subject"] == "Product Manager - Raj Aryan"
+    assert row["Cold Email Subject"] == "Product Manager - Asha Verma"
     assert "Hi Acme Hiring Team" in row["Cold Email Body"]
     assert "do not send again" in row["Outreach Status"]
     assert row["Email Draft File"] == "j1.eml"

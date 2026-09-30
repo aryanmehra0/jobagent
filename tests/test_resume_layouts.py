@@ -122,7 +122,7 @@ def test_prose_mentioning_an_alias_is_not_a_heading():
     """Matching alias words anywhere would turn a bullet into a section break."""
     assert _heading_key("Led 3 projects") is None
     assert _heading_key("Managed several projects end to end") is None
-    assert _heading_key("RAJ ARYAN") is None
+    assert _heading_key("ASHA VERMA") is None
 
 
 # ==============================================================================
@@ -273,11 +273,11 @@ def test_location_is_read_from_a_based_in_line():
     from job_agent.intake.heuristic import extract_contact
 
     header = [
-        "RAJ ARYAN",
+        "ASHA VERMA",
         "Associate Product Manager | AI/ML",
-        "+91-6287278385 | someone@example.com",
+        "+91-9876543210 | someone@example.com",
         "Based in Gurugram \u2022 Open to relocate to Mumbai",
     ]
     contact = extract_contact(header, "\n".join(header))
     assert contact["location"] == "Gurugram"
-    assert contact["full_name"] == "RAJ ARYAN", "an all-caps name must not be skipped"
+    assert contact["full_name"] == "ASHA VERMA", "an all-caps name must not be skipped"
