@@ -31,10 +31,10 @@ risked.
 
 from __future__ import annotations
 
-import io
 import re
 import shutil
 from collections import Counter
+from functools import lru_cache
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -134,8 +134,68 @@ def _compact(text: str) -> str:
     return _BULLET_OR_SPACE.sub("", text or "")
 
 
+def _merge_script_fragments(spans: List[dict], groups: List[List[int]], body_size: float) -> List[List[int]]:
+    """Attach subscripts and superscripts to the line they sit on.
+
+    Spans are grouped into lines by baseline. A subscript (CH4, NO2) or a
+    superscript (R2) sits a few points off its line's baseline, so it formed a
+    one-character "line" of its own. That stray fragment made the safety checks
+    see text "beside" a block, and read out of order in the validator, which
+    together stopped resumes containing chemistry or maths from being reordered
+    at all. A fragment is small text that lies inside the box of an ordinary
+    line on the same page; it is merged into that line, in left-to-right order.
+    """
+    def box(group: List[int]) -> Tuple[float, float, float, float]:
+        return (min(spans[i]["bbox"][0] for i in group), min(spans[i]["bbox"][1] for i in group),
+                max(spans[i]["bbox"][2] for i in group), max(spans[i]["bbox"][3] for i in group))
+
+    def is_fragment(group: List[int]) -> bool:
+        text = "".join(spans[i]["text"].strip() for i in group)
+        smallest = max(spans[i]["size"] for i in group)
+        return len(text) <= 6 and smallest <= body_size * 0.9
+
+    hosts = [g for g in groups if not is_fragment(g)]
+    host_boxes = [(g, box(g)) for g in hosts]
+    attached: Dict[int, List[int]] = {}
+    consumed = set()
+    for position, group in enumerate(groups):
+        if not is_fragment(group):
+            continue
+        x0, y0, x1, y1 = box(group)
+        centre = (y0 + y1) / 2
+        page = spans[group[0]]["page"]
+        for host, (hx0, hy0, hx1, hy1) in host_boxes:
+            if spans[host[0]]["page"] != page:
+                continue
+            if hy0 - 1.0 <= centre <= hy1 + 1.0 and hx0 - 2.0 <= x0 and x1 <= hx1 + 2.0:
+                attached.setdefault(id(host), []).extend(group)
+                consumed.add(position)
+                break
+    merged: List[List[int]] = []
+    for position, group in enumerate(groups):
+        if position in consumed:
+            continue
+        merged.append(group + attached.get(id(group), []))
+    return merged
+
+
 def read_layout(pdf_path: Path) -> Layout:
-    """Sections, entries and bullets of a resume PDF, from its text positions."""
+    """Sections, entries and bullets of a resume PDF, from its text positions.
+
+    Cached per file and modification time: a batch tailors one source PDF for
+    many jobs, and the layout is the same every time.
+    """
+    path = Path(pdf_path)
+    stat = path.stat()
+    return _read_layout_cached(str(path), stat.st_mtime_ns, stat.st_size)
+
+
+@lru_cache(maxsize=4)
+def _read_layout_cached(path: str, mtime_ns: int, size: int) -> Layout:
+    return _read_layout_uncached(Path(path))
+
+
+def _read_layout_uncached(pdf_path: Path) -> Layout:
     doc = fitz.open(str(pdf_path))
     spans: List[dict] = []
     for page_number, page in enumerate(doc):
@@ -163,6 +223,7 @@ def read_layout(pdf_path: Path) -> Layout:
     for span in spans:
         char_sizes[round(span["size"], 1)] += len(span["text"].strip())
     body_size = char_sizes.most_common(1)[0][0] if char_sizes else 10.0
+    groups = _merge_script_fragments(spans, groups, body_size)
 
     lines: List[Line] = []
     for group in groups:
@@ -296,6 +357,9 @@ def _shorten(text: str, limit: int = 60) -> str:
     return lead if len(lead) <= limit else lead[: limit - 1] + "…"
 
 
+# A bullet that is just a labelled keyword list ("Tools: ...", "Stack: ...").
+_LABEL_LINE = re.compile(r"^\s*(tools|technologies|tech stack|stack|environment|languages|frameworks)\b[^:]{0,20}:", re.I)
+
 def plan_for_job(layout: Layout, job: JobPosting) -> Plan:
     """Most relevant blocks first, within each group that may be reordered."""
     from job_agent.tailoring.rewriter import job_terms, relevance
@@ -304,9 +368,19 @@ def plan_for_job(layout: Layout, job: JobPosting) -> Plan:
     groups: List[Group] = []
     skipped: List[str] = []
 
-    def order_by_relevance(units: List[Unit]) -> List[int]:
+    def order_by_relevance(units: List[Unit], pin_labels: bool = False) -> List[int]:
         scored = [(-relevance(unit.text, terms), index) for index, unit in enumerate(units)]
-        return [index for _, index in sorted(scored)]
+        order = [index for _, index in sorted(scored)]
+        if not pin_labels:
+            return order
+        # A "Tools: ..." or "Technologies: ..." line is a list of keywords, not an
+        # accomplishment. Led by one, a role reads as machine-arranged, so those
+        # stay where the candidate put them and the rest reorder around them.
+        pinned = {i for i, unit in enumerate(units) if _LABEL_LINE.match(unit.text)}
+        if not pinned:
+            return order
+        movable = iter(index for index in order if index not in pinned)
+        return [index if index in pinned else next(movable) for index in range(len(units))]
 
     for section in layout.sections:
         title = section.title
@@ -321,7 +395,7 @@ def plan_for_job(layout: Layout, job: JobPosting) -> Plan:
                     continue
                 units = [Unit(bullet.text, bullet.text, bullet.lines) for bullet in entry.bullets]
                 name = entry.title.split("|")[0].strip() or title.title()
-                groups.append(Group(_shorten(name, 70), units, order_by_relevance(units)))
+                groups.append(Group(_shorten(name, 70), units, order_by_relevance(units, pin_labels=True)))
     return Plan(groups=groups, skipped=skipped)
 
 
@@ -347,11 +421,19 @@ def _assign_bands(layout: Layout, group: Group, page_rect: fitz.Rect, drawings: 
 
     above = [line.bottom for line in page_lines if id(line) not in unit_ids and line.top < tops[0]]
     below = [line.top for line in page_lines if id(line) not in unit_ids and line.top >= bottoms[-1] - 1.0]
-    first_boundary = (max(above) + tops[0]) / 2 if above else tops[0] - 1.0
-    gap = (tops[1] - bottoms[0]) if len(units) > 1 else 2.0
-    last_boundary = (bottoms[-1] + min(below)) / 2 if below else bottoms[-1] + max(gap / 2, 1.0)
-    first_boundary = max(first_boundary, tops[0] - 6.0)
-    last_boundary = min(last_boundary, bottoms[-1] + 6.0)
+    # Every block gets the same padding: half the typical gap between blocks. The
+    # first and last used to take up to 6pt of whatever empty space bordered the
+    # group, so once a block moved into the middle of the list that extra
+    # headroom showed up as a visible gap that the original did not have. Space
+    # outside the group stays where it was (it is drawn as static background).
+    gaps = sorted(max(tops[i + 1] - bottoms[i], 0.0) for i in range(len(units) - 1))
+    pad = (gaps[len(gaps) // 2] if gaps else 2.0) / 2.0   # exactly what an interior block has: no floor, or the ends differ
+    first_boundary = tops[0] - pad
+    last_boundary = bottoms[-1] + pad
+    if above:   # never reach into the text above
+        first_boundary = max(first_boundary, (max(above) + tops[0]) / 2)
+    if below:   # or the text below
+        last_boundary = min(last_boundary, (bottoms[-1] + min(below)) / 2)
 
     boundaries = [first_boundary] + [(bottoms[i] + tops[i + 1]) / 2 for i in range(len(units) - 1)] + [last_boundary]
     left = page_rect.x0
@@ -530,6 +612,26 @@ def _link_signature(path: Path) -> Counter:
     return found
 
 
+@lru_cache(maxsize=4)
+def _source_facts_cached(path: str, mtime_ns: int, size: int) -> Dict[str, object]:
+    """Everything validation needs to know about the original, computed once."""
+    source = Path(path)
+    doc = fitz.open(str(source))
+    pages = []
+    for page in doc:
+        pixmap = page.get_pixmap(dpi=72)
+        pages.append((pixmap.width, pixmap.height, pixmap.n, bytes(pixmap.samples),
+                      page.rect.width, page.rect.height))
+    doc.close()
+    return {"mupdf": _mupdf_words(source), "pypdf": _pypdf_words(source),
+            "links": _link_signature(source), "pages": pages}
+
+
+def _source_facts(source: Path) -> Dict[str, object]:
+    stat = Path(source).stat()
+    return _source_facts_cached(str(source), stat.st_mtime_ns, stat.st_size)
+
+
 def _pypdf_text(path: Path) -> str:
     from pypdf import PdfReader
 
@@ -583,8 +685,9 @@ def validate(layout: Layout, plan: Plan, output: Path) -> Dict[str, object]:
         abs(a.rect.width - b.rect.width) < 0.5 and abs(a.rect.height - b.rect.height) < 0.5 for a, b in zip(src, out))
     record("page_size", same_size, "page size unchanged" if same_size else "page size differs")
 
-    for name, reader in (("words_mupdf", _mupdf_words), ("words_pypdf", _pypdf_words)):
-        before, after = reader(source), reader(output)
+    facts = _source_facts(source)
+    for name, key, reader in (("words_mupdf", "mupdf", _mupdf_words), ("words_pypdf", "pypdf", _pypdf_words)):
+        before, after = facts[key], reader(output)
         missing = before - after
         extra = after - before
         detail = "every word present exactly as often as in the original"
@@ -595,13 +698,18 @@ def validate(layout: Layout, plan: Plan, output: Path) -> Dict[str, object]:
 
     output_text = _normalize(" ".join(page.get_text("text", sort=True) for page in out))
     compact_output = _compact(output_text)
+    # Position-sorted extraction can split a line holding a subscript or
+    # superscript; the content stream (how an ATS reads it) keeps it whole. A
+    # block is intact if it reads as one continuous run either way.
+    compact_stream = _compact(_normalize(" ".join(page.get_text("text") for page in out)))
     broken = [unit.text for group in plan.groups for unit in group.units
-              if len(unit.lines) > 1 and _compact(unit.text) not in compact_output]
+              if len(unit.lines) > 1
+              and _compact(unit.text) not in compact_output and _compact(unit.text) not in compact_stream]
     record("blocks_intact", not broken,
            "every bullet and entry reads as one continuous block" if not broken
            else f"{len(broken)} block(s) broken, e.g. \"{_shorten(broken[0])}\"")
 
-    links_before, links_after = _link_signature(source), _link_signature(output)
+    links_before, links_after = facts["links"], _link_signature(output)
     record("links", links_before == links_after,
            f"{sum(links_before.values())} link(s) kept with their text" if links_before == links_after
            else f"links differ: expected {sum(links_before.values())}, found {sum(links_after.values())}")
@@ -636,19 +744,22 @@ def validate(layout: Layout, plan: Plan, output: Path) -> Dict[str, object]:
         if group.region is not None:
             moved_regions.setdefault(group.units[0].page, []).append(group.region)
     worst = 0.0
-    for page_number, (a, b) in enumerate(zip(src, out)):
-        pa, pb = a.get_pixmap(dpi=72), b.get_pixmap(dpi=72)
-        if (pa.width, pa.height) != (pb.width, pb.height):
+    for page_number, (a_width, a_height, a_n, a_samples, _, _) in enumerate(facts["pages"]):
+        if page_number >= len(out):
+            worst = 1.0
+            break
+        pb = out[page_number].get_pixmap(dpi=72)
+        if (a_width, a_height) != (pb.width, pb.height):
             worst = 1.0
             break
         rows = [(int(r.y0) - 1, int(r.y1) + 2) for r in moved_regions.get(page_number, [])]
-        stride = pa.width * pa.n
+        stride = a_width * a_n
         differing = total = 0
-        for row in range(pa.height):
+        for row in range(a_height):
             if any(y0 <= row <= y1 for y0, y1 in rows):
                 continue
             start = row * stride
-            line_a, line_b = pa.samples[start:start + stride], pb.samples[start:start + stride]
+            line_a, line_b = a_samples[start:start + stride], pb.samples[start:start + stride]
             total += stride
             if line_a != line_b:
                 differing += sum(1 for x, y in zip(line_a, line_b) if abs(x - y) > 24)

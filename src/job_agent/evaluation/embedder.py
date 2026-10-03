@@ -24,6 +24,21 @@ class SemanticEmbedder:
         self.model_name = model_name or settings.semantic_embedding_model
         self._encoder = None
         self._use_fallback = False
+        self.last_cache_stats = {"hits": 0, "misses": 0}
+
+    # Cosine scores are not comparable across backends. Measured on 903 real postings with
+    # the MiniLM encoder, on-target titles had a median of 0.45 (10th percentile 0.32) and
+    # off-target ones a median of 0.31, so 0.15 let nearly everything through. TF-IDF scores
+    # run far lower for the same pair, so it keeps the old cutoff.
+    TRANSFORMER_THRESHOLD = 0.30
+    TFIDF_THRESHOLD = 0.15
+
+    def resolve_threshold(self, configured: Optional[float] = None) -> float:
+        """The Tier 1 cutoff: the operator's value if set, else the right one for this backend."""
+        if configured is not None:
+            return configured
+        self._get_encoder()
+        return self.TFIDF_THRESHOLD if self._use_fallback else self.TRANSFORMER_THRESHOLD
 
     def _get_encoder(self):
         """Lazy loader for sentence-transformers model with TF-IDF fallback."""
@@ -96,7 +111,11 @@ class SemanticEmbedder:
         if not self._use_fallback and encoder is not None:
             try:
                 candidate_vec = encoder.encode([candidate_text], normalize_embeddings=True)
-                job_vecs = encoder.encode(job_texts, normalize_embeddings=True)
+                from job_agent.evaluation.embedding_cache import EmbeddingCache
+
+                cache = EmbeddingCache(self.model_name)
+                job_vecs = cache.vectors(job_texts, lambda texts: encoder.encode(texts, normalize_embeddings=True))
+                self.last_cache_stats = {"hits": cache.hits, "misses": cache.misses}
                 # Dot product of normalized vectors = cosine similarity
                 scores = np.dot(job_vecs, candidate_vec.T).flatten()
                 return [float(max(0.0, min(1.0, s))) for s in scores]

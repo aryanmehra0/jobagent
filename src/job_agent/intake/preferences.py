@@ -142,6 +142,30 @@ def save_preferences(values: Dict[str, Any], profile_path: Optional[Path] = None
     return updated
 
 
+def clear_preferences(profile_path: Optional[Path] = None) -> CandidateProfile:
+    """Remove country, visa, remote and salary preferences from the sealed profile.
+
+    Used when a profile was built with another person's preferences. Only the
+    preference fields change: the fact seal is carried over unchanged, the
+    whole-profile hash is recomputed, and the stored preferences file is removed.
+    """
+    target = profile_path or settings.profile_path
+    profile = CandidateProfile.model_validate(json.loads(target.read_text(encoding="utf-8")))
+    if not profile.verify_integrity():
+        raise ValueError("The profile's locked facts do not match their seal. Re-run intake first.")
+    data = profile.model_dump()
+    auth = data["work_authorization"]
+    auth.update(current_country=None, authorized_countries=[], citizenship=[],
+                requires_sponsorship=None, remote_worldwide=None)
+    data.update(desired_salary=None, desired_salary_max=None, salary_currency=None)
+    updated = CandidateProfile.model_validate(data)
+    updated.fact_hash = profile.fact_hash
+    updated.profile_hash = updated.compute_profile_hash()
+    target.write_text(updated.model_dump_json(indent=2), encoding="utf-8")
+    preferences_path().unlink(missing_ok=True)
+    return updated
+
+
 def reapply_saved_preferences(profile: CandidateProfile, output_path: Path) -> CandidateProfile:
     """Called after intake: carry stored preferences into the freshly parsed profile."""
     preferences = load_preferences()

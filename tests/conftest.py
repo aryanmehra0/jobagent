@@ -19,3 +19,16 @@ def isolate_llm_settings(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "dashboard_username", None)
     monkeypatch.setattr(settings, "dashboard_password", None)
     monkeypatch.setattr(settings, "dashboard_allowed_hosts", None)
+    # Every other Settings field a real .env can set and a test could silently inherit:
+    # a configured DATABASE_URL would send tests to the operator's real database, and a
+    # tuned MIN_MATCH_SCORE / TIER1_THRESHOLD / TAILORING_MODE changes what "qualifies".
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "min_match_score", 7.0)
+    monkeypatch.setattr(settings, "tier1_threshold", None)
+    monkeypatch.setattr(settings, "tailoring_mode", "auto")
+    monkeypatch.setattr(settings, "profile_path", tmp_path / "profiles" / "profile.json")
+    monkeypatch.setattr(settings, "raw_resumes_dir", tmp_path / "raw_resumes")
+    # No test may call out to a resolver: the SSRF guard is exercised explicitly in test_netguard.py.
+    import job_agent.contacts.finder as finder
+
+    monkeypatch.setattr(finder, "_resolves_to_public_address", lambda host, port: True)

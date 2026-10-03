@@ -7,7 +7,6 @@ terminal prompt for manual human intervention before resuming the workflow.
 
 from __future__ import annotations
 
-import time
 from typing import Optional
 from playwright.sync_api import Page
 from rich.console import Console

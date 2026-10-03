@@ -674,3 +674,117 @@ def test_readiness_endpoint_refuses_paths_outside_the_resumes_directory(console)
         headers={"Content-Type": "application/json"},
     )
     assert status == 404
+
+
+# ---- Phase 4: authentication and file-serving hardening -----------------------------------------
+
+def test_a_non_ascii_login_attempt_is_a_clean_401_not_a_crash(auth_console):
+    base, _ = auth_console
+    status, _ = _request(f"{base}/", headers=_basic_auth_header("candidate", "p\u00e4ssw\u00f6rd \u2713"))
+    assert status == 401
+
+
+def test_a_non_ascii_password_can_actually_be_used(monkeypatch):
+    from job_agent.config.settings import settings
+    monkeypatch.setattr(settings, "dashboard_username", "candidate")
+    monkeypatch.setattr(settings, "dashboard_password", "p\u00e4ssw\u00f6rd \u2713")
+    server = FlowConsoleServer(("127.0.0.1", 0), partial(FlowConsoleHandler), "unicode-token")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        base = f"http://127.0.0.1:{server.server_address[1]}"
+        status, _ = _request(f"{base}/", headers=_basic_auth_header("candidate", "p\u00e4ssw\u00f6rd \u2713"))
+        assert status == 200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_a_non_ascii_session_token_is_rejected_cleanly(console):
+    base, _ = console
+    status, _ = _request(f"{base}/api/preferences", method="POST", body=b"{}",
+                         headers={"X-Session-Token": "t\u00f6ken".encode("utf-8").decode("latin-1")})
+    assert status in (401, 403)
+
+
+def test_file_route_serves_outputs_but_not_the_profile_or_databases(console, monkeypatch, tmp_path):
+    from urllib.parse import quote
+
+    from job_agent.config.settings import settings
+    base, _ = console
+    data = tmp_path / "data"
+    outputs, profiles = data / "outputs", data / "profiles"
+    outputs.mkdir(parents=True)
+    profiles.mkdir()
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profiles / "profile.json")
+    monkeypatch.setattr(settings, "raw_resumes_dir", data / "raw_resumes")
+    (outputs / "resume_1.pdf").write_bytes(b"%PDF-1.4 fake")
+    (outputs / "jobs.db").write_bytes(b"SQLite format 3")
+    (outputs / ".pipeline.lock").write_bytes(b"0")
+    (profiles / "profile.json").write_text('{"contact": {"email": "private@example.org"}}', encoding="utf-8")
+
+    def fetch(path):
+        return _request(f"{base}/api/file?path={quote(str(path))}")
+
+    assert fetch(outputs / "resume_1.pdf")[0] == 200
+    for blocked in (profiles / "profile.json", outputs / "jobs.db", outputs / ".pipeline.lock",
+                    outputs / ".." / "profiles" / "profile.json"):
+        status, body = fetch(blocked)
+        assert status == 403, blocked
+        assert b"private@example.org" not in body
+
+
+def test_remote_hostnames_without_a_login_refuse_to_start(monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.web.server import run_server
+    monkeypatch.setattr(settings, "dashboard_allowed_hosts", "mydevice.example.ts.net")
+    monkeypatch.setattr(settings, "dashboard_username", None)
+    monkeypatch.setattr(settings, "dashboard_password", None)
+    with pytest.raises(ValueError, match="without a login"):
+        run_server(port=0, open_browser=False)
+
+
+def test_a_full_disk_is_reported_as_507_not_a_dropped_connection(console, monkeypatch):
+    import errno
+    import job_agent.web.server as web_server
+    base, token = console
+
+    def full_disk(self, body):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(web_server.FlowConsoleHandler, "_save_preferences", full_disk)
+    status, body = _request(f"{base}/api/preferences", method="POST", token=token, body=b"{}")
+    assert status == 507
+    assert "disk is full" in json.loads(body)["error"]
+
+    def broken_read(self):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(web_server.FlowConsoleHandler, "_route_get", broken_read)
+    status, body = _request(f"{base}/api/state")
+    assert status == 507
+
+
+def test_a_resume_that_expands_enormously_is_refused(console):
+    import io
+    import zipfile
+    base, token = console
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"0" * (60 * 1024 * 1024))   # compresses to a few KB
+    status, body = _request(f"{base}/api/resume", method="POST", token=token, body=buffer.getvalue(),
+                            headers={"X-Filename": "bomb.docx"})
+    assert status == 400
+    assert "unreasonable size" in json.loads(body)["error"]
+
+
+def test_a_pdf_with_too_many_pages_is_refused(console):
+    import fitz
+    base, token = console
+    document = fitz.open()
+    for _ in range(40):
+        document.new_page()
+    status, body = _request(f"{base}/api/resume", method="POST", token=token, body=document.tobytes(),
+                            headers={"X-Filename": "long.pdf"})
+    assert status == 400
+    assert "pages" in json.loads(body)["error"]

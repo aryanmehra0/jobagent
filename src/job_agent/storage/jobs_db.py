@@ -168,6 +168,33 @@ _SCHEMA = (
     """,
     "CREATE INDEX IF NOT EXISTS idx_phase_runs_phase ON phase_runs(phase, id)",
     """
+    CREATE TABLE IF NOT EXISTS runs (
+        run_id TEXT PRIMARY KEY,
+        started_at TEXT,
+        finished_at TEXT,
+        status TEXT,
+        candidate_name TEXT,
+        candidate_key TEXT,
+        profile_hash TEXT,
+        resume_file TEXT,
+        dry_run INTEGER,
+        tailoring_mode TEXT,
+        started_from TEXT,
+        phases TEXT,
+        results TEXT,
+        warnings TEXT,
+        totals TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at)",
+    """
+    CREATE TABLE IF NOT EXISTS run_jobs (
+        run_id TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        PRIMARY KEY (run_id, job_id)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS job_outreach (
         job_id TEXT PRIMARY KEY,
         recipient TEXT,
@@ -199,6 +226,10 @@ _VIEW = """
     LEFT JOIN job_outreach o ON o.job_id = j.job_id
     LEFT JOIN job_resumes r ON r.job_id = j.job_id
 """
+
+
+# SQLite files whose schema this process has already created: {path: file identity}.
+_PREPARED_FILES: Dict[str, Optional[int]] = {}
 
 
 class JobsDatabase:
@@ -264,7 +295,21 @@ class JobsDatabase:
         # Postgres has no "CREATE VIEW IF NOT EXISTS"; OR REPLACE is equivalent here.
         return statement.replace("CREATE VIEW IF NOT EXISTS", "CREATE OR REPLACE VIEW")
 
+    def _file_identity(self) -> Optional[int]:
+        try:
+            return self.db_path.stat().st_ino
+        except OSError:
+            return None
+
     def _init_db(self) -> None:
+        # Creating the schema and migrating costs about 25 ms, and a database object is made
+        # for nearly every call (13 in one trivial run). A SQLite file already prepared by
+        # this process is skipped; a deleted or replaced file has a new identity and is
+        # prepared again. Postgres is always checked.
+        if not self.database_url:
+            identity = self._file_identity()
+            if identity is not None and _PREPARED_FILES.get(str(self.db_path)) == identity:
+                return
         with self._connect() as conn:
             if not self.database_url:
                 conn.execute("PRAGMA journal_mode=WAL")
@@ -276,6 +321,8 @@ class JobsDatabase:
             except Exception:
                 # A view is a convenience; the tables are what matter.
                 pass
+        if not self.database_url:
+            _PREPARED_FILES[str(self.db_path)] = self._file_identity()
 
     def _migrate(self, conn) -> None:
         """Add columns introduced after a database was created."""
@@ -283,6 +330,7 @@ class JobsDatabase:
         if self.database_url:
             for column, kind in added.items():
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN IF NOT EXISTS {column} {kind}")
+            conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS candidate_key TEXT")
             # A view's columns cannot be changed in place on Postgres.
             conn.execute("DROP VIEW IF EXISTS job_overview")
             return
@@ -290,6 +338,10 @@ class JobsDatabase:
         for column, kind in added.items():
             if column not in existing:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {kind}")
+        # Runs are keyed by candidate identity (email), not by display name.
+        run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        if "candidate_key" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN candidate_key TEXT")
         # The overview view predates the column; rebuild it to include it.
         conn.execute("DROP VIEW IF EXISTS job_overview")
 
@@ -519,6 +571,101 @@ class JobsDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """), (run_id, phase, status, started_at, finished_at, duration_seconds,
                     json_module.dumps(summary, default=str) if summary else None, started_from))
+
+    # --- Run history ----------------------------------------------------------
+
+    _RUN_JSON = ("phases", "results", "warnings", "totals")
+
+    def save_run(self, run: Dict[str, Any]) -> None:
+        """Insert or update one run; called as it starts, after each phase, and when it ends."""
+        import json as json_module
+
+        values = [run.get(key) for key in ("run_id", "started_at", "finished_at", "status", "candidate_name",
+                                          "candidate_key", "profile_hash", "resume_file")]
+        values.append(None if run.get("dry_run") is None else int(bool(run["dry_run"])))
+        values += [run.get("tailoring_mode"), run.get("started_from")]
+        values += [json_module.dumps(run.get(key), default=str) if run.get(key) is not None else None
+                   for key in self._RUN_JSON]
+        with self._connect() as conn:
+            conn.execute(self._sql("""
+                INSERT INTO runs (run_id, started_at, finished_at, status, candidate_name, candidate_key,
+                                  profile_hash, resume_file, dry_run, tailoring_mode, started_from, phases,
+                                  results, warnings, totals)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (run_id) DO UPDATE SET
+                    started_at = excluded.started_at, finished_at = excluded.finished_at,
+                    status = excluded.status, candidate_name = excluded.candidate_name,
+                    candidate_key = excluded.candidate_key,
+                    profile_hash = excluded.profile_hash, resume_file = excluded.resume_file,
+                    dry_run = excluded.dry_run, tailoring_mode = excluded.tailoring_mode,
+                    started_from = excluded.started_from, phases = excluded.phases,
+                    results = excluded.results, warnings = excluded.warnings, totals = excluded.totals
+            """), values)
+
+    def link_run_jobs(self, run_id: str, job_ids: List[str]) -> None:
+        """Remember which jobs a run found, so a past run's shortlist can be reopened."""
+        ids = [str(job_id) for job_id in dict.fromkeys(job_ids) if job_id]
+        if not ids:
+            return
+        with self._connect() as conn:
+            for job_id in ids:
+                conn.execute(self._sql(
+                    "INSERT INTO run_jobs (run_id, job_id) VALUES (?, ?) ON CONFLICT (run_id, job_id) DO NOTHING"),
+                    (run_id, job_id))
+
+    def list_runs(self, limit: int = 200, candidate: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Newest first. Each run carries its job count and decoded JSON fields."""
+        import json as json_module
+
+        query = ("SELECT r.*, (SELECT COUNT(*) FROM run_jobs j WHERE j.run_id = r.run_id) AS job_count "
+                 "FROM runs r")
+        params: List[Any] = []
+        if candidate:
+            query += " WHERE COALESCE(r.candidate_key, LOWER(r.candidate_name)) = ?"
+            params.append(candidate)
+        query += " ORDER BY r.started_at DESC LIMIT ?"
+        params.append(int(limit))
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(self._sql(query), params).fetchall()]
+        for row in rows:
+            row["candidate_key"] = row.get("candidate_key") or (row.get("candidate_name") or "").casefold() or None
+            row["dry_run"] = None if row.get("dry_run") is None else bool(row["dry_run"])
+            for key in self._RUN_JSON:
+                try:
+                    row[key] = json_module.loads(row[key]) if row.get(key) else None
+                except ValueError:
+                    row[key] = None
+        return rows
+
+    def close_orphaned_runs(self, except_run_id: Optional[str] = None, older_than_seconds: float = 30.0) -> int:
+        """Mark runs still recorded as "running" as interrupted.
+
+        A run only stays "running" if its process died (the window closed, the
+        machine slept, it was killed), because a live run saves its end. The
+        caller must know no run is active: the pipeline lock is held, or nothing
+        is running. Returns how many were closed.
+
+        `older_than_seconds` guards a race the "is anything running?" check cannot: a run
+        may start between that check and this UPDATE, and its brand-new record would be
+        marked dead. A record younger than the grace period is never an orphan.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat()
+        with self._connect() as conn:
+            if except_run_id:
+                cursor = conn.execute(self._sql(
+                    "UPDATE runs SET status = 'interrupted' WHERE status = 'running' AND run_id != ? "
+                    "AND started_at < ?"), (except_run_id, cutoff))
+            else:
+                cursor = conn.execute(self._sql(
+                    "UPDATE runs SET status = 'interrupted' WHERE status = 'running' AND started_at < ?"), (cutoff,))
+            return cursor.rowcount or 0
+
+    def run_job_ids(self, run_id: str) -> List[str]:
+        with self._connect() as conn:
+            return [row["job_id"] for row in conn.execute(
+                self._sql("SELECT job_id FROM run_jobs WHERE run_id = ?"), (run_id,)).fetchall()]
 
     def _store_resumes(self, conn, outputs_dir: Optional[Path], now: str) -> int:
         """Keep each tailored PDF in the database, byte for byte, beside its job."""
@@ -760,6 +907,35 @@ def record_phase(phase: str, status: str, **details: Any) -> None:
         JobsDatabase().record_phase_run(phase, status, **details)
     except Exception as exc:
         Console().print(f"[dim]Run history not recorded: {exc}[/dim]")
+
+
+def save_run(run: Dict[str, Any], job_ids: Optional[List[str]] = None) -> None:
+    """Persist a run record, reporting rather than raising if the database is away."""
+    from rich.console import Console
+
+    try:
+        database = JobsDatabase()
+        database.save_run(run)
+        if job_ids:
+            database.link_run_jobs(run["run_id"], job_ids)
+    except Exception as exc:
+        Console().print(f"[dim]Run record not saved: {exc}[/dim]")
+
+
+def close_orphaned_runs(except_run_id: Optional[str] = None, older_than_seconds: float = 30.0) -> int:
+    """Close runs whose process died. Only call when no run can be active."""
+    try:
+        return JobsDatabase().close_orphaned_runs(except_run_id, older_than_seconds)
+    except Exception:
+        return 0
+
+
+def list_runs(limit: int = 200, candidate: Optional[str] = None) -> List[Dict[str, Any]]:
+    return JobsDatabase().list_runs(limit=limit, candidate=candidate)
+
+
+def run_job_ids(run_id: str) -> List[str]:
+    return JobsDatabase().run_job_ids(run_id)
 
 
 def sync_jobs_db(outputs_dir: Optional[Path] = None, quiet: bool = True) -> Optional[Dict[str, int]]:

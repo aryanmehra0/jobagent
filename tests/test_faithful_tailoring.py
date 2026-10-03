@@ -438,3 +438,108 @@ def test_the_csv_has_a_one_click_link_to_each_resume(tmp_path):
     with exporter.csv_path.open(encoding="utf-8-sig", newline="") as handle:
         row = next(csv.DictReader(handle))
     assert row["Open Resume"] == f'=HYPERLINK("{pdf.resolve()}","Open {pdf.name}")'
+
+
+# ==============================================================================
+# REGRESSIONS FOUND ON A REAL CV (maths in bullets, jobs with no description)
+# ==============================================================================
+
+def _resume_with_script_fragments(path: Path) -> Path:
+    """Bullets holding a subscript (CH4) and a superscript (R2): small text off the baseline."""
+    doc = fitz.open()
+    page = doc.new_page(width=595, height=842)
+
+    def text(x, y, value, size=10, bold=False, color=(0, 0, 0)):
+        page.insert_text((x, y), value, fontname="hebo" if bold else "helv", fontsize=size, color=color)
+
+    text(230, 40, "ASHA VERMA", size=17, bold=True, color=BLUE)
+    text(34, 80, "RESEARCH EXPERIENCE", size=10.5, bold=True, color=BLUE)
+    page.draw_line((34, 83), (560, 83), color=BLUE, width=0.8)
+    text(34, 98, "Sensing Lab", bold=True)
+    text(470, 98, "Jan 2024 - Present", bold=True)
+    y = 112
+    rows = (
+        ("Detected CO and CH", "4", " under humidity drift using a custom detector array", "(sensor fusion)."),
+        ("Trained transformer language models achieving R", "2", " above 0.9 on retrieval benchmarks for", "scientific text."),
+    )
+    for before, fragment, after, second in rows:
+        page.insert_text((37, y), "•", fontname="tiro", fontsize=10)
+        width = fitz.get_text_length(before, fontname="helv", fontsize=10)
+        text(47, y, before)
+        text(47 + width, y + 2.5 if fragment == "4" else y - 3.5, fragment, size=6.5)
+        text(47 + width + 4.5, y, after)
+        y += 12
+        text(47, y, second)
+        y += 14
+    doc.save(str(path))
+    return path
+
+
+def test_subscripts_and_superscripts_stay_inside_their_bullet(tmp_path):
+    layout = faithful.read_layout(_resume_with_script_fragments(tmp_path / "math.pdf"))
+    assert not [line for line in layout.lines if len(line.text.strip()) == 1 and line.size < 8], \
+        "a subscript/superscript became a line of its own"
+    section = next(s for s in layout.sections if s.title == "RESEARCH EXPERIENCE")
+    assert [len(bullet.lines) for entry in section.entries for bullet in entry.bullets] == [2, 2]
+
+
+def test_a_resume_with_maths_in_its_bullets_can_still_be_reordered(tmp_path):
+    source = _resume_with_script_fragments(tmp_path / "math.pdf")
+    job = _job("NLP Research Engineer", "Transformer language models, retrieval benchmarks and scientific text.")
+    result = faithful.tailor_pdf(source, job, tmp_path / "out.pdf")
+    assert result.validation["passed"], result.validation
+    assert result.tailored and result.changes, result.notes
+    assert _words(source) == _words(tmp_path / "out.pdf")
+
+
+def test_relevance_does_not_reward_a_bullet_for_being_long():
+    from job_agent.tailoring.rewriter import relevance
+
+    terms = {"python": 1.0, "rag": 1.0, "llm": 1.0}
+    tight = "Built a Python RAG pipeline for LLM agents."
+    rambling = ("Worked across many teams over several quarters on a wide variety of internal tooling "
+                "tasks including documentation reviews, planning sessions, python scripts, rag notes and llm demos.")
+    assert relevance(tight, terms) > relevance(rambling, terms)
+
+
+def test_a_job_without_a_description_is_ordered_by_role_knowledge_not_just_its_title_words():
+    from job_agent.tailoring.rewriter import job_terms
+
+    bare = _job("Machine Learning Engineer", "")
+    assert {"pytorch", "tensorflow", "deployment"} <= set(job_terms(bare))
+    described = _job("Machine Learning Engineer", "We need someone who loves spreadsheets and writing. " * 4)
+    assert "pytorch" not in job_terms(described), "role knowledge must only fill in for a missing description"
+
+
+def test_the_source_layout_is_read_once_per_file_version(tmp_path):
+    source = _resume(tmp_path / "r.pdf")
+    first = faithful.read_layout(source)
+    assert faithful.read_layout(source) is first
+    other = _resume(tmp_path / "r2.pdf", bullets={"Analyst - Acme  |  Pune": [("Data:", "Built dashboards for", "daily sales review.")]})
+    assert faithful.read_layout(other) is not first
+
+
+def test_worker_processes_produce_the_same_resumes_as_the_serial_path(tmp_path):
+    """Phase 3: tailoring many jobs runs on worker processes. The files must not differ."""
+    from job_agent.tailoring.pipeline import ResumeTailoringPipeline, _faithful_task
+
+    source = _resume(tmp_path / "cv.pdf")
+    jobs = [_job(f"Role {n}", f"We need {skill} experience." ) for n, skill in
+            enumerate(("kubernetes", "python", "sql", "react"))]
+    pipeline = ResumeTailoringPipeline.__new__(ResumeTailoringPipeline)
+
+    class _Compiler:
+        output_dir = tmp_path / "parallel"
+
+    pipeline.compiler = _Compiler()
+    _Compiler.output_dir.mkdir()
+    parallel = pipeline._tailor_in_parallel(source, jobs, workers=2)
+    assert set(parallel) == {job.id for job in jobs}
+
+    for job in jobs:
+        serial_pdf = tmp_path / f"serial_{job.id}.pdf"
+        serial = _faithful_task(source, job, serial_pdf)
+        assert serial.validation.get("passed") == parallel[job.id].validation.get("passed")
+        assert serial.changes == parallel[job.id].changes
+        assert (_Compiler.output_dir / f"resume_{job.id}.pdf").exists()
+        assert _words(serial_pdf) == _words(_Compiler.output_dir / f"resume_{job.id}.pdf")

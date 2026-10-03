@@ -66,6 +66,10 @@ def employer_website(job: JobPosting) -> Optional[str]:
     return None
 
 
+from job_agent.netguard import resolves_to_public_address as _resolves_to_public_address
+from job_agent.netguard import safe_get
+
+
 class CompanySiteCrawler:
     """Reads a company's public pages for the email addresses it publishes."""
 
@@ -80,7 +84,11 @@ class CompanySiteCrawler:
 
     def _get(self, url: str) -> Optional[str]:
         try:
-            response = self.session.get(url, timeout=self.timeout, allow_redirects=True, stream=True)
+            # Company websites come from scraped listings: refuse any hop that is not public.
+            response = safe_get(self.session, url, check=lambda host, port: _resolves_to_public_address(host, port),
+                                timeout=self.timeout, stream=True)
+            if response is None:
+                return None
             content_type = response.headers.get("Content-Type", "")
             if response.status_code != 200 or ("html" not in content_type and "text" not in content_type):
                 response.close()

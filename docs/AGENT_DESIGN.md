@@ -49,10 +49,15 @@ intent:
 **Consistency and concurrency**
 - `runtime.pipeline_lock` / `@exclusive_run` serialize artifact-writing stages across CLI and dashboard processes, so two runs can't interleave writes to the same files.
 - `invalidate_after` archives downstream artifacts when an upstream stage produces a new batch, so a later stage can't silently consume results built from a superseded input.
+- A job the candidate skips is recorded server-side (`user_skips.json`): it is not scored again, and the reasons they wrote are passed to the LLM judge as context about roles they already rejected (never as facts about the candidate).
+- Every listing a sweep drops, whatever the reason (filters, duplicates, already seen), is written to `skipped_jobs.json` and shown in the Sourcing panel.
+- Sourcing runs one worker per job board (requests within a board stay sequential), and tailoring many jobs uses worker processes; both re-install the run's cancellation token so Stop still works.
+- The jobs list the dashboard polls is re-exported only when an input file changed or after 60 s, so polling does not hold the pipeline lock.
 - Checkpointed LLM stages resume only against the identical profile content and judge — a changed profile or provider invalidates the checkpoint rather than reusing stale scores.
 
 **Access and privacy**
 - The dashboard binds to loopback only, full stop (`web/server.py`'s `run_server` hard-refuses any other host) — reaching it remotely goes through a private tunnel plus an explicit login (`DASHBOARD_USERNAME`/`PASSWORD`, `DASHBOARD_ALLOWED_HOSTS`), never a relaxed bind.
+- Credentials are compared as bytes, so a non-ASCII password works and a malformed login attempt is a 401 rather than a crash; `DASHBOARD_ALLOWED_HOSTS` without a login refuses to start.
 - Per-session CSRF token, Host/Origin DNS-rebinding checks, and a hard 25MB/1MB request-size cap on every mutating endpoint.
 - The one place in the codebase that fetches an arbitrary caller-supplied URL from scrape/feed data (`sourcing/details.py`'s detail-page fetch) resolves the hostname first and refuses anything that isn't a public, routable address — the same check `contacts/finder.py` already used for employer-site crawling, reused rather than reinvented.
 - `.env`, `data/profiles/`, and real resumes are gitignored; `ANONYMIZED_TELEMETRY` is forced off in-process regardless of what any dependency tries to set.

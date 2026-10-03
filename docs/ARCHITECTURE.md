@@ -90,13 +90,18 @@ job agent/
 │   ├── llm.py                       # Provider-agnostic LLM client (groq/openai/anthropic/
 │   │                                 # openai_compatible), strict-mode error propagation
 │   ├── runtime.py                   # Cross-process pipeline lock, @exclusive_run, cancellation
+│   ├── netguard.py                  # safe_get: fetch untrusted URLs, re-checking every redirect hop
+│   │                                 # against a public-address test (SSRF guard)
 │   │
 │   ├── config/            normalize.py, schema.py, settings.py
 │   ├── intake/             Phase 1 — cli.py, heuristic.py, layout.py, parser.py,
-│   │                        preferences.py, readiness.py, validator.py
+│   │                        preferences.py, readiness.py, switch.py (archives the previous
+│   │                        candidate's outputs when a different person's resume is loaded),
+│   │                        validator.py
 │   ├── sourcing/           Phase 2 — scraper.py, ats_direct.py, delta_store.py, details.py,
 │   │                        proxy_manager.py, public_feeds.py, relevance.py
-│   ├── evaluation/         Phase 3 — embedder.py, reranker.py, pipeline.py, gaps.py
+│   ├── evaluation/         Phase 3 — embedder.py, embedding_cache.py (job vectors kept between
+│   │                        runs), reranker.py, pipeline.py, gaps.py
 │   ├── tailoring/          Phase 4 — rewriter.py, compiler.py, cover_letter.py, faithful.py,
 │   │                        pipeline.py, regional.py
 │   ├── automation/         Phase 5 — agent.py, browser_session.py, form_filler.py, hitl.py,
@@ -105,6 +110,7 @@ job agent/
 │   │                        a separate workday.py file)
 │   ├── tracking/           Phase 6 — bundle.py, cold_email.py, export.py, inbox.py, manual.py,
 │   │                        outreach.py, pipeline.py, quality.py, records.py, styler.py,
+│   │                        skips.py (jobs the candidate skipped, kept server-side),
 │   │                        supplements.py, tracker.py
 │   ├── interview/          Phase 7 — pipeline.py (module is `interview`, not `prep`)
 │   ├── contacts/           Warm contact leads (separate top-level package, not under tracking/)
@@ -112,10 +118,11 @@ job agent/
 │   ├── storage/            jobs_db.py — the queryable jobs.db/Postgres layer
 │   ├── hosted/             Separate control-plane scaffold — api.py, auth.py, queue.py,
 │   │                        worker.py (queue+auth storage is queue.py, there is no db.py)
-│   └── web/                Flow console — runner.py, server.py, state.py, analytics.py,
+│   └── web/                Flow console — runner.py, run_history.py (per-run persistence),
+│                            server.py, state.py, analytics.py,
 │                            static/{index.html,styles.css,app.js}
 │
-└── tests/                            # 31 test files, 519 tests (513 pass, 6 opt-in browser tests)
+└── tests/                            # 42 test files, 813 tests (807 run in CI, plus 6 opt-in browser tests that pass with JOB_AGENT_BROWSER_TESTS=1)
 ```
 
 ---
@@ -199,7 +206,7 @@ Key models in `schema.py` (all inherit from `StrictModel` with `extra="forbid"`)
 ---
 
 ## 9. Phase 3 — Evaluation & Scoring
-- **Tier 1**: `embedder.py` runs fast, free cosine similarity filtering using `sentence-transformers/all-MiniLM-L6-v2` (or TF-IDF fallback).
+- **Tier 1**: `embedder.py` runs fast, free cosine similarity filtering using `sentence-transformers/all-MiniLM-L6-v2` (or TF-IDF fallback). The cutoff depends on the backend (0.30 for the transformer, 0.15 for TF-IDF) unless `TIER1_THRESHOLD` is set, and job vectors are cached in `embedding_cache.db` keyed by model and text.
 - **Tier 2**: `reranker.py` scores candidates 1.0–10.0 using Groq (`openai/gpt-oss-120b`), OpenAI (`gpt-4o`), Anthropic, or an offline heuristic judge.
 - **Atomic Checkpointing**: Saves progress to `evaluation_checkpoint.json` so interrupted runs resume seamlessly without re-scoring previously evaluated jobs.
 
@@ -330,3 +337,5 @@ Run with `python -m pytest -v`:
 8. **Idempotent Bookkeeping**: Relational and Excel trackers use job IDs to update existing rows rather than creating duplicate entries.
 9. **Exclusive Process Lock**: CLI and UI pipeline runs enforce exclusive locks to prevent corrupting disk artifacts.
 10. **Loopback & Privacy**: Web UI binds only to loopback; all external telemetry is unconditionally disabled.
+11. **One Candidate At A Time**: Candidate identity is the lowercased email (name only as a fallback). Loading a different candidate's resume archives (never deletes) the previous candidate's outputs and resets their database rows behind a backup, and the run history is filtered by that same key.
+12. **Untrusted URLs Stay Off The Local Network**: Job and company URLs come from scraped data. `netguard.safe_get` refuses non-public hosts and re-validates every redirect hop; `/api/file` serves only generated outputs and uploaded resumes, from an allow-list of file types.

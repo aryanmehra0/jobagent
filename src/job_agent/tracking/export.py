@@ -14,10 +14,10 @@ The file is UTF-8 with a byte-order mark so Excel opens company names such as
 from __future__ import annotations
 
 import csv
-import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from job_agent.config.normalize import read_json as _read_json
 from job_agent.config.schema import JobPosting
 from job_agent.config.settings import settings
 
@@ -37,13 +37,6 @@ COLUMNS = [
 ]
 
 _SOURCE_LABELS = {"job_post": "Job post", "company_site": "Company website", "hunter": "Hunter.io"}
-
-
-def _read_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return default
 
 
 def job_row(job: JobPosting) -> Dict[str, str]:
@@ -88,6 +81,14 @@ def _promote_status(current: str, new: str) -> str:
     from job_agent.tracking.records import promote_status
 
     return promote_status(current, new)
+
+
+def _fit(row) -> Optional[float]:
+    """A row's fit score as a number, or None when it has not been scored."""
+    try:
+        return float(row.get("Fit Score")) if str(row.get("Fit Score") or "").strip() else None
+    except (TypeError, ValueError):
+        return None
 
 
 class JobsCsvExporter:
@@ -213,8 +214,19 @@ class JobsCsvExporter:
                 passed = record.get("validation_passed") is True or (record.get("validation_passed") is None and audit.get("passed") is True)
                 valid = passed and hashlib.sha256(pdf.read_bytes()).hexdigest() == record.get("pdf_sha256")
             if valid and row.get("Remote Eligibility") != "Location restricted":
-                row["Application Readiness"] = "Ready for your review"
-                row["Next Step"] = "Review the PDF, eligibility and live listing; open Apply URL to apply."
+                # A resume exists for every job now, so having one says nothing about whether
+                # the job is worth applying to. "Ready" requires the fit score to clear the bar.
+                fit = _fit(row)
+                if fit is None:
+                    row["Application Readiness"] = "Resume ready, not scored"
+                    row["Next Step"] = "A resume is ready, but this job has not been scored. Run evaluation to see if it fits."
+                elif fit < settings.min_match_score:
+                    row["Application Readiness"] = "Resume ready, below threshold"
+                    row["Next Step"] = (f"Scored {fit:g}/10, below your {settings.min_match_score:g}/10 threshold. "
+                                        "A resume is ready if you want to apply anyway.")
+                else:
+                    row["Application Readiness"] = "Ready for your review"
+                    row["Next Step"] = "Review the PDF, eligibility and live listing; open Apply URL to apply."
             elif not row.get("Fit Score"):
                 row["Next Step"] = "Run evaluation; this job has not been scored."
             else:

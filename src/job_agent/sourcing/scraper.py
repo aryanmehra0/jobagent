@@ -11,8 +11,10 @@ constraint was responsible instead of just returning an empty list.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import threading
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -34,6 +36,9 @@ from job_agent.sourcing.public_feeds import PublicFeedIngestion
 
 console = Console()
 
+SKIPPED_FILE = "skipped_jobs.json"
+MAX_SKIPPED_RECORDS = 3000
+
 # JobSpy caps out well before this; requesting more just slows the sweep down.
 MAX_RESULTS_PER_REQUEST = 100
 
@@ -52,6 +57,10 @@ DIRECT_SOURCES = ("greenhouse", "lever", "ashby", "remotive", "arbeitnow", "jobi
 _BLOCK_MARKERS = ("403", "forbidden", "cf-waf", "blocked", "captcha", "429", "too many requests")
 
 
+_COUNTRY_PATCH_LOCK = threading.Lock()
+_COUNTRY_PATCH: Dict[str, Any] = {"depth": 0, "original": None}
+
+
 @contextmanager
 def tolerate_unknown_countries():
     """Stop one foreign listing from discarding a whole JobSpy result page.
@@ -68,20 +77,31 @@ def tolerate_unknown_countries():
         yield
         return
 
-    original = Country.__dict__["from_string"]
-    strict = Country.from_string
+    # Boards are scraped on parallel threads and this patches a class attribute, so the
+    # patch is shared and reference-counted: the first thread in installs it and the last
+    # one out restores it. Per-thread patching would let one thread capture another's
+    # lenient version as the "original" and leave JobSpy permanently altered.
+    with _COUNTRY_PATCH_LOCK:
+        if _COUNTRY_PATCH["depth"] == 0:
+            original = Country.__dict__["from_string"]
+            strict = Country.from_string
 
-    def lenient(cls, country_str):
-        try:
-            return strict(country_str)
-        except ValueError:
-            return cls.WORLDWIDE
+            def lenient(cls, country_str):
+                try:
+                    return strict(country_str)
+                except ValueError:
+                    return cls.WORLDWIDE
 
-    Country.from_string = classmethod(lenient)
+            _COUNTRY_PATCH["original"] = original
+            Country.from_string = classmethod(lenient)
+        _COUNTRY_PATCH["depth"] += 1
     try:
         yield
     finally:
-        Country.from_string = original
+        with _COUNTRY_PATCH_LOCK:
+            _COUNTRY_PATCH["depth"] -= 1
+            if _COUNTRY_PATCH["depth"] == 0:
+                Country.from_string = _COUNTRY_PATCH["original"]
 
 
 class _BlockDetector(logging.Handler):
@@ -121,6 +141,8 @@ class OmnichannelScraper:
         self.candidate_profile = candidate_profile
         # Counts why postings were discarded, reported at the end of the sweep.
         self.filter_stats: Counter = Counter()
+        # One record per job a filter dropped, so "why was this skipped?" has an answer.
+        self.skipped: List[Dict[str, Any]] = []
         # Boards that refused a request this sweep. Retrying them for every
         # domain and location only adds latency and further blocks.
         self.blocked_boards: Dict[str, str] = {}
@@ -131,7 +153,7 @@ class OmnichannelScraper:
         return board in self.blocked_boards
 
     @staticmethod
-    def configuration_warnings(params: SearchParameters) -> List[str]:
+    def configuration_warnings(params: SearchParameters, profile_years: Optional[float] = None) -> List[str]:
         """Settings that will make a sweep slow or empty, detectable before it starts."""
         from job_agent.config.schema import CITY_COUNTRIES
 
@@ -165,6 +187,24 @@ class OmnichannelScraper:
                 "Only remote roles are selected. Searching specific cities "
                 f"({', '.join(cities)}) as well mostly re-finds the same remote listings."
             )
+        # `desired_experience_years` is the level this search is aimed at, but scoring judges the
+        # candidate by what the resume shows. A wide gap means the search looks for roles the judge
+        # will then mark down (or up), so say so instead of letting it stay silent.
+        if profile_years is not None and abs(params.desired_experience_years - profile_years) >= 2.0:
+            warnings.append(
+                f"Your search is aimed at roles for {params.desired_experience_years:g} years of experience, but "
+                f"your resume shows {profile_years:g}. Scoring uses the resume, so roles at the higher level will "
+                "score lower. Change 'desired_experience_years' in your search settings if that is not intended."
+            )
+
+        from job_agent.sourcing.relevance import suspicious_role_words
+
+        for role in params.target_domains:
+            for word, likely in suspicious_role_words(role):
+                warnings.append(
+                    f"Target role '{role}' contains '{word}', which looks like a typo for '{likely}'. "
+                    "A misspelled role matches no postings."
+                )
         return warnings
 
     # --- Normalization --------------------------------------------------------
@@ -194,7 +234,7 @@ class OmnichannelScraper:
             job_url = clean_text(value("job_url")) or clean_text(value("job_url_direct"))
 
             if not title or not company or not job_url:
-                self.filter_stats["incomplete_row"] += 1
+                self._reject("incomplete_row", None, title=title, company=company, url=job_url)
                 continue
 
             description = value("description")
@@ -229,7 +269,8 @@ class OmnichannelScraper:
                         work_mode=work_mode,
                         salary_min=_as_float(value("min_amount")),
                         salary_max=_as_float(value("max_amount")),
-                        salary_currency=clean_text(value("currency")) or "USD",
+                        # A blank currency is unknown, not USD: assuming one compared rupee bands to a dollar floor.
+                        salary_currency=clean_text(value("currency")) or None,
                         job_type=clean_text(value("job_type")) or None,
                         source=clean_text(value("site")) or default_source,
                         apply_url=apply_url,
@@ -238,7 +279,8 @@ class OmnichannelScraper:
                     )
                 )
             except Exception as exc:  # pydantic ValidationError and friends
-                self.filter_stats["invalid_row"] += 1
+                self._reject("invalid_row", None, title=title, company=company, url=job_url,
+                             detail=str(exc)[:160])
                 console.print(f"[dim]Skipped malformed listing from {default_source}: {exc}[/dim]")
 
         return postings
@@ -255,37 +297,60 @@ class OmnichannelScraper:
             return []
         import jobspy
 
-        results: List[JobPosting] = []
-        boards = self.params.job_boards
+        boards = list(dict.fromkeys(self.params.job_boards))
         locations = self.params.locations or ["Remote"]
         per_request = min(self.params.max_results_per_board, MAX_RESULTS_PER_REQUEST)
+        console.print(
+            f"[bold cyan]Sourcing:[/bold cyan] {len(self.params.target_domains)} role(s) x "
+            f"{len(locations)} location(s) across [yellow]{', '.join(boards)}[/yellow], "
+            "one worker per board"
+        )
 
-        for domain in self.params.target_domains:
-            queried_locationless: set[str] = set()
-            for location in locations:
-                console.print(
-                    f"[bold cyan]Sourcing:[/bold cyan] '{domain}' in '{location}' "
-                    f"across [yellow]{', '.join(boards)}[/yellow]"
-                )
-                for board in boards:
-                    # Stop takes effect before the next request; the one in flight
-                    # finishes, since JobSpy offers no way to abort it cleanly.
-                    check_cancelled()
-                    if self.is_board_blocked(board):
-                        continue
-                    # Bayt currently ignores location. Querying it once for every
-                    # city repeats the same network request and increases blocking.
-                    if board == "bayt" and board in queried_locationless:
-                        continue
-                    if board == "bayt":
-                        queried_locationless.add(board)
-                    results.extend(
-                        self._scrape_single_board(
-                            jobspy, board=board, domain=domain, location=location, results_wanted=per_request
-                        )
-                    )
+        def sweep_board(board: str, cancel_event) -> List[JobPosting]:
+            """Every (role, location) query for one board, in order, on this thread."""
+            from job_agent.runtime import cancellation
 
-        return results
+            found: List[JobPosting] = []
+            with cancellation(cancel_event) if cancel_event is not None else contextlib.nullcontext():
+                for domain in self.params.target_domains:
+                    queried_locationless = False
+                    for location in locations:
+                        # Stop takes effect before the next request; the one in flight
+                        # finishes, since JobSpy offers no way to abort it cleanly.
+                        check_cancelled()
+                        if self.is_board_blocked(board):
+                            return found
+                        # Bayt currently ignores location. Querying it once for every
+                        # city repeats the same network request and increases blocking.
+                        if board == "bayt":
+                            if queried_locationless:
+                                continue
+                            queried_locationless = True
+                        found.extend(self._scrape_single_board(
+                            jobspy, board=board, domain=domain, location=location,
+                            results_wanted=per_request))
+            return found
+
+        # Boards are independent sites with their own sticky proxy session, rate limit and
+        # block state, so each gets one worker and they no longer wait on each other. Within
+        # a board requests stay sequential, which keeps the request rate per site unchanged.
+        from concurrent.futures import ThreadPoolExecutor
+
+        from job_agent.runtime import current_cancellation
+
+        cancel_event = current_cancellation()
+        with ThreadPoolExecutor(max_workers=max(1, len(boards)), thread_name_prefix="board") as pool:
+            futures = [pool.submit(sweep_board, board, cancel_event) for board in boards]
+            collected: List[List[JobPosting]] = []
+            first_error: Optional[BaseException] = None
+            for future in futures:
+                try:
+                    collected.append(future.result())
+                except BaseException as exc:  # noqa: BLE001 - re-raised below once every worker has stopped
+                    first_error = first_error or exc
+        if first_error is not None:
+            raise first_error
+        return [job for board_jobs in collected for job in board_jobs]
 
     def _scrape_single_board(
         self,
@@ -358,6 +423,21 @@ class OmnichannelScraper:
 
     # --- Filtering ------------------------------------------------------------
 
+    def _reject(self, reason: str, job: Optional[JobPosting], **fields: Any) -> None:
+        """Count a dropped listing and keep a record of which one and why."""
+        self.filter_stats[reason] += 1
+        if len(self.skipped) >= MAX_SKIPPED_RECORDS:
+            return
+        self.skipped.append({
+            "reason": reason,
+            "title": job.title if job else fields.get("title", ""),
+            "company": job.company if job else fields.get("company", ""),
+            "location": job.location if job else "",
+            "source": job.source if job else "",
+            "url": job.job_url if job else fields.get("url", ""),
+            **({"detail": fields["detail"]} if fields.get("detail") else {}),
+        })
+
     def _passes_filters(self, job: JobPosting) -> bool:
         """Apply the `searches.yaml` constraints the boards do not enforce themselves.
 
@@ -370,12 +450,12 @@ class OmnichannelScraper:
 
             # Company feeds are matched by title when fetched; boards are not.
             if not title_matches(job.title, self.params.target_domains):
-                self.filter_stats["off_target"] += 1
+                self._reject("off_target", job)
                 return False
 
         if job.work_mode not in self.params.selected_work_modes:
             reason = "not_remote" if self.params.selected_work_modes == ["remote"] else "work_mode"
-            self.filter_stats[reason] += 1
+            self._reject(reason, job)
             return False
 
         if job.work_mode in {"onsite", "hybrid"} and self.params.onsite_countries:
@@ -386,7 +466,7 @@ class OmnichannelScraper:
             # confirmed eligible, so it is excluded from automatic processing.
             eligible = location_in_countries(job.location, self.params.onsite_countries)
             if eligible is not True:
-                self.filter_stats["outside_onsite_countries"] += 1
+                self._reject("outside_onsite_countries", job)
                 return False
 
         if job.work_mode == "remote" and self.candidate_profile is not None:
@@ -394,14 +474,14 @@ class OmnichannelScraper:
             from job_agent.tailoring.regional import remote_eligibility
             eligibility, _ = remote_eligibility(job, auth.current_country)
             if eligibility == "Location restricted":
-                self.filter_stats["outside_remote_eligibility"] += 1
+                self._reject("outside_remote_eligibility", job)
                 return False
             if auth.remote_worldwide is False:
                 from job_agent.config.schema import location_in_countries
 
                 allowed = list(auth.authorized_countries)
                 if allowed and location_in_countries(job.location, allowed) is False:
-                    self.filter_stats["outside_remote_eligibility"] += 1
+                    self._reject("outside_remote_eligibility", job)
                     return False
 
         if self.params.min_salary is not None and self._same_currency(job):
@@ -409,18 +489,18 @@ class OmnichannelScraper:
             # 175k floor, even though its lower bound does not.
             ceiling = job.salary_max if job.salary_max is not None else job.salary_min
             if ceiling is not None and ceiling < self.params.min_salary:
-                self.filter_stats["below_min_salary"] += 1
+                self._reject("below_min_salary", job)
                 return False
 
         age_hours = job.age_hours()
         if age_hours is not None and age_hours > self.params.hours_old:
-            self.filter_stats["too_old"] += 1
+            self._reject("too_old", job)
             return False
         if age_hours is None and job.source in DIRECT_SOURCES:
             # Job boards apply the time window server-side, so an undated board
             # listing is still inside it. A company feed returns every open role,
             # so an undated one there could be months old.
-            self.filter_stats["undated"] += 1
+            self._reject("undated", job)
             return False
 
         return True
@@ -486,6 +566,7 @@ class OmnichannelScraper:
         """
         target_output = output_file or (settings.outputs_dir / "scraped_jobs.json")
         self.filter_stats.clear()
+        self.skipped.clear()
 
         if self.candidate_profile is None and settings.profile_path.is_file():
             try:
@@ -507,7 +588,8 @@ class OmnichannelScraper:
             console.print(f"Minimum salary : {self.params.min_salary:,} {self.params.salary_currency}")
         self.blocked_boards.clear()
         self.board_errors.clear()
-        for warning in self.configuration_warnings(self.params):
+        for warning in self.configuration_warnings(
+                self.params, getattr(self.candidate_profile, "years_of_experience", None)):
             console.print(f"[bold yellow]Check your settings:[/bold yellow] {warning}")
 
         aggregated: List[JobPosting] = []
@@ -559,8 +641,24 @@ class OmnichannelScraper:
 
         filtered = [job for job in aggregated if self._passes_filters(job)]
         deduped, in_sweep_duplicates = self._deduplicate(filtered)
+        kept_ids = {job.id for job in deduped}
+        for job in filtered:
+            if job.id not in kept_ids:
+                self._reject("duplicate_in_sweep", job, detail="The same role was found on another board or search")
+        # If the profile now belongs to a different candidate than the one these job
+        # statuses were produced for, reopen them so this sweep can hand them to the
+        # new profile instead of reporting "nothing new".
+        from job_agent.sourcing.delta_store import profile_identity
+        reopened = self.delta_store.note_profile(profile_identity(settings.profile_path))
+        if reopened:
+            console.print(f"[cyan]The profile is for a different candidate than the one these jobs were judged "
+                          f"for; {reopened} earlier job(s) are reopened and will be scored again if they still match.[/cyan]")
         unseen = self.delta_store.filter_unseen(deduped)
         previously_seen = len(deduped) - len(unseen)
+        unseen_ids = {job.id for job in unseen}
+        for job in deduped:
+            if job.id not in unseen_ids:
+                self._reject("already_seen", job, detail="Found by an earlier search")
 
         self._print_summary(raw_count, in_sweep_duplicates, previously_seen, unseen)
 
@@ -597,6 +695,8 @@ class OmnichannelScraper:
         target_output.write_text(
             json.dumps([job.model_dump() for job in unseen + backlog], indent=2), encoding="utf-8"
         )
+        (target_output.parent / SKIPPED_FILE).write_text(
+            json.dumps(self.skipped, indent=1, ensure_ascii=False), encoding="utf-8")
         from collections import Counter
         from job_agent.config.normalize import utc_now_iso
         counts = Counter(job.source for job in aggregated)
@@ -604,7 +704,7 @@ class OmnichannelScraper:
             "checked_at": utc_now_iso(), "raw_listings": raw_count, "new_jobs": len(unseen),
             "backlog_jobs": len(backlog), "latest_matching_jobs": len(latest),
             "previously_seen": previously_seen, "duplicates": in_sweep_duplicates + previously_seen,
-            "filtered": dict(self.filter_stats), "errors": source_errors,
+            "filtered": dict(self.filter_stats), "skipped_file": SKIPPED_FILE, "errors": source_errors,
             "description_fetch": detail_report,
             "boards": {board: {"status": "blocked" if board in self.blocked_boards else
                                 "failed" if "job_boards" in source_errors or board in self.board_errors else "completed",
@@ -648,6 +748,7 @@ class OmnichannelScraper:
             return []
         statuses = self.delta_store.statuses([job.id for job in previous])
         stats_before = self.filter_stats.copy()
+        skipped_before = len(self.skipped)
         backlog = [
             job for job in previous
             if job.id not in exclude
@@ -657,6 +758,7 @@ class OmnichannelScraper:
         ]
         # Re-filtering the backlog must not inflate this sweep's funnel.
         self.filter_stats = stats_before
+        del self.skipped[skipped_before:]
         return backlog
 
     def _within_window_since_discovery(self, job: JobPosting) -> bool:
@@ -713,8 +815,13 @@ class OmnichannelScraper:
             "too_old": "Dropped: older than freshness window",
             "undated": "Dropped: company feed listing with no posting date",
             "off_target": "Dropped: title is not one of the target roles",
+            "work_mode": "Dropped: work arrangement you did not select",
+            "outside_onsite_countries": "Dropped: on-site role outside your onsite countries (or location unknown)",
+            "outside_remote_eligibility": "Dropped: remote role restricted to other countries",
             "incomplete_row": "Dropped: missing title/company/URL",
             "invalid_row": "Dropped: failed schema validation",
+            "duplicate_in_sweep": "Dropped: same role found again on another board or search",
+            "already_seen": "Dropped: found by an earlier search",
         }
         for key, label in labels.items():
             if self.filter_stats.get(key):

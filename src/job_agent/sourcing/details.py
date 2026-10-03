@@ -97,23 +97,8 @@ def extract_description(html: str) -> str:
     return ""
 
 
-def _resolves_to_public_address(hostname: str, port: int) -> bool:
-    """Whether every address a hostname resolves to is a public, routable one.
-
-    Refuses loopback/private/link-local targets so a job_url from scrape/feed
-    data can't be used to reach an internal service. Split out from
-    _fetch_description so tests can substitute a fake resolver instead of
-    depending on live DNS for a placeholder domain (mirrors the same check in
-    contacts/finder.py's CompanySiteCrawler._get).
-    """
-    import ipaddress
-    import socket
-
-    try:
-        addresses = socket.getaddrinfo(hostname, port)
-    except OSError:
-        return False
-    return bool(addresses) and all(ipaddress.ip_address(item[4][0]).is_global for item in addresses)
+from job_agent.netguard import resolves_to_public_address as _resolves_to_public_address  # noqa: E402
+from job_agent.netguard import safe_get  # noqa: E402
 
 
 def _fetch_description(job: JobPosting, session, proxy: str | None = None) -> str:
@@ -131,13 +116,18 @@ def _fetch_description(job: JobPosting, session, proxy: str | None = None) -> st
     if not _resolves_to_public_address(parsed.hostname, port):
         return ""
 
-    with session.get(
-        job.job_url,
+    # Every redirect hop is re-checked: a public page must not be able to bounce us to an internal one.
+    response = safe_get(
+        session, job.job_url,
+        check=lambda host, port: _resolves_to_public_address(host, port),
         timeout=10,
         stream=True,
         proxies={"http": proxy, "https": proxy} if proxy else None,
         headers={"User-Agent": "Mozilla/5.0 JobAgent/0.2 (+local job search assistant)"},
-    ) as response:
+    )
+    if response is None:
+        return ""
+    with response:
         response.raise_for_status()
         content_type = (response.headers.get("content-type") or "").lower()
         if content_type and not any(part in content_type for part in ("html", "text", "json")):
@@ -181,6 +171,64 @@ def enrich_job_details(jobs: list[JobPosting], session=None, proxy: str | None =
         except (requests.RequestException, ValueError):
             report["unavailable"] += 1
         result.append(job)
+    return result, report
+
+
+def _can_fetch(job: JobPosting) -> bool:
+    """Whether a listing's page may be fetched for its description (LinkedIn needs a real view URL)."""
+    parsed = urlsplit(job.job_url)
+    if job.source == "linkedin":
+        return (parsed.hostname or "").endswith(".linkedin.com") and bool(re.fullmatch(r"/jobs/view/\d+/?", parsed.path))
+    return parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+
+
+def enrich_missing_descriptions(jobs: list[JobPosting], *, workers: int = 4, proxy: str | None = None,
+                                minimum_chars: int = DESCRIPTION_MIN_CHARS):
+    """Fetch a description for every listing that came without a usable one.
+
+    Listing pages are network-bound, so a few are fetched at a time; one at a
+    time, a hundred listings with a ten-second timeout each is a quarter of an
+    hour of waiting. Same safety as `enrich_job_details` (public hosts only,
+    bounded reads). Returns (jobs, report).
+    """
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    report = {"requested": 0, "fetched": 0, "unavailable": 0}
+    targets = [i for i, job in enumerate(jobs) if _thin(job.description, minimum_chars)]
+    targets = [i for i in targets if _can_fetch(jobs[i])]
+    report["unavailable"] += sum(1 for job in jobs if _thin(job.description, minimum_chars)) - len(targets)
+    if not targets:
+        return jobs, report
+    report["requested"] = len(targets)
+
+    local = threading.local()
+
+    def fetch(index: int) -> tuple[int, str]:
+        if not hasattr(local, "session"):
+            local.session = requests.Session()
+        try:
+            return index, _fetch_description(jobs[index], local.session, proxy=proxy)
+        except (requests.RequestException, ValueError):
+            return index, ""
+
+    result = list(jobs)
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
+    try:
+        futures = [pool.submit(fetch, index) for index in targets]
+        for done in as_completed(futures):
+            check_cancelled()
+            index, description = done.result()
+            if not description:
+                report["unavailable"] += 1
+                continue
+            job = result[index]
+            result[index] = JobPosting.model_validate({
+                **job.model_dump(), "description": description,
+                "contacts": [c.model_dump() for c in job.contacts] + job_post_contacts(description)})
+            report["fetched"] += 1
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
     return result, report
 
 

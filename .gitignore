@@ -3,6 +3,7 @@
 
 # Generated pipeline artifacts
 data/outputs/
+data/*.log
 data/profiles/
 data/browser_profile/
 data/proxies.txt

@@ -31,6 +31,11 @@ def cancellation(event: threading.Event):
         _local.cancel_event = previous
 
 
+def current_cancellation():
+    """The cancellation event of this thread, or None; lets a helper thread inherit it."""
+    return getattr(_local, "cancel_event", None)
+
+
 def check_cancelled() -> None:
     """Raise `RunCancelled` if a Stop was requested for this thread's run.
 

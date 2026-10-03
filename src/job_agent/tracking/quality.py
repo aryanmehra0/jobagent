@@ -7,16 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from job_agent.config.normalize import read_json as _read_json
 from job_agent.config.settings import settings
 from job_agent.intake.validator import load_and_verify_profile
 from job_agent.tracking.bundle import validate_application_pack
-
-
-def _read_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return default
 
 
 def _read_rows(path: Path) -> list[dict[str, str]]:

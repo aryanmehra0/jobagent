@@ -2,6 +2,7 @@ import json
 from unittest.mock import Mock
 
 import pytest
+from tests.test_tailoring import candidate_profile  # noqa: F401  (fixture)
 import requests
 
 from job_agent.llm import GroqClient, LLMError
@@ -124,3 +125,45 @@ def test_malformed_json_rejected_by_groq_is_resampled():
     session.post.side_effect = [bad, response()]
     assert GroqClient(["one"], "m", session=session).complete([], json_mode=True) == '{"ok":true}'
     assert session.post.call_count == 2
+
+
+def test_request_too_large_retries_with_a_smaller_output_allowance():
+    # Groq counts prompt + reserved output against one per-request limit, so an
+    # oversized max_tokens must shrink instead of failing the whole phase.
+    session = Mock()
+    session.post.side_effect = [response(413), response(413), response()]
+    client = GroqClient(["one"], "test", session=session)
+    assert client.complete([], json_mode=True, max_tokens=8000) == '{"ok":true}'
+    sent = [call.kwargs["json"]["max_completion_tokens"] for call in session.post.call_args_list]
+    assert sent == [8000, 4000, 2000]
+
+
+def test_request_too_large_gives_an_actionable_error_not_a_model_access_hint():
+    session = Mock()
+    session.post.return_value = response(413)
+    with pytest.raises(LLMError, match="too large") as error:
+        GroqClient(["one"], "test", session=session).complete([], max_tokens=1500)
+    assert "model access" not in str(error.value)
+    assert session.post.call_count == 1
+
+
+def test_a_score_is_labelled_with_the_model_that_actually_judged_it(monkeypatch, candidate_profile):
+    """When Groq's daily limit moves the client to its fallback model, the label must follow."""
+    from job_agent import llm
+    from job_agent.config.schema import JobPosting
+    from job_agent.evaluation.reranker import LLMReranker
+
+    job = JobPosting(id="j1", title="AI Engineer", company="Acme", location="Remote", is_remote=True,
+                     job_url="https://example.com/1", source="test", description="Build things in Python.")
+    reranker = LLMReranker(provider="groq")
+    monkeypatch.setattr(reranker, "_call_groq", lambda *a, **k: {
+        "fit_score": 6.0, "technical_score": 6.0, "seniority_score": 6.0, "reasoning": "ok",
+        "matching_skills": [], "missing_skills": []})
+
+    class Client:
+        last_model = "openai/gpt-oss-20b"
+
+    monkeypatch.setattr(llm, "_client", Client())
+    assert LLMReranker.evaluate_job(reranker, candidate_profile, job, 0.5).scored_by == "groq:openai/gpt-oss-20b"
+    monkeypatch.setattr(llm, "_client", None)
+    assert LLMReranker.evaluate_job(reranker, candidate_profile, job, 0.5).scored_by.startswith("groq:")

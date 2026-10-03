@@ -59,21 +59,84 @@ _TERM_STOPWORDS = {
 }
 
 
+# What a posting for a given kind of role typically asks for. Used only when a
+# listing carries no usable description, so a resume can still be ordered for
+# the role instead of by the title's two or three words. These terms rank the
+# candidate's OWN content; they are never written into the resume, so nothing
+# the candidate does not have can be claimed.
+_ROLE_KNOWLEDGE = (
+    (r"\b(ml|machine learning|deep learning|neural|computer vision|nlp)\b",
+     "python pytorch tensorflow scikit-learn keras transformers model training evaluation deployment inference neural"),
+    (r"\b(ai|artificial intelligence|genai|generative|llm|agentic|agents?|rag)\b",
+     "llm rag agents prompt langchain retrieval embeddings transformers python api deployment evaluation"),
+    (r"\b(data scientist|data science|analytics|analyst)\b",
+     "python sql pandas numpy statistics visualization modeling analysis dashboards experiments tableau"),
+    (r"\bdata engineer",
+     "sql python spark airflow etl pipelines warehouse kafka cloud aws data"),
+    (r"\b(backend|back-end|back end|software engineer|software developer|sde|api)\b",
+     "python java api rest microservices database sql docker aws testing git"),
+    (r"\b(frontend|front-end|front end|react|ui)\b",
+     "javascript typescript react html css responsive components testing ui"),
+    (r"\bfull[- ]?stack",
+     "javascript typescript react node python api database sql docker"),
+    (r"\b(devops|sre|platform|cloud|infrastructure)\b",
+     "docker kubernetes aws ci cd terraform linux monitoring automation deployment"),
+    (r"\b(product manager|product management|apm|product owner)\b",
+     "roadmap stakeholders metrics analytics strategy users prioritization sql experiments product"),
+    (r"\b(research|scientist|phd)\b",
+     "research papers experiments publications evaluation python models analysis"),
+    (r"\b(security|infosec|cyber)\b",
+     "security vulnerabilities encryption authentication threat network testing"),
+    (r"\b(android|ios|mobile)\b",
+     "android ios kotlin swift mobile api ui testing"),
+    (r"\b(qa|sdet|test engineer|quality)\b",
+     "testing automation selenium pytest ci regression api quality"),
+)
+_THIN_DESCRIPTION_CHARS = 80
+
+
+def role_knowledge_terms(title: str) -> Dict[str, float]:
+    """Typical requirement words for the kinds of role a title names."""
+    lowered = (title or "").lower()
+    terms: Dict[str, float] = {}
+    for pattern, words in _ROLE_KNOWLEDGE:
+        if re.search(pattern, lowered):
+            for word in words.split():
+                terms[word] = 1.5
+    return terms
+
+
 def job_terms(job: JobPosting) -> Dict[str, float]:
-    """Words of a posting weighted by where they appear: the title counts most."""
+    """Words of a posting weighted by where they appear: the title counts most.
+
+    A listing with no real description falls back on role knowledge for its
+    title, so the ordering is still meaningful.
+    """
     weights: Dict[str, float] = {}
     for text, weight in ((job.title, 3.0), (job.description, 1.0)):
         for word in re.findall(r"[a-z][a-z0-9+#./-]{1,}", (text or "").lower()):
             word = word.strip("./-")
             if len(word) > 1 and word not in _TERM_STOPWORDS:
                 weights[word] = weights.get(word, 0.0) + weight
+    if len((job.description or "").strip()) < _THIN_DESCRIPTION_CHARS:
+        for word, weight in role_knowledge_terms(job.title).items():
+            weights[word] = max(weights.get(word, 0.0), weight)
     # Diminishing returns: a word repeated 30 times in boilerplate is not 30x relevant.
     return {word: min(weight, 6.0) for word, weight in weights.items()}
 
 
 def relevance(text: str, terms: Dict[str, float]) -> float:
+    """How well a block of the candidate's text matches a posting's terms.
+
+    The matched weight is damped by length. Summing alone made the longest
+    bullet win for being long, not for being relevant, so a rambling bullet
+    with two matching words outranked a tight one with three.
+    """
     words = set(re.findall(r"[a-z][a-z0-9+#./-]{1,}", (text or "").lower()))
-    return sum(terms.get(word.strip("./-"), 0.0) for word in words)
+    if not words:
+        return 0.0
+    matched = sum(terms.get(word.strip("./-"), 0.0) for word in words)
+    return matched / (len(words) ** 0.35)
 
 
 def skill_in_posting(skill: str, job: JobPosting) -> bool:

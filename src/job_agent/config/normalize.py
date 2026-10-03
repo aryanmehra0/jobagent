@@ -381,3 +381,17 @@ def strip_html(value: Optional[str]) -> str:
     lines = [clean_text(line) for line in text.splitlines()]
     joined = "\n".join(line for line in lines if line)
     return _NEWLINES_RE.sub("\n\n", joined).strip()
+
+
+def read_json(path, default=None):
+    """Read a JSON file, returning `default` when it is missing, unreadable or corrupt.
+
+    One implementation for the artifact readers that each used to carry their own copy.
+    """
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return default

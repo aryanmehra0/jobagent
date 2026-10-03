@@ -90,7 +90,10 @@ def test_sourcing_stops_before_the_next_board_request(tmp_path: Path, monkeypatc
     with cancellation(event), pytest.raises(RunCancelled):
         scraper.scrape_job_boards()
 
-    assert fake.calls == 2, "the request in flight finishes; no further request starts"
+    # Boards run on parallel workers, so a request on the other board may already be in flight
+    # when Stop lands; it finishes, but no worker starts another one afterwards.
+    boards = 2
+    assert 2 <= fake.calls <= 2 + (boards - 1), "requests in flight finish; no further request starts"
 
 
 def test_a_cancelled_sweep_writes_no_partial_results(tmp_path: Path, monkeypatch):

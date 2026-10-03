@@ -27,6 +27,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from job_agent.config.normalize import read_json as _read_json
 from job_agent.config.settings import settings
 from job_agent.runtime import exclusive_run
 from job_agent.intake.cli import configure_cli, load_search_parameters
@@ -809,7 +810,7 @@ def _run_pipeline_sync(
     threshold: Optional[float],
     limit: Optional[int],
     assume_yes: bool,
-    mode: str,
+    mode: Optional[str],
     cover_letter: bool,
     title: str,
 ) -> dict:
@@ -865,7 +866,8 @@ def _run_pipeline_sync(
 @click.option("--cover-letter", is_flag=True, help="Include optional cover letters during tailoring.")
 @click.option("--resume", "-r", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None)
 @click.option("--dry-run/--live", default=True, help="Default: prepare results without submitting. --live enables applications.")
-@click.option("--mode", type=click.Choice(["auto", "faithful", "generated", "regional"]), default="regional", show_default=True)
+@click.option("--mode", type=click.Choice(["auto", "faithful", "generated", "regional"]), default=None,
+              help="Default: TAILORING_MODE setting (auto - keeps your own PDF's fonts, colors and one-page layout, reordering only).")
 @click.option("--skip-intake", is_flag=True, help="Reuse the existing profile.json instead of re-parsing a resume.")
 @click.option("--threshold", "-t", type=click.FloatRange(0.0, 1.0), default=None, help="Tier 1 cutoff.")
 @click.option("--limit", "-n", type=click.IntRange(1), default=None, help="Cap jobs per phase after evaluation.")
@@ -878,7 +880,7 @@ def run_pipeline_command(
     threshold: Optional[float],
     limit: Optional[int],
     assume_yes: bool,
-    mode: str = "regional",
+    mode: Optional[str] = None,
     cover_letter: bool = False,
 ) -> None:
     """Run phases 1 through 7 end to end.
@@ -897,7 +899,8 @@ def run_pipeline_command(
 @click.option("--resume", "-r", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None,
               help="Optional new resume to parse before the run.")
 @click.option("--dry-run/--live", default=True, help="Default: prepare results without submitting. --live enables applications.")
-@click.option("--mode", type=click.Choice(["auto", "faithful", "generated", "regional"]), default="regional", show_default=True)
+@click.option("--mode", type=click.Choice(["auto", "faithful", "generated", "regional"]), default=None,
+              help="Default: TAILORING_MODE setting (auto - keeps your own PDF's fonts, colors and one-page layout, reordering only).")
 @click.option("--threshold", "-t", type=click.FloatRange(0.0, 1.0), default=None, help="Tier 1 cutoff.")
 @click.option("--limit", "-n", type=click.IntRange(1), default=None, help="Cap jobs per phase after evaluation.")
 @click.option("--cover-letter/--no-cover-letter", default=True, show_default=True,
@@ -910,7 +913,7 @@ def daily_command(
     threshold: Optional[float],
     limit: Optional[int],
     assume_yes: bool,
-    mode: str = "regional",
+    mode: Optional[str] = None,
     cover_letter: bool = True,
 ) -> None:
     """Daily search-to-download workflow for preparing today's application pack."""
@@ -1469,14 +1472,6 @@ def reset_command(delta: bool, outputs: bool) -> None:
                 path.unlink()
                 removed += 1
         console.print(f"[green]Removed {removed} generated artifact(s). The Excel tracker was left intact.[/green]")
-
-
-def _read_json(path: Path, default):
-    """Read a JSON artifact, returning `default` if it is missing or corrupt."""
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
 
 
 def _module_exists(name: str) -> bool:

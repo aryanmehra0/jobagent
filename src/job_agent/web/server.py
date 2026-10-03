@@ -59,6 +59,99 @@ def _allowed_hosts() -> set:
     return {part.strip().lower() for part in raw.split(",") if part.strip()}
 
 
+# The jobs list was rebuilt from every artifact, under the pipeline lock, on every GET.
+# The dashboard polls it, so the lock was held almost continuously and a run could not start.
+# The export is now redone only when an input file changed or the dates it derives could have moved.
+_EXPORT_MAX_AGE_SECONDS = 60.0
+_OWN_OUTPUTS = ("jobs_master", "jobs_latest", "applications_", ".pipeline.lock", "application_pack")
+_export_state: Dict[str, Any] = {"signature": None, "at": 0.0}
+
+
+def _outputs_signature() -> Tuple:
+    """A cheap fingerprint of everything the export reads: names and mtimes, not contents."""
+    entries = []
+    try:
+        with os.scandir(settings.outputs_dir) as scan:
+            for entry in scan:
+                if entry.name.startswith(_OWN_OUTPUTS) or entry.name == "history":
+                    continue
+                stat = entry.stat()
+                entries.append((entry.name, stat.st_mtime_ns, stat.st_size if entry.is_file() else 0))
+    except OSError:
+        return ("unreadable",)
+    try:
+        entries.append(("profile", settings.profile_path.stat().st_mtime_ns))
+    except OSError:
+        pass
+    return tuple(sorted(entries))
+
+
+def _export_is_stale() -> bool:
+    import time
+
+    if _export_state["signature"] is None:
+        return True
+    if time.monotonic() - _export_state["at"] > _EXPORT_MAX_AGE_SECONDS:
+        return True
+    return _outputs_signature() != _export_state["signature"]
+
+
+def _mark_export_fresh() -> None:
+    import time
+
+    _export_state.update(signature=_outputs_signature(), at=time.monotonic())
+
+
+# What /api/file will hand out. Databases, locks and keys are deliberately absent.
+SERVABLE_SUFFIXES = frozenset({
+    ".pdf", ".csv", ".xlsx", ".zip", ".eml", ".json", ".md", ".txt", ".html", ".png", ".docx",
+})
+
+
+def _status_for_oserror(exc: OSError) -> HTTPStatus:
+    import errno
+
+    return HTTPStatus.INSUFFICIENT_STORAGE if exc.errno in (errno.ENOSPC, errno.EDQUOT) else HTTPStatus.INTERNAL_SERVER_ERROR
+
+
+def _describe_oserror(exc: OSError) -> str:
+    import errno
+
+    if exc.errno in (errno.ENOSPC, errno.EDQUOT):
+        return "The disk is full, so nothing was saved. Free some space and try again."
+    return f"The file system refused the request: {exc.strerror or exc}"
+
+
+# A resume is a few hundred KB. These stop a crafted file from exhausting memory in the parser.
+MAX_RESUME_PAGES = 30
+MAX_DOCX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024
+
+
+def _oversized_resume_reason(suffix: str, body: bytes) -> Optional[str]:
+    """Why an upload is too big to parse safely once expanded, or None when it is fine."""
+    import io
+
+    if suffix == ".docx":
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(body)) as archive:
+                if sum(item.file_size for item in archive.infolist()) > MAX_DOCX_UNCOMPRESSED_BYTES:
+                    return "That .docx expands to an unreasonable size and was not opened."
+        except zipfile.BadZipFile:
+            return None   # not a readable archive: the parser reports that, as it always has
+    elif suffix == ".pdf":
+        try:
+            import fitz
+
+            with fitz.open(stream=body, filetype="pdf") as document:
+                if document.page_count > MAX_RESUME_PAGES:
+                    return f"That PDF has {document.page_count} pages; a resume should be {MAX_RESUME_PAGES} or fewer."
+        except Exception:
+            return "That PDF could not be read. It may be damaged or password protected."
+    return None
+
+
 class FlowConsoleServer(ThreadingHTTPServer):
     """Threading HTTP server carrying the shared runner and session token."""
 
@@ -162,7 +255,10 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
     def _check_token(self) -> bool:
         """Whether the request carries this session's token."""
         supplied = self.headers.get("X-Session-Token") or ""
-        return secrets.compare_digest(supplied, self.server.token)
+        # compare_digest raises TypeError on a str with non-ASCII characters, which a
+        # client can send in a header; compare bytes so a bad token is just a failed check.
+        return secrets.compare_digest(supplied.encode("utf-8", "surrogateescape"),
+                                      self.server.token.encode("utf-8"))
 
     def _check_auth(self) -> bool:
         """HTTP Basic Auth, only enforced once both DASHBOARD_USERNAME and
@@ -188,7 +284,10 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         except (binascii.Error, UnicodeDecodeError):
             return False
         supplied_user, _, supplied_pass = decoded.partition(":")
-        return secrets.compare_digest(supplied_user, username) & secrets.compare_digest(supplied_pass, password)
+        # Bytes, not str: a non-ASCII password (or login attempt) made compare_digest raise
+        # TypeError, which surfaced as a 500 and could never be matched.
+        return (secrets.compare_digest(supplied_user.encode("utf-8"), str(username).encode("utf-8"))
+                & secrets.compare_digest(supplied_pass.encode("utf-8"), str(password).encode("utf-8")))
 
     def _require_auth(self) -> bool:
         """Check Basic Auth, sending the 401 challenge if it fails. Returns whether to continue."""
@@ -204,6 +303,17 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802 - name fixed by BaseHTTPRequestHandler
         """Serve the dashboard, its assets, and read-only API endpoints."""
+        try:
+            self._route_get()
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        except OSError as exc:
+            # A full or unreadable disk used to drop the connection with no answer at all.
+            self._error(_status_for_oserror(exc), _describe_oserror(exc))
+        except Exception as exc:  # noqa: BLE001 - one bad request must not kill the handler thread
+            self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"{type(exc).__name__}: {exc}")
+
+    def _route_get(self) -> None:
         if not self._require_auth():
             return
         if not self._check_origin():
@@ -225,26 +335,88 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         elif route == "/api/analytics":
             from job_agent.web.analytics import analytics
             self._json(HTTPStatus.OK, analytics())
+        elif route == "/api/performance":
+            from job_agent.tracking.performance import performance_report
+            self._json(HTTPStatus.OK, performance_report())
+        elif route == "/api/runs":
+            from job_agent.runtime import pipeline_busy
+            from job_agent.storage.jobs_db import close_orphaned_runs, list_runs
+            if not self.server.runner.is_running and not pipeline_busy():
+                close_orphaned_runs()   # nothing is running, so a "running" record is a dead run
+            query = parse_qs(parsed.query)
+            try:
+                from job_agent.sourcing.delta_store import profile_identity
+
+                limit = max(1, min(500, int(query.get("limit", ["200"])[0])))
+                everyone = list_runs(limit=500)
+                wanted = (query.get("profile", [""])[0] or "").strip().casefold()
+                runs = [r for r in everyone if r["candidate_key"] == wanted][:limit] if wanted else everyone[:limit]
+            except (ValueError, RuntimeError, OSError) as exc:
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"Run history is unavailable: {exc}")
+                return
+            seen = {}
+            for run_row in everyone:
+                if run_row["candidate_key"] and run_row["candidate_key"] not in seen:
+                    seen[run_row["candidate_key"]] = run_row.get("candidate_name") or run_row["candidate_key"]
+            self._json(HTTPStatus.OK, {
+                "runs": runs,
+                "profiles": [{"key": key, "name": name} for key, name in seen.items()],
+                "current_profile": profile_identity(settings.profile_path),
+            })
         elif route == "/api/jobs":
             from job_agent.tracking.export import JobsCsvExporter, _read_json
+            from job_agent.tracking.skips import load_skips
             from job_agent.web.state import run_report_state
             from job_agent.runtime import pipeline_lock
             exporter = JobsCsvExporter()
             warnings = []
-            try:
-                # Refresh derived dates/readiness without running a new job search.
-                with pipeline_lock():
-                    exporter.export()
-            except (RuntimeError, OSError) as exc:
-                warnings.append(f"Showing the saved export; refresh could not finish: {exc}")
-            self._json(HTTPStatus.OK, {"jobs": list(exporter.load().values()), "warnings": warnings,
+            if _export_is_stale():
+                try:
+                    # Refresh derived dates/readiness without running a new job search.
+                    with pipeline_lock():
+                        exporter.export()
+                    _mark_export_fresh()
+                except (RuntimeError, OSError) as exc:
+                    warnings.append(f"Showing the saved export; refresh could not finish: {exc}")
+            jobs = list(exporter.load().values())
+            run_filter = (parse_qs(parsed.query).get("run", [""])[0] or "").strip()
+            if run_filter:
+                # A past run's shortlist: only the jobs that run found.
+                from job_agent.storage.jobs_db import run_job_ids
+                try:
+                    wanted = set(run_job_ids(run_filter))
+                except (RuntimeError, OSError) as exc:
+                    warnings.append(f"Could not load that run's jobs: {exc}")
+                    wanted = set()
+                jobs = [row for row in jobs if row.get("Job ID") in wanted]
+            self._json(HTTPStatus.OK, {"jobs": jobs, "warnings": warnings,
                        "csv_path": str(settings.outputs_dir / "jobs_master.csv"),
                        "latest_csv_path": str(settings.outputs_dir / "jobs_latest.csv"),
                        "ready_csv_path": str(settings.outputs_dir / "applications_ready.csv"),
                        "outreach_dir": str(settings.outputs_dir / "outreach"),
+                       "user_skipped": sorted(load_skips()),
                        "manually_applied": list(_read_json(settings.outputs_dir / "manual_applications.json", {})),
                        "run_report": run_report_state(),
                        "coverage": _read_json(settings.outputs_dir / "source_coverage.json", {})})
+        elif route == "/api/skipped":
+            from collections import Counter
+
+            from job_agent.sourcing.scraper import SKIPPED_FILE
+            from job_agent.tracking.export import _read_json
+            query = parse_qs(parsed.query)
+            records = _read_json(settings.outputs_dir / SKIPPED_FILE, [])
+            records = [r for r in records if isinstance(r, dict)] if isinstance(records, list) else []
+            reason = (query.get("reason", [""])[0] or "").strip()
+            try:
+                limit = max(1, min(1000, int(query.get("limit", ["200"])[0])))
+            except ValueError:
+                limit = 200
+            shown = [r for r in records if not reason or r.get("reason") == reason]
+            self._json(HTTPStatus.OK, {
+                "total": len(records),
+                "reasons": dict(Counter(r.get("reason", "unknown") for r in records)),
+                "jobs": shown[:limit],
+            })
         elif route == "/api/file":
             query = parse_qs(parsed.query)
             self._serve_artifact(query.get("path", [""])[0], download=query.get("download") == ["1"])
@@ -281,6 +453,7 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
             "/api/cancel": self._cancel_run,
             "/api/export/bundle": self._export_bundle,
             "/api/jobs/applied": self._mark_applied,
+            "/api/jobs/skip": self._skip_job,
         }
         handler = handlers.get(route)
         if handler is None:
@@ -289,6 +462,10 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
 
         try:
             handler(body)
+        except OSError as exc:
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+                raise
+            self._error(_status_for_oserror(exc), _describe_oserror(exc))
         except Exception as exc:
             self._error(HTTPStatus.INTERNAL_SERVER_ERROR, f"{type(exc).__name__}: {exc}")
 
@@ -321,10 +498,17 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         if not raw_path:
             self._error(HTTPStatus.BAD_REQUEST, "No path supplied.")
             return
-        target = Path(unquote(raw_path)).resolve()
-        allowed_root = settings.data_dir.resolve()
-        if allowed_root not in target.parents or not target.is_file():
-            self._error(HTTPStatus.FORBIDDEN, "That file is outside the agent's data directory.")
+        try:
+            target = Path(unquote(raw_path)).resolve()
+        except (OSError, ValueError):
+            self._error(HTTPStatus.BAD_REQUEST, "That is not a valid path.")
+            return
+        # Only what the pages link to: generated outputs and the uploaded resumes. The sealed
+        # profile, databases, the lock file and anything else under data/ stay unreachable.
+        roots = [settings.outputs_dir.resolve(), settings.raw_resumes_dir.resolve()]
+        if (not any(root in target.parents for root in roots) or not target.is_file()
+                or target.suffix.lower() not in SERVABLE_SUFFIXES):
+            self._error(HTTPStatus.FORBIDDEN, "That file is outside what the dashboard serves (generated outputs and uploaded resumes only).")
             return
         content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         if target.suffix.lower() == ".csv":
@@ -349,6 +533,23 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.CONFLICT, str(exc))
             return
         self._json(HTTPStatus.OK, {"path": str(path)})
+
+    def _skip_job(self, body: bytes) -> None:
+        from job_agent.tracking.skips import mark_skipped
+        try:
+            payload = json.loads(body or b"{}")
+            if (not isinstance(payload, dict) or not isinstance(payload.get("job_id"), str)
+                    or not isinstance(payload.get("undo", False), bool)
+                    or not isinstance(payload.get("reason", ""), str)):
+                raise ValueError("Supply a job ID, an optional boolean undo flag and an optional text reason.")
+            result = mark_skipped(payload["job_id"], undo=payload.get("undo", False), reason=payload.get("reason", ""))
+        except ValueError as exc:
+            self._error(HTTPStatus.BAD_REQUEST, str(exc))
+            return
+        except RuntimeError as exc:
+            self._error(HTTPStatus.CONFLICT, str(exc))
+            return
+        self._json(HTTPStatus.OK, result)
 
     def _mark_applied(self, body: bytes) -> None:
         if self.server.runner.is_running:
@@ -430,6 +631,11 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
                 HTTPStatus.BAD_REQUEST,
                 "That file is not a .docx. If it is an old .doc, open it and save as .docx.",
             )
+            return
+
+        too_big = _oversized_resume_reason(suffix, body)
+        if too_big:
+            self._error(HTTPStatus.BAD_REQUEST, too_big)
             return
 
         settings.raw_resumes_dir.mkdir(parents=True, exist_ok=True)
@@ -696,6 +902,10 @@ def _merge_env(path: Path, updates: Dict[str, str]) -> None:
         out.append(f"{key}={_env_value(value)}")
     temporary = path.with_suffix(".env.tmp")
     temporary.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    try:
+        os.chmod(temporary, 0o600)   # API keys live here; no effect on Windows, owner-only elsewhere
+    except OSError:
+        pass
     temporary.replace(path)
 
 
@@ -741,6 +951,13 @@ def run_server(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = T
             "and submit job applications, so it must not be exposed on a network."
         )
 
+    if _allowed_hosts() and not (settings.dashboard_username and settings.dashboard_password):
+        raise ValueError(
+            "DASHBOARD_ALLOWED_HOSTS is set without a login, so anyone who can reach that hostname "
+            "could use this console to send applications. Set DASHBOARD_USERNAME and "
+            "DASHBOARD_PASSWORD, or clear DASHBOARD_ALLOWED_HOSTS."
+        )
+
     token = secrets.token_urlsafe(32)
     handler = partial(FlowConsoleHandler)
     server = FlowConsoleServer((host, port), handler, token)
@@ -754,11 +971,6 @@ def run_server(host: str = "127.0.0.1", port: int = 8765, open_browser: bool = T
     extra_hosts = _allowed_hosts()
     if extra_hosts:
         print(f"Extra accepted hostnames (DASHBOARD_ALLOWED_HOSTS): {', '.join(sorted(extra_hosts))}")
-        if not (settings.dashboard_username and settings.dashboard_password):
-            print(
-                "WARNING: DASHBOARD_ALLOWED_HOSTS is set without a login. Anyone who can reach "
-                "that hostname can use this console. Set DASHBOARD_USERNAME and DASHBOARD_PASSWORD too."
-            )
     print("Press Ctrl+C to stop.\n")
 
     if open_browser:

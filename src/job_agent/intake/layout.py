@@ -16,6 +16,8 @@ the section parser sees the document a human would read.
 
 from __future__ import annotations
 
+import re
+
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # A gutter must be at least this wide (in points) to count as a column break,
@@ -141,14 +143,44 @@ def _line_positions(words: Sequence[Dict[str, Any]]) -> List[float]:
     return positions
 
 
+# Fonts that draw pictures (an envelope beside an email, a phone, a LinkedIn logo), not
+# words. A PDF extractor reports the glyph's NAME as if it were text, so "Envelope"
+# ended up glued to the front of an email address and was sealed into the profile.
+# Maths and symbol fonts (CMSY, Symbol) are deliberately not listed: they carry text.
+_ICON_FONT = re.compile(r"awesome|material|glyphicon|ionicon|octicon|entypo|icomoon|fontello|linearicons|"
+                        r"themify|simple-?line|typicons|icons?|-icons?|icons?-", re.I)
+
+
+# How far apart two letters may be and still belong to one word, as a fraction of the text
+# size. pdfplumber's default is a fixed 3pt, but LaTeX-style PDFs have no space characters
+# and a space is only about 0.26em (2.6pt at 10pt), so the default glued most of the body
+# text into one long token ("AIresearcherwithexperience"). Two of four real resumes lost
+# two thirds of their words that way. Relative to size, it holds for small and large text.
+WORD_GAP_RATIO = 0.12
+
+
+def is_icon_font(fontname: Optional[str]) -> bool:
+    """Whether a PDF font is an icon font (its 'characters' are pictures)."""
+    return bool(_ICON_FONT.search((fontname or "").split("+")[-1]))
+
+
+def _without_icons(page: Any) -> Any:
+    """The page minus icon-font glyphs, or the page itself if it cannot be filtered."""
+    try:
+        return page.filter(lambda obj: obj.get("object_type") != "char" or not is_icon_font(obj.get("fontname")))
+    except Exception:
+        return page
+
+
 def extract_page_lines(page: Any) -> List[str]:
     """Extract one page as ordered text lines, splitting columns when present.
 
     Falls back to the page's own `extract_text()` whenever word positions are
     unavailable, so a page this cannot analyse still yields its text.
     """
+    page = _without_icons(page)
     try:
-        words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+        words = page.extract_words(use_text_flow=False, keep_blank_chars=False, x_tolerance_ratio=WORD_GAP_RATIO)
     except Exception:
         words = []
 
@@ -188,8 +220,9 @@ def describe_layout(page: Any) -> Tuple[str, Optional[float]]:
     Used by the readiness report so a candidate is told their template is
     two-column, which is the usual explanation for a jumbled extraction.
     """
+    page = _without_icons(page)
     try:
-        words = page.extract_words(use_text_flow=False, keep_blank_chars=False)
+        words = page.extract_words(use_text_flow=False, keep_blank_chars=False, x_tolerance_ratio=WORD_GAP_RATIO)
     except Exception:
         return "unknown", None
     if not words:

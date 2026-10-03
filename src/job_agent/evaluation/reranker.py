@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console
 
-from job_agent.config.normalize import clean_text, truncate
+from job_agent.config.normalize import truncate
 from job_agent.config.schema import (
     CandidateProfile,
     EvaluationScore,
@@ -45,17 +45,23 @@ SCORING RULES:
 - 5.0 - 6.9: Moderate match. Substantial skill overlap, but notable gaps in critical frameworks or experience.
 - 1.0 - 4.9: Weak match, or a disqualifying misalignment.
 
+fit_score is 0.6 x technical_score + 0.4 x seniority_score, rounded to one decimal.
+Disqualifier: if the role is a different job family from the candidate's profile (sales, recruiting,
+marketing, finance, operations, or a pure management role), fit_score is at most 4.0 however many tools overlap.
+Seniority: a title such as Senior (about 5 years), Lead or Manager (about 6), Staff or Principal (about 8)
+sets the experience bar when the posting states no number. A gap of 3 or more years caps fit_score at 6.0.
+
 Judge only on evidence present in the candidate profile. Do not assume unlisted skills.
 List a skill under matching_skills only if it appears in BOTH the profile and the posting.
 
 Output ONLY a single valid JSON object adhering exactly to this schema:
 {
-  "fit_score": 7.5,
-  "technical_score": 8.0,
-  "seniority_score": 7.0,
-  "reasoning": "Candidate possesses the Python and Kubernetes experience this role requires...",
-  "matching_skills": ["Python", "Kubernetes", "AWS"],
-  "missing_skills": ["Ruby on Rails", "Sidekiq"]
+  "fit_score": <number>,
+  "technical_score": <number>,
+  "seniority_score": <number>,
+  "reasoning": "<two sentences citing the specific skills and years that decided the score>",
+  "matching_skills": ["<skill in both profile and posting>"],
+  "missing_skills": ["<skill the posting requires that the profile lacks>"]
 }
 """
 
@@ -101,6 +107,8 @@ class LLMReranker:
     def __init__(self, provider: Optional[str] = None, min_score: Optional[float] = None):
         self.provider = (provider or settings.active_provider).lower()
         self.min_score = settings.min_match_score if min_score is None else min_score
+        # The candidate's own reasons for skipping jobs; set by the pipeline before scoring.
+        self.feedback_note = ""
 
     # --- Sliding window context selection -------------------------------------
 
@@ -260,6 +268,43 @@ class LLMReranker:
             return years if years <= 20 else None
         return None
 
+    # Years of experience a title implies when the posting states no number.
+    _TITLE_YEARS = (
+        (r"\b(?:director|head of|vp|vice president|chief)\b", 10.0),
+        (r"\b(?:principal|staff|architect)\b", 8.0),
+        (r"\b(?:manager|lead)\b", 6.0),
+        (r"\b(?:senior|sr)\b", 5.0),
+        (r"\b(?:associate|junior|jr|entry|graduate|trainee|intern(?:ship)?)\b", 0.0),
+    )
+
+    @classmethod
+    def _title_years(cls, title: str) -> Optional[float]:
+        """Years of experience implied by the rank words in a title ("Senior" is about 5)."""
+        lowered = title.lower()
+        for pattern, years in cls._TITLE_YEARS:
+            if re.search(pattern, lowered):
+                return years
+        return None
+
+    @classmethod
+    def _verified_skills(cls, profile: CandidateProfile, job: JobPosting,
+                         matching: List[str], missing: List[str]) -> tuple:
+        """Keep only skills the evidence supports, whoever produced the lists.
+
+        A model can name a skill the candidate does not have, or one the posting never
+        mentions. A "matching" skill must be in the profile AND the posting; a "missing"
+        skill must not already be in the profile.
+        """
+        owned = {skill.lower().strip(): skill for skill in profile.skills.all_skills()}
+        posting = f"{job.title} {job.description}"
+        verified = []
+        for skill in matching:
+            key = str(skill).lower().strip()
+            if key in owned and cls._find_skills_in_text([owned[key]], posting):
+                verified.append(owned[key])
+        kept_missing = [str(skill) for skill in missing if str(skill).lower().strip() not in owned]
+        return list(dict.fromkeys(verified)), kept_missing
+
     def _heuristic_reranker(
         self,
         profile: CandidateProfile,
@@ -284,7 +329,12 @@ class LLMReranker:
             if tech not in owned and self._find_skills_in_text([tech], haystack)
         ]
 
-        required_years = self._required_years(job.description)
+        stated_years = self._required_years(job.description)
+        title_years = self._title_years(job.title)
+        # The stricter of the two is the real bar: a "Senior" title with "2+ years" in the
+        # body is still a senior role.
+        known = [years for years in (stated_years, title_years) if years is not None]
+        required_years = max(known) if known else None
         if required_years is None:
             seniority_score = 7.0
             seniority_note = "The posting does not state a years-of-experience requirement."
@@ -299,8 +349,13 @@ class LLMReranker:
                 f"{required_years:g} required."
             )
 
-        technical_score = min(10.0, max(1.0, len(matching) * 1.5 + embedding_similarity * 4.0))
+        # A resume lists many tools and a long posting names most of them, so overlap alone
+        # must not saturate the scale: eight shared skills read as strong, not perfect.
+        technical_score = min(10.0, max(1.0, 1.0 + len(matching) * 0.75 + embedding_similarity * 5.0))
         fit_score = max(1.0, min(10.0, technical_score * 0.6 + seniority_score * 0.4))
+        if required_years is not None and required_years - profile.years_of_experience >= 3:
+            # Three or more years short is a reject whatever the skills say.
+            fit_score = min(fit_score, 6.0)
 
         # Hard constraint: a posting the candidate cannot legally take should not rank.
         authorized = profile.work_authorization.is_authorized_in(job.location)
@@ -358,6 +413,8 @@ class LLMReranker:
         """Evaluate a single posting against the candidate profile."""
         job_context = truncate(self.select_context(job.description), CONTEXT_BUDGET_CHARS)
         profile_summary = self._profile_summary(profile)
+        if self.feedback_note:
+            profile_summary = f"{profile_summary}\n{self.feedback_note}"
 
         verdict: Optional[RerankerVerdict] = None
         scored_by = "heuristic"
@@ -368,6 +425,11 @@ class LLMReranker:
             model = settings.model_for("rerank", self.provider)
             try:
                 raw = caller(profile_summary, job, job_context)
+                if self.provider == "groq":
+                    # After a daily limit the client switches models mid-run; record the one that
+                    # actually judged this job, not the one that was configured.
+                    from job_agent.llm import last_groq_model
+                    model = last_groq_model() or model
                 # Reject anything the schema will not accept rather than trusting it.
                 verdict = RerankerVerdict(**raw)
                 scored_by = f"{self.provider}:{model}"
@@ -382,15 +444,21 @@ class LLMReranker:
         if verdict is None:
             verdict = self._heuristic_reranker(profile, job, embedding_similarity)
 
+        matching_skills, missing_skills = self._verified_skills(
+            profile, job, list(verdict.matching_skills), list(verdict.missing_skills))
         return EvaluationScore(
             embedding_similarity=embedding_similarity,
             fit_score=verdict.fit_score,
-            technical_score=verdict.technical_score or verdict.fit_score,
-            seniority_score=verdict.seniority_score or verdict.fit_score,
+            # A sub-score the model left out falls back to the fit score; one it returned
+            # as 0.0 is a real "no overlap" and must stay 0.0 (`or` treated both alike).
+            technical_score=(verdict.technical_score if "technical_score" in verdict.model_fields_set
+                             else verdict.fit_score),
+            seniority_score=(verdict.seniority_score if "seniority_score" in verdict.model_fields_set
+                             else verdict.fit_score),
             threshold_used=self.min_score,
             reasoning=verdict.reasoning,
-            matching_skills=verdict.matching_skills,
-            missing_skills=verdict.missing_skills,
+            matching_skills=matching_skills,
+            missing_skills=missing_skills,
             scored_by=scored_by,
         )
 

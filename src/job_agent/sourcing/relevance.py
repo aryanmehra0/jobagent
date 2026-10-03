@@ -38,6 +38,12 @@ _PHRASES = [
     (r"\bnlp\b", "ai"),
     (r"\bai\s*/\s*ai\b", "ai"),
     (r"\bagentic\b", "ai"),
+    # Specialisms with no "ai"/"ml" token of their own, and the scientist titles
+    # used for the same work. Only AI/applied scientists are folded (a plain data scientist is analytics work, which an existing test pins as a non-match), so an
+    # unrelated scientist (a lab or research role) never becomes a match.
+    (r"\b(?:ml|llm|genai|ai)\s*ops\b", "ai"),
+    (r"\bcomputer vision\b|\bgenerative models?\b|\brag\b", "ai"),
+    (r"\b(?:ai|applied)\s+scientists?\b", "ai engineer"),
     (r"\bmgr\b", "manager"),
     (r"\bengg\b", "engineer"),
     # An "AI Developer" does the job of an "AI Engineer".
@@ -62,11 +68,45 @@ def core_words(role: str) -> Set[str]:
     return words or set(_words(role))
 
 
+_FAMILIES = {"sale", "recruiter", "recruitment", "marketing", "presale"}
+
+
 def title_matches(title: str, roles: Iterable[str]) -> bool:
     """Whether a posting title names any of the target roles."""
     title_words = set(_words(title))
-    # Shared AI/product keywords do not turn a sales or recruiting role into
-    # an engineering/product role. Keep these families when explicitly requested.
-    families = {"sale", "recruiter", "recruitment", "marketing", "presale"}
-    return any(core and core <= title_words and not ((title_words & families) - core)
+    # Shared AI/product keywords do not turn a sales or recruiting role into an
+    # engineering/product role. Only the job itself counts: in "AI Engineer,
+    # Marketing Platform" the text after the comma names a team, not the role.
+    job_part = re.split(r"[,|(]|\s[-\u2013\u2014:]\s", clean_text(title), maxsplit=1)[0]
+    role_words = set(_words(job_part))
+    return any(core and core <= title_words and not ((role_words & _FAMILIES) - core)
                for core in (core_words(role) for role in roles))
+
+
+# Words a role name is normally built from; a near-miss to one of these is a typo.
+_VOCABULARY = {
+    "engineer", "engineering", "developer", "scientist", "researcher", "research", "analyst", "manager",
+    "architect", "specialist", "consultant", "learning", "machine", "artificial", "intelligence",
+    "generative", "agentic", "applied", "senior", "principal", "software", "product", "data", "vision",
+    "computer", "language", "natural", "processing", "automation", "platform", "backend", "frontend",
+    "fullstack", "associate", "assistant", "designer", "director", "intern", "internship", "operations",
+}
+
+
+def suspicious_role_words(role: str) -> List[tuple]:
+    """(word, likely_spelling) pairs for words in a role that look like typos.
+
+    A misspelled target role matches nothing, and nothing says so. Only words
+    that are *almost* a known role word are flagged, so unusual valid words
+    (Kubernetes, Quant, Robotics) are left alone.
+    """
+    import difflib
+
+    flagged = []
+    for word in re.findall(r"[a-z]+", clean_text(role).casefold()):
+        if len(word) < 5 or word in _VOCABULARY:
+            continue
+        close = difflib.get_close_matches(word, _VOCABULARY, n=1, cutoff=0.85)
+        if close:
+            flagged.append((word, close[0]))
+    return flagged

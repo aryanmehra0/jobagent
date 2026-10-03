@@ -76,6 +76,15 @@ class AutoApplyPipeline:
         manifest = self._load_manifest(manifest_file)
         job_lookup, score_lookup = self._load_qualified(qualified_file)
 
+        # The manifest also holds resumes made for jobs that did not qualify (so any
+        # job can be applied to by hand). Only qualified jobs are ever applied to
+        # automatically, and the live-apply confirmation must count only those.
+        eligible = [entry for entry in manifest if entry.get("job_id") in job_lookup]
+        if len(eligible) != len(manifest):
+            console.print(f"[dim]{len(manifest) - len(eligible)} resume(s) are for jobs that did not qualify; "
+                          "they are for manual applications and are not submitted automatically.[/dim]")
+        manifest = eligible
+
         if specific_job_id:
             manifest = [entry for entry in manifest if entry.get("job_id") == specific_job_id]
             if not manifest:

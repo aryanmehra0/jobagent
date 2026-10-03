@@ -17,23 +17,105 @@
 
   /* ---------------- Graph layout ---------------- */
 
-  // Positions are fixed rather than auto-laid-out: the pipeline is a known,
-  // unchanging shape, and a stable layout is easier to learn than a solver's.
-  // Serpentine layout: phases 1-3 run left to right, then the flow drops a row
-  // and phases 4-6 run right to left. This keeps all six phases on screen at
-  // once — a single row would be 1630px wide and force horizontal scrolling,
-  // which defeats the point of seeing the whole pipeline at a glance.
-  const NODE_POS = {
-    resume:   { x: 258, y: 16,  kind: "input" },
-    settings: { x: 498, y: 16,  kind: "input" },
-    intake:   { x: 258, y: 150 },
-    source:   { x: 498, y: 150 },
-    evaluate: { x: 738, y: 150 },
-    tailor:   { x: 738, y: 420 },
-    apply:    { x: 498, y: 420 },
-    track:    { x: 258, y: 420 },
-    prep:     { x: 258, y: 690 },
+  // Positions are fixed per layout rather than auto-laid-out: the pipeline is a
+  // known, unchanging shape, and a stable layout is easier to learn than a
+  // solver's. Three hand-placed layouts exist because no single one suits every
+  // window: a one-row flow is clearest but needs ~1570px, while the serpentine
+  // (phases run left to right, drop a row, then return right to left) fits a
+  // narrow window. fitLayout() picks whichever shows the pipeline largest and
+  // scales it to fit, so all phases stay visible without scrolling.
+  const COL = 232, ROW = 270, NODE_H = 240, TOP = 16, PHASE_Y = 150;
+  const PHASE_IDS = ["intake", "source", "evaluate", "tailor", "apply", "track", "prep"];
+
+  // Each layout maps node id -> [column, row]; the two input nodes sit one row
+  // above the phase they feed (row 0), phases start at row 1 (y = PHASE_Y).
+  const LAYOUTS = {
+    row: {
+      cells: { resume: [0, 0], settings: [1, 0], intake: [0, 1], source: [1, 1], evaluate: [2, 1],
+               tailor: [3, 1], apply: [4, 1], track: [5, 1], prep: [6, 1] },
+    },
+    grid: {
+      cells: { resume: [0, 0], settings: [1, 0], intake: [0, 1], source: [1, 1], evaluate: [2, 1],
+               tailor: [3, 1], apply: [3, 2], track: [2, 2], prep: [1, 2] },
+    },
+    snake: {
+      cells: { resume: [0, 0], settings: [1, 0], intake: [0, 1], source: [1, 1], evaluate: [2, 1],
+               tailor: [2, 2], apply: [1, 2], track: [0, 2], prep: [0, 3] },
+    },
   };
+  const LAYOUT_ORDER = ["row", "grid", "snake"];
+
+  function layoutSize(name) {
+    const cells = Object.values(LAYOUTS[name].cells);
+    const cols = Math.max(...cells.map((c) => c[0]));
+    const rows = Math.max(...cells.map((c) => c[1]));
+    return { w: cols * COL + 176, h: rowY(rows) + NODE_H };
+  }
+  function rowY(row) { return row === 0 ? TOP : PHASE_Y + (row - 1) * ROW; }
+
+  let NODE_POS = {};
+  let layoutName = "";
+  let flowScale = 1;
+  let fitMode = true;
+  try { fitMode = localStorage.getItem("flowFit") !== "0"; } catch (_) { /* storage blocked */ }
+
+  function applyLayout(name) {
+    layoutName = name;
+    NODE_POS = {};
+    for (const [id, [c, r]] of Object.entries(LAYOUTS[name].cells)) {
+      NODE_POS[id] = { x: c * COL, y: rowY(r), ...(r === 0 ? { kind: "input" } : {}) };
+    }
+  }
+
+  /**
+   * Pick the layout that renders largest in the canvas and scale it to fit.
+   * In "actual size" mode nothing is scaled; the widest layout that fits the
+   * width wins and the canvas scrolls vertically if it must.
+   * Returns true when the layout changed, so the caller can rebuild the nodes.
+   */
+  function fitLayout() {
+    const canvas = $(".canvas");
+    const availW = Math.max(320, canvas.clientWidth - 56);
+    // On narrow screens the page scrolls normally and the canvas is as tall as
+    // its content, so height must not feed back into the scale (it would just
+    // measure its own previous answer).
+    const natural = window.matchMedia("(max-width: 1100px)").matches;
+    const availH = natural ? Infinity : Math.max(320, canvas.clientHeight - 56);
+    let best = "snake", bestScale = -1;
+    if (fitMode) {
+      // Width is never traded away (horizontal scrolling is the worst outcome),
+      // but height may shrink only down to a readable floor; below that the
+      // canvas scrolls vertically. The first layout that renders comfortably
+      // large wins, so wide windows get the clearest one-row flow.
+      const READABLE = 0.85, FLOOR = 0.8;
+      for (const name of LAYOUT_ORDER) {
+        const { w, h } = layoutSize(name);
+        const byWidth = Math.min(1, availW / w);
+        const scale = Math.max(Math.min(byWidth, availH / h), Math.min(byWidth, FLOOR));
+        if (scale >= READABLE) { best = name; bestScale = scale; break; }
+        if (scale > bestScale + 0.001) { best = name; bestScale = scale; }
+      }
+    } else {
+      best = LAYOUT_ORDER.find((name) => layoutSize(name).w <= availW) || "snake";
+      bestScale = 1;
+    }
+    flowScale = fitMode ? bestScale : 1;
+    const { w, h } = layoutSize(best);
+    const sizer = $("#flow-sizer"), flow = $("#flow");
+    sizer.style.width = `${Math.round(w * flowScale)}px`;
+    sizer.style.height = `${Math.round(h * flowScale)}px`;
+    flow.style.width = `${w}px`;
+    flow.style.height = `${h}px`;
+    flow.style.transform = `scale(${flowScale})`;
+    const fitBtn = $("#fit-btn");
+    if (fitBtn) {
+      fitBtn.textContent = fitMode ? "Fit to view ✓" : "Actual size";
+      fitBtn.setAttribute("aria-pressed", String(fitMode));
+    }
+    const changed = best !== layoutName;
+    if (changed) applyLayout(best);
+    return changed;
+  }
 
   // [from, to, label] — the label shows the count handed to the next phase.
   const EDGES = [
@@ -55,15 +137,16 @@
   function anchorRects() {
     const flow = $("#flow").getBoundingClientRect();
     const rects = {};
+    // The flow is CSS-scaled to fit the window; bounding boxes come back scaled,
+    // but the SVG lives in the unscaled coordinate space, so undo the scale.
+    const k = flowScale || 1;
     document.querySelectorAll(".node[data-node]").forEach((node) => {
       const box = node.getBoundingClientRect();
+      const left = (box.left - flow.left) / k, top = (box.top - flow.top) / k;
+      const width = box.width / k, height = box.height / k;
       rects[node.dataset.node] = {
-        left: box.left - flow.left,
-        right: box.right - flow.left,
-        top: box.top - flow.top,
-        bottom: box.bottom - flow.top,
-        cx: box.left - flow.left + box.width / 2,
-        cy: box.top - flow.top + box.height / 2,
+        left, right: left + width, top, bottom: top + height,
+        cx: left + width / 2, cy: top + height / 2,
       };
     });
     return rects;
@@ -114,6 +197,9 @@
   const runStatus = {};   // phase -> "running" | "ready" | "error" | "halted"
   const runSummary = {};  // phase -> summary from the last completed run
   const logLines = [];
+  const logFilter = { query: "", level: "all" };
+  let activePhaseId = null;   // the phase currently running, for the live elapsed timer
+  let phaseStartedAt = null;
 
   const $ = (sel) => document.querySelector(sel);
   const el = (tag, cls, text) => {
@@ -122,6 +208,53 @@
     if (text != null) node.textContent = text;
     return node;
   };
+
+  /* ---------------- Icons ---------------- */
+
+  // Inline stroke icons (Lucide, ISC licence) so the console needs no icon font
+  // or network request, and icons inherit text colour in both themes. The
+  // strings are constants defined here, never user data.
+  const ICONS = {
+    briefcase: '<rect width="20" height="14" x="2" y="7" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/>',
+    "file-text": '<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/><path d="M10 9H8"/><path d="M16 13H8"/><path d="M16 17H8"/>',
+    sliders: '<line x1="4" x2="4" y1="21" y2="14"/><line x1="4" x2="4" y1="10" y2="3"/><line x1="12" x2="12" y1="21" y2="12"/><line x1="12" x2="12" y1="8" y2="3"/><line x1="20" x2="20" y1="21" y2="16"/><line x1="20" x2="20" y1="12" y2="3"/><line x1="2" x2="6" y1="14" y2="14"/><line x1="10" x2="14" y1="8" y2="8"/><line x1="18" x2="22" y1="16" y2="16"/>',
+    intake: '<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>',
+    source: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+    evaluate: '<path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/><path d="M13 6h8"/><path d="M13 12h8"/><path d="M13 18h8"/>',
+    tailor: '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
+    apply: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+    track: '<line x1="12" x2="12" y1="20" y2="10"/><line x1="18" x2="18" y1="20" y2="4"/><line x1="6" x2="6" y1="20" y2="16"/>',
+    prep: '<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>',
+    play: '<polygon points="6 3 20 12 6 21 6 3"/>',
+    theme: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+    copy: '<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+    trash: '<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
+    clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+    alert: '<path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/>',
+    chevron: '<path d="m6 9 6 6 6-6"/>',
+    arrow: '<path d="M5 12h14"/><path d="m12 5 7 7-7 7"/>',
+  };
+
+  function icon(name) {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("class", "icon");
+    svg.setAttribute("aria-hidden", "true");
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "2");
+    svg.setAttribute("stroke-linecap", "round");
+    svg.setAttribute("stroke-linejoin", "round");
+    svg.innerHTML = ICONS[name] || "";
+    return svg;
+  }
+
+  // Static markup marks where an icon goes with data-icon="name".
+  function hydrateIcons(root = document) {
+    root.querySelectorAll("[data-icon]").forEach((slot) => {
+      if (!slot.querySelector("svg")) slot.prepend(icon(slot.dataset.icon));
+    });
+  }
 
   /* ---------------- API ---------------- */
 
@@ -134,6 +267,29 @@
     const payload = isJson ? await res.json() : null;
     if (!res.ok) throw new Error((payload && payload.error) || `HTTP ${res.status}`);
     return payload;
+  }
+
+  // A run can be started elsewhere: the CLI, a scheduled task, another window or
+  // instance. This page only gets live events for runs its own server starts, so
+  // it would sit on old data. Poll the state quietly (faster while a run is in
+  // flight) and redraw only when something changed.
+  let lastStateJson = "";
+  async function syncState() {
+    if (document.hidden) return;
+    try {
+      const data = await api("/api/state");
+      const next = JSON.stringify(data);
+      if (next === lastStateJson) return;
+      lastStateJson = next;
+      state = data.state;
+      running = data.running;
+      render();
+    } catch { /* the next poll tries again; a toast every few seconds would only be noise */ }
+  }
+
+  function startStatePolling() {
+    const tick = () => { syncState(); setTimeout(tick, running ? 6000 : 20000); };
+    setTimeout(tick, 6000);
   }
 
   async function refreshState() {
@@ -568,6 +724,8 @@
             track_all: true,
             tailoring_mode: $("#resume-mode").value,
             cover_letter: $("#cover-letter").checked,
+            tailor_all: runOptions.tailorAll,
+            score_limit: runOptions.scoreLimit || undefined,
             job_id: jobId,
           },
         }),
@@ -646,8 +804,22 @@
 
   /* ---------------- Event stream ---------------- */
 
+  // The server replays its last run's events to every new connection (to fill the
+  // Live log). They describe the PAST, and a phase that failed in that run may
+  // since have succeeded in another process or window, so they must not set a
+  // phase's status: the files on disk are the truth. Each (re)connection starts a
+  // short replay window during which statuses are not taken from events.
+  let replaying = true;
+  let lastEventAt = Date.now();
+
   function connectEvents() {
     const source = new EventSource("/api/events");
+    let replayTimer = setTimeout(() => { replaying = false; }, 2000);
+    source.onopen = () => {
+      replaying = true;
+      clearTimeout(replayTimer);
+      replayTimer = setTimeout(() => { replaying = false; }, 1500);
+    };
 
     source.onmessage = (event) => {
       let payload;
@@ -661,6 +833,7 @@
   }
 
   function handleEvent(evt) {
+    if (!replaying) lastEventAt = Date.now();
     switch (evt.type) {
       case "run_start":
         ranThisSession = true;
@@ -671,8 +844,9 @@
         break;
 
       case "phase_start":
-        runStatus[evt.phase] = "running";
-        delete runSummary[evt.phase];
+        if (!replaying) { runStatus[evt.phase] = "running"; delete runSummary[evt.phase]; }
+        activePhaseId = evt.phase;
+        phaseStartedAt = Date.now();
         pushLog("evt", `▶ ${title(evt.phase)}`);
         render();
         break;
@@ -687,9 +861,11 @@
 
       case "phase_end": {
         const ok = ["ok", "warning"].includes(evt.status);
-        runStatus[evt.phase] = evt.status === "warning" ? "warning" : ok ? "ready" : evt.status === "cancelled" ? "halted" : "error";
-        runSummary[evt.phase] = evt.summary || {};
-        if (evt.summary && evt.summary.halt_reason && evt.status !== "error") runStatus[evt.phase] = "halted";
+        if (!replaying) {
+          runStatus[evt.phase] = evt.status === "warning" ? "warning" : ok ? "ready" : evt.status === "cancelled" ? "halted" : "error";
+          runSummary[evt.phase] = evt.summary || {};
+          if (evt.summary && evt.summary.halt_reason && evt.status !== "error") runStatus[evt.phase] = "halted";
+        }
 
         if (setupWatching === evt.phase) {
           setup.parsing = false;
@@ -702,6 +878,7 @@
           ok ? `✔ ${title(evt.phase)} finished in ${evt.duration}s`
              : `✖ ${title(evt.phase)} ${evt.status}${evt.error ? `: ${evt.error}` : ""}`
         );
+        if (activePhaseId === evt.phase) { activePhaseId = null; phaseStartedAt = null; }
         render();
         break;
       }
@@ -714,19 +891,61 @@
 
       case "run_end":
         running = false;
+        activePhaseId = null;
+        phaseStartedAt = null;
         pushLog("evt", `Run ${evt.status}.`);
-        toast(
-          evt.status === "ok" ? "Run finished." : `Run ${evt.status}.`,
-          evt.status === "ok" ? "ok" : "err"
-        );
+        // The server replays the previous run's events when the page connects;
+        // announcing those would pop a stale "Run warning." on every reload.
+        if (!replaying) {
+          toast(
+            evt.status === "ok" ? "Run finished."
+              : evt.status === "warning" ? "Run finished with warnings. Check the Live log."
+              : `Run ${evt.status}.`,
+            evt.status === "ok" ? "ok" : evt.status === "warning" ? "warn" : "err"
+          );
+        }
         refreshState();
         if ($("#jobs-dialog").open) openJobs();
         break;
     }
   }
 
+  // Patterns the backend's plain-text lines use for warnings/errors that don't
+  // arrive with an explicit "err" kind (e.g. a Groq cooldown, a PDF check).
+  const WARN_PATTERN = /\b(warning|retry|retrying|cooldown|rate limit|429|skipped|fallback|manual apply needed)\b/i;
+  const ERR_PATTERN = /\b(error|failed|✖|exception|traceback|access is denied)\b/i;
+  const OK_PATTERN = /(✔|\bpass\b|\bqualified\b|\bok\b)/i;
+
+  function logLevel(entry) {
+    if (entry.kind === "err") return "err";
+    if (entry.kind === "evt") return "evt";
+    if (ERR_PATTERN.test(entry.line)) return "err";
+    if (WARN_PATTERN.test(entry.line)) return "warn";
+    if (OK_PATTERN.test(entry.line)) return "ok";
+    return "";
+  }
+
+  function formatElapsed(ms) {
+    const s = Math.max(0, ms) / 1000;
+    return s < 60 ? `${s.toFixed(0)}s` : `${Math.floor(s / 60)}m ${Math.floor(s % 60)}s`;
+  }
+
+  // Updates only the running node's elapsed-time text, not a full render(), so
+  // a once-a-second tick doesn't disturb scroll position, focus or selection
+  // anywhere else in the UI.
+  function tickRunningTimer() {
+    if (!running || !activePhaseId || !phaseStartedAt) return;
+    const node = document.querySelector(`.node[data-node="${activePhaseId}"] .node-elapsed`);
+    if (node) node.textContent = formatElapsed(Date.now() - phaseStartedAt);
+  }
+
+  // Gap since the previous line, captured at push time (not render time) so
+  // filtering/searching the log never distorts how long a step actually took.
   function pushLog(kind, line, phase) {
-    logLines.push({ kind, line, phase });
+    const ts = Date.now();
+    const prev = logLines[logLines.length - 1];
+    const gapMs = prev && kind !== "evt" && prev.kind !== "evt" ? ts - prev.ts : 0;
+    logLines.push({ kind, line, phase, ts, gapMs });
     if (logLines.length > 1200) logLines.splice(0, logLines.length - 1200);
     renderLog();
   }
@@ -783,30 +1002,132 @@
       : last.age_hours < 48 ? `${Math.round(last.age_hours)} hours ago`
       : `${Math.round(last.age_hours / 24)} days ago`;
     banner.hidden = false;
-    $("#run-banner-text").textContent =
+    const full =
       `These are results from your previous run (${when.toLocaleString()}, ${age}), not a new search. ` +
       "Press Run all phases to refresh the search. Previously seen listings can appear in the latest CSV; processed applications are not repeated. " +
       "Start fresh clears this view first.";
+    // One line in the banner; the full explanation stays available on hover and
+    // to screen readers instead of eating three lines of canvas.
+    const text = $("#run-banner-text");
+    text.textContent = `Showing your previous run — ${when.toLocaleString()} (${age}), not a new search. Press Run all phases to refresh.`;
+    text.title = full;
   }
 
   function render() {
     renderBanner();
     renderRunBanner();
     renderPills();
+    renderNextStep();
     renderNodes();
     // Deferred a frame: edge anchors are measured from the DOM, which only has
     // real geometry once the browser has laid the new nodes out.
     requestAnimationFrame(renderEdges);
     renderPanel();
+    // With the log on its own tab, a pulsing dot says a run is producing output.
+    document.querySelector('.tab[data-tab="log"]')?.classList.toggle("is-live", running);
     $("#run-btn").disabled = running;
     $("#cancel-btn").disabled = !running;
-    $("#run-btn").textContent = running ? "Running…" : "▶ Run all phases";
+    $("#run-btn").replaceChildren(icon("play"), el("span", null, running ? "Running…" : "Run all phases"));
+    $("#run-btn").setAttribute("aria-label", running ? "Running, please wait" : "Run all phases");
 
     const dry = $("#dry-run").checked;
     $("#dry-toggle").classList.toggle("is-live", !dry);
-    $("#dry-label").textContent = dry
-      ? "Dry run (nothing is submitted)"
-      : "LIVE — will submit real applications";
+    $("#dry-label").textContent = dry ? "Dry run" : "LIVE — submits real applications";
+    $("#dry-toggle").title = dry
+      ? "Dry run is on: nothing is submitted. Untick to submit real applications."
+      : "Live mode: auto-apply will submit real applications.";
+  }
+
+  /**
+   * Work out the single most useful thing to do now, from the same state the
+   * nodes show, so the card can never disagree with the graph. Order matters:
+   * a missing profile blocks everything, then each phase in pipeline order, and
+   * only when the pipeline is healthy does it point at the human steps.
+   */
+  function nextStep() {
+    if (!state) return null;
+    const metric = (id, key) => Number(state.phases[id]?.metrics?.[key]) || 0;
+    const status = (id) => nodeStatus(id);
+
+    if (running) {
+      const phase = activePhaseId || state.run_report?.active_phase;
+      const label = phase && state.phases[phase]?.title;
+      // No events for a while but a run is in flight: it was started somewhere else.
+      const elsewhere = !activePhaseId && Date.now() - lastEventAt > 15000;
+      return {
+        title: label ? `Running ${label}…` : "Running…",
+        detail: elsewhere
+          ? "A run started elsewhere (the command line, a scheduled task or another window) is in progress. This page follows it automatically."
+          : "Watch progress in the Live log. Stop is available in the top bar.",
+      };
+    }
+    if (state.setup && (state.setup.needs_profile || state.setup.using_sample)) {
+      return { title: "Upload your resume", detail: "Every phase needs your real profile first.", action: "Set up resume", run: () => openSetup(0) };
+    }
+    if (status("intake") !== "ready") {
+      return { title: "Parse your resume", detail: "Phase 1 builds and seals your profile.", action: "Run resume intake", run: () => startRun(["intake"]) };
+    }
+    // Country, visa needs and salary are not on a resume, and a new candidate does not
+    // inherit the previous one's. Ask before the first search, where they shape which
+    // jobs are eligible and how they are scored.
+    const saved = state.preferences?.values || {};
+    const hasPreferences = saved.current_country || (saved.authorized_countries || []).length;
+    if (!hasPreferences && status("source") === "empty") {
+      return { title: "Add your location and work preferences",
+               detail: "Eligibility and scoring depend on your country, visa needs and salary range, and they are not on a resume.",
+               action: "Open preferences",
+               run: () => { settingsOpen.add("Candidate preferences"); switchTab("settings"); } };
+    }
+    if (status("source") === "empty") {
+      return { title: "Find jobs", detail: "Search your configured boards for matching roles.", action: "Run sourcing", run: () => startRun(["source"]) };
+    }
+    const missing = metric("evaluate", "Missing description");
+    const deferred = metric("evaluate", "Deferred by limit");
+    const qualified = metric("evaluate", "Qualified");
+    if (status("evaluate") === "empty") {
+      return { title: "Score the jobs", detail: "Rank sourced jobs against your profile.", action: "Run evaluation", run: () => startRun(["evaluate"]) };
+    }
+    if (status("tailor") === "empty" && qualified > 0) {
+      return { title: "Tailor your resume", detail: `${qualified} qualified job(s) are ready for tailored PDFs.`, action: "Run tailoring", run: () => startRun(["tailor"]) };
+    }
+    const manual = metric("apply", "Manual apply needed");
+    // What is left over never outranks work the candidate can act on today.
+    const leftovers = [
+      deferred > 0 ? `${deferred} more job${deferred === 1 ? " is" : "s are"} waiting to be scored.` : "",
+      missing > 0 ? `${missing} could not be scored because ${missing === 1 ? "it" : "they"} had no readable description.` : "",
+    ].filter(Boolean).join(" ");
+    if (manual > 0) {
+      return { title: `${manual} application${manual === 1 ? "" : "s"} need you to apply`,
+               detail: `Open each job, attach the tailored PDF and send it yourself. ${leftovers}`.trim(), action: "Open shortlist", run: openJobs };
+    }
+    if (qualified > 0) {
+      return { title: `${qualified} job${qualified === 1 ? " is" : "s are"} ready for your review`,
+               detail: `Each has a tailored resume and an explanation of its score. ${leftovers}`.trim(), action: "Open shortlist", run: openJobs };
+    }
+    if (deferred > 0) {
+      return { title: `${deferred} job${deferred === 1 ? "" : "s"} still to score`,
+               detail: "Evaluation stopped at its limit before reaching them. Run it again to continue.",
+               action: "Score the rest", run: () => startRun(["evaluate"]) };
+    }
+    if (missing > 0) {
+      return { title: `${missing} job${missing === 1 ? "" : "s"} could not be scored`,
+               detail: "They had no readable description. Re-running evaluation retries them.",
+               action: "Retry evaluation", run: () => startRun(["evaluate"]) };
+    }
+    return { title: "Pipeline is up to date", detail: "Review your shortlist, or run all phases to refresh the search.", action: "Open shortlist", run: openJobs };
+  }
+
+  function renderNextStep() {
+    const card = $("#next-step");
+    const step = nextStep();
+    card.hidden = !step;
+    if (!step) return;
+    $("#next-step-title").textContent = step.title;
+    $("#next-step-detail").textContent = step.detail;
+    const button = $("#next-step-action");
+    button.hidden = !step.action;
+    button.textContent = step.action || "";
+    button.onclick = step.run || null;
   }
 
   function renderPills() {
@@ -829,12 +1150,19 @@
 
   function renderNodes() {
     const flow = $("#flow");
+    // Nodes are rebuilt on every render; keep keyboard focus on the same card.
+    const focusedNode = document.activeElement?.closest?.(".node")?.dataset.node;
     flow.querySelectorAll(".node").forEach((n) => n.remove());
     if (!state) return;
+    fitLayout();
+    if (focusedNode) requestAnimationFrame(() => {
+      const card = flow.querySelector(`.node[data-node="${focusedNode}"]`);
+      (card?.querySelector(".node-body") || card)?.focus({ preventScroll: true });
+    });
 
     // Input nodes describe what you feed the pipeline.
-    flow.append(inputNode("resume", "Resume PDF", resumeLabel(), "📄"));
-    flow.append(inputNode("settings", "Search Settings", settingsLabel(), "⚙️"));
+    flow.append(inputNode("resume", "Resume PDF", resumeLabel(), "file-text"));
+    flow.append(inputNode("settings", "Search Settings", settingsLabel(), "sliders"));
 
     state.order.forEach((id, index) => {
       flow.append(phaseNode(id, index + 1));
@@ -853,51 +1181,86 @@
     return `${cfg.values.target_domains.length} role(s), ${cfg.values.job_boards.length} board(s)`;
   }
 
-  function inputNode(id, label, sub, icon) {
+  // Nodes contain their own "Run" button, and a <button> may not nest another
+  // button, so the card is a focusable div that behaves like one.
+  function makeActivatable(node, label) {
+    node.tabIndex = 0;
+    node.setAttribute("role", "button");
+    node.setAttribute("aria-label", label);
+    node.addEventListener("keydown", (e) => {
+      if (e.target !== node || (e.key !== "Enter" && e.key !== " ")) return;
+      e.preventDefault();
+      node.click();
+    });
+  }
+
+  function inputNode(id, label, sub, iconName) {
     const pos = NODE_POS[id];
-    const node = el("button", `node node-input status-${state?.config?.status === "error" && id === "settings" ? "error" : "ready"}`);
+    const node = el("div", `node node-input status-${state?.config?.status === "error" && id === "settings" ? "error" : "ready"}`);
     node.style.left = `${pos.x}px`;
     node.style.top = `${pos.y}px`;
     node.dataset.node = id;
+    makeActivatable(node, `${label}: ${sub}`);
 
     const head = el("div", "node-head");
-    head.append(el("div", "node-index", icon), el("div", "node-title", label));
+    const tile = el("div", "node-icon"); tile.append(icon(iconName));
+    head.append(tile, el("div", "node-title", label));
     node.append(head, el("div", "node-sub", sub));
 
     node.addEventListener("click", () => { selected = id; switchTab("settings"); render(); });
     return node;
   }
 
+  // A phase card holds two separate controls: a "select" button (the title,
+  // status and summary) and the Run button. They are siblings because a button
+  // may not contain another button, and assistive tech hides the children of
+  // anything with role="button", so a Run button inside the card was unreachable
+  // by name. Mouse users can still click anywhere on the card to select it.
   function phaseNode(id, index) {
     const phase = state.phases[id];
     const status = nodeStatus(id);
     const pos = NODE_POS[id];
 
-    const node = el("button", `node status-${status}${selected === id ? " is-selected" : ""}`);
+    const node = el("div", `node status-${status}${selected === id ? " is-selected" : ""}`);
     node.style.left = `${pos.x}px`;
     node.style.top = `${pos.y}px`;
     node.dataset.node = id;
+    node.setAttribute("role", "group");
+    node.setAttribute("aria-label", `Phase ${index}: ${phase.title}`);
 
-    const head = el("div", "node-head");
-    head.append(el("div", "node-index", String(index)), el("div", "node-title", phase.title));
-    node.append(head, el("div", "node-sub", phase.subtitle));
+    const select = el("button", "node-body");
+    select.type = "button";
+    select.setAttribute("aria-pressed", String(selected === id));
+    select.setAttribute("aria-label", `Phase ${index}, ${phase.title}: ${STATUS_LABEL[status] || status}. ${phase.summary}. Show details.`);
 
-    const badge = el("div", "node-status");
+    const head = el("span", "node-head");
+    const tile = el("span", "node-icon"); tile.append(icon(id));
+    head.append(tile, el("span", "node-title", phase.title), el("span", "node-index", String(index)));
+    select.append(head, el("span", "node-sub", phase.subtitle));
+
+    const badge = el("span", "node-status");
     if (status === "running") badge.append(el("span", "spin"));
     badge.append(el("span", null, STATUS_LABEL[status] || status));
-    node.append(badge);
+    if (status === "running" && activePhaseId === id) {
+      badge.append(el("span", "node-elapsed", formatElapsed(Date.now() - phaseStartedAt)));
+    }
+    select.append(badge, el("span", "node-summary", phase.summary));
+    node.append(select);
 
-    node.append(el("div", "node-summary", phase.summary));
-
-    const metrics = el("div", "node-metrics");
+    // Label/value rows rather than boxed chips: three numbers read as a column
+    // you can scan, where chips read as decoration.
+    const metrics = el("dl", "node-metrics");
     Object.entries(phase.metrics || {}).slice(0, 3).forEach(([key, value]) => {
-      const chip = el("span", "metric");
-      chip.append(document.createTextNode(`${key} `), el("b", null, String(value)));
-      metrics.append(chip);
+      const row = el("div", "metric");
+      row.append(el("dt", null, key), el("dd", null, String(value)));
+      metrics.append(row);
     });
     if (metrics.children.length) node.append(metrics);
 
-    const run = el("button", "btn btn-sm node-run", `Run ${phase.title.toLowerCase()}`);
+    const run = el("button", "btn btn-sm node-run");
+    run.type = "button";
+    run.setAttribute("aria-label", `Run ${phase.title.toLowerCase()}`);
+    run.append(icon("play"), el("span", null, `Run ${phase.title.toLowerCase()}`));
     run.disabled = running;
     run.addEventListener("click", (e) => { e.stopPropagation(); startRun([id]); });
     node.append(run);
@@ -982,32 +1345,175 @@
 
   function switchTab(name) {
     document.querySelectorAll(".tab").forEach((tab) => {
-      tab.classList.toggle("is-active", tab.dataset.tab === name);
+      const active = tab.dataset.tab === name;
+      tab.classList.toggle("is-active", active);
+      tab.setAttribute("aria-selected", String(active));
+      tab.tabIndex = active ? 0 : -1;
     });
     $("#panel-details").hidden = name !== "details";
     $("#panel-log").hidden = name !== "log";
     $("#panel-settings").hidden = name !== "settings";
     $("#panel-analytics").hidden = name !== "analytics";
+    $("#panel-history").hidden = name !== "history";
     if (name === "analytics") renderAnalytics();
     if (name === "settings") renderSettings();
+    if (name === "history") renderHistory();
+  }
+
+  // A labelled horizontal bar: the value is always printed next to the bar, so
+  // the chart is never the only way to read a number.
+  function barRow(label, value, sub, fraction, tone) {
+    const row = el("div", "bar-row");
+    const head = el("div", "bar-head");
+    head.append(el("span", "bar-label", label), el("span", "bar-value", value));
+    const track = el("div", "bar-track");
+    track.setAttribute("role", "img");
+    track.setAttribute("aria-label", `${label}: ${value}`);
+    const fill = el("div", `bar-fill${tone ? ` ${tone}` : ""}`);
+    fill.style.width = `${Math.max(0, Math.min(1, fraction || 0)) * 100}%`;
+    track.append(fill);
+    row.append(head, track);
+    if (sub) row.append(el("div", "bar-sub", sub));
+    return row;
+  }
+
+  function statTile(label, value, hint) {
+    const tile = el("div", "stat-tile");
+    tile.append(el("div", "stat-value", value), el("div", "stat-label", label));
+    if (hint) tile.append(el("div", "stat-hint", hint));
+    return tile;
   }
 
   async function renderAnalytics() {
-    const panel = $("#panel-analytics"); panel.replaceChildren(el("p", null, "Loading outcomes…"));
+    const panel = $("#panel-analytics");
+    panel.replaceChildren(el("p", "hint", "Loading outcomes…"));
     try {
-      const result = await api("/api/analytics"); panel.replaceChildren(el("h3", null, "Application outcomes"), el("p", null, result.note));
-      for (const stage of result.funnel) {
-        const row = el("div", "analytics-row");
-        row.append(el("strong", null, `${stage.stage}: ${stage.count}`), el("p", "hint", stage.conversion == null ? "Conversion unknown" : `${(stage.conversion * 100).toFixed(1)}% of preceding stage`));
-        const meter = el("meter"); meter.min = 0; meter.max = Math.max(1, result.funnel[0].count); meter.value = stage.count; meter.title = `${stage.stage}: ${stage.count}`;
-        row.append(meter); panel.append(row);
+      const [result, perf] = await Promise.all([
+        api("/api/analytics"),
+        api("/api/performance").catch(() => null),
+      ]);
+      panel.replaceChildren(el("h3", null, "Application outcomes"));
+      if (result.note) panel.append(el("p", "hint", result.note));
+      const lastRun = lastRunCard();
+      if (lastRun) { panel.append(el("h4", null, "Last run"), lastRun); panel.append(el("h4", null, "Outcomes")); }
+
+      const funnel = result.funnel || [];
+      const top = Math.max(1, funnel[0]?.count || 0);
+      if (!funnel.length || !funnel[0].count) {
+        const empty = el("div", "empty-state");
+        empty.append(el("strong", null, "No applications recorded yet"),
+          el("span", null, "Run the pipeline and mark jobs as applied; outcomes and reply rates will appear here."));
+        panel.append(empty);
       }
-      panel.append(el("p", null, result.median_response_days == null ? "Median response time: unknown" : `Median response time: ${result.median_response_days.toFixed(1)} days (${result.timed_responses} dated replies)`));
-      for (const [key, title] of [["by_score", "By fit score"], ["by_source", "By source"], ["by_variant", "By resume format"], ["by_role", "By role"]]) {
-        panel.append(el("h4", null, title));
-        for (const row of result[key]) panel.append(el("p", null, `${row.label}: ${row.replied}/${row.applied} replies${result.reply_tracking ? ` (${(row.response_rate * 100).toFixed(1)}%)` : " (tracking unavailable)"}`));
+
+      // Headline numbers first: what happened, and how fast replies come.
+      const last = funnel[funnel.length - 1];
+      const tiles = el("div", "stat-tiles");
+      if (funnel[0]) tiles.append(statTile(funnel[0].stage, String(funnel[0].count)));
+      if (last && last !== funnel[0]) tiles.append(statTile(last.stage, String(last.count)));
+      tiles.append(statTile("Median reply",
+        result.median_response_days == null ? "—" : `${result.median_response_days.toFixed(1)}d`,
+        result.median_response_days == null ? "No dated replies yet" : `${result.timed_responses} dated repl${result.timed_responses === 1 ? "y" : "ies"}`));
+      panel.append(tiles);
+
+      panel.append(el("h4", null, "Funnel"));
+      const funnelBox = el("div", "bars");
+      funnel.forEach((stage, i) => {
+        funnelBox.append(barRow(stage.stage, String(stage.count),
+          stage.conversion == null ? (i ? "Conversion unknown" : "") : `${(stage.conversion * 100).toFixed(1)}% of previous stage`,
+          stage.count / top));
+      });
+      panel.append(funnelBox);
+
+      for (const [key, heading] of [["by_score", "Reply rate by fit score"], ["by_source", "By source"], ["by_variant", "By resume format"], ["by_role", "By role"]]) {
+        const rows = result[key] || [];
+        if (!rows.length) continue;
+        panel.append(el("h4", null, heading));
+        const box = el("div", "bars");
+        for (const row of rows) {
+          const rate = result.reply_tracking ? `${(row.response_rate * 100).toFixed(1)}%` : "n/a";
+          box.append(barRow(row.label, `${row.replied}/${row.applied} replied`,
+            result.reply_tracking ? rate : "Reply tracking unavailable",
+            result.reply_tracking ? row.response_rate : 0, "is-ok"));
+        }
+        panel.append(box);
       }
-    } catch (error) { panel.replaceChildren(el("p", null, error.message)); }
+      renderLatency(panel, perf);
+    } catch (error) {
+      const failed = el("div", "callout err", `Could not load analytics: ${error.message}`);
+      panel.replaceChildren(failed);
+    }
+  }
+
+  function renderLatency(panel, perf) {
+    panel.append(el("h4", null, "Phase latency"));
+    if (!perf || !perf.phase_stats.length) {
+      panel.append(el("p", "hint", "No timed runs yet. Latency appears here after the first full run."));
+      return;
+    }
+    const slowest = Math.max(...perf.phase_stats.map((item) => item.average_seconds), 1);
+    const box = el("div", "bars");
+    for (const item of perf.phase_stats) {
+      box.append(barRow(`${title(item.phase)} · ${item.runs} run${item.runs === 1 ? "" : "s"}`,
+        `avg ${item.average_seconds.toFixed(1)}s`,
+        `latest ${item.latest_seconds.toFixed(1)}s${item.slow ? " · slower than usual" : ""}`,
+        item.average_seconds / slowest, item.slow ? "is-warn" : ""));
+    }
+    panel.append(box);
+
+    const anySlow = perf.phase_stats.some((item) => item.slow);
+    const callout = el("div", `callout ${anySlow ? "warn" : "ok"}`);
+    callout.append(el("strong", null, anySlow ? "Latency recommendations" : "Latency"));
+    const ul = el("ul");
+    for (const rec of perf.recommendations) ul.append(el("li", null, rec));
+    callout.append(ul);
+    panel.append(callout);
+  }
+
+  const SKIP_REASON_LABEL = {
+    off_target: "Title is not one of your target roles",
+    work_mode: "Work arrangement you did not select",
+    not_remote: "Not a remote role",
+    outside_onsite_countries: "On-site outside your onsite countries, or location unknown",
+    outside_remote_eligibility: "Remote role restricted to other countries",
+    below_min_salary: "Pays below your minimum salary",
+    too_old: "Older than your freshness window",
+    undated: "Company listing with no posting date",
+    incomplete_row: "Missing title, company or link",
+    invalid_row: "Could not be read",
+    duplicate_in_sweep: "Same role found again on another board or search",
+    already_seen: "Found by an earlier search (already scored or tailored)",
+  };
+
+  // Every job a filter dropped, grouped by reason, so a missing job has an explanation.
+  function appendSkippedJobs(panel) {
+    const box = el("div", "skipped-jobs");
+    panel.append(box);
+    fetch("/api/skipped?limit=1000").then((r) => (r.ok ? r.json() : null)).then((data) => {
+      if (!data || !data.total || !panel.contains(box)) return;
+      box.append(el("h4", null, `Why ${data.total} listing${data.total === 1 ? " was" : "s were"} dropped`));
+      Object.entries(data.reasons).sort((x, y) => y[1] - x[1]).forEach(([reason, count]) => {
+        const group = el("details", "skip-group");
+        group.append(el("summary", null, `${SKIP_REASON_LABEL[reason] || reason} — ${count}`));
+        const list = el("ul", "list");
+        data.jobs.filter((job) => job.reason === reason).slice(0, 15).forEach((job) => {
+          const li = el("li");
+          const label = [job.company, job.title].filter(Boolean).join(" — ") || "(untitled listing)";
+          if (/^https?:\/\//i.test(job.url || "")) {
+            const link = el("a", "link grow", label);
+            link.href = job.url; link.target = "_blank"; link.rel = "noopener noreferrer";
+            li.append(link);
+          } else {
+            li.append(el("span", "grow", label));
+          }
+          if (job.location) li.append(el("span", "metric", job.location));
+          list.append(li);
+        });
+        if (count > list.children.length) list.append(el("li", null, `…and ${count - list.children.length} more`));
+        group.append(list);
+        box.append(group);
+      });
+    }).catch(() => {});
   }
 
   function renderPanel() {
@@ -1054,6 +1560,8 @@
       });
       panel.append(dl);
     }
+
+    if (id === "source") { appendSkippedJobs(panel); }
 
     if (id === "evaluate" && phase.top?.length) {
       panel.append(el("h4", null, "Top matches"));
@@ -1135,23 +1643,87 @@
     panel.append(runBtn);
   }
 
-  function renderLog() {
-    const panel = $("#panel-log");
-    const atBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 60;
-    panel.innerHTML = "";
+  const fmtTime = (ts) => new Date(ts).toLocaleTimeString(undefined, { hour12: false });
 
+  // Splits `text` into plain/matched chunks around a case-insensitive query,
+  // so the filter reads as a highlight rather than just a narrowed list.
+  function highlightInto(container, text, query) {
+    if (!query) { container.append(document.createTextNode(text)); return; }
+    const lower = text.toLowerCase();
+    let i = 0;
+    let at;
+    while ((at = lower.indexOf(query, i)) !== -1) {
+      if (at > i) container.append(document.createTextNode(text.slice(i, at)));
+      const mark = el("mark", null, text.slice(at, at + query.length));
+      container.append(mark);
+      i = at + query.length;
+    }
+    if (i < text.length) container.append(document.createTextNode(text.slice(i)));
+  }
+
+  function filteredLogLines() {
+    const query = logFilter.query.trim().toLowerCase();
+    return logLines.filter((entry) => {
+      const level = logLevel(entry);
+      if (logFilter.level === "warn" && level !== "warn") return false;
+      if (logFilter.level === "err" && level !== "err") return false;
+      if (query && !entry.line.toLowerCase().includes(query) && !(entry.phase || "").toLowerCase().includes(query)) return false;
+      return true;
+    });
+  }
+
+  function renderLog() {
+    const body = $("#log-body");
+    if (!body) return;
+    const atBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 60;
+    const visible = filteredLogLines();
+    const query = logFilter.query.trim().toLowerCase();
+
+    body.innerHTML = "";
     if (!logLines.length) {
-      panel.append(el("span", "log-empty", "No activity yet. Press “Run all phases” to start."));
-      return;
+      body.append(el("span", "log-empty", "No activity yet. Press “Run all phases” to start."));
+    } else if (!visible.length) {
+      body.append(el("span", "log-empty", "No log lines match this filter."));
+    } else {
+      const frag = document.createDocumentFragment();
+      for (const entry of visible) {
+        const level = logLevel(entry);
+        const line = el("div", `log-line ${level}`);
+        line.append(el("span", "log-time", fmtTime(entry.ts)));
+        // A visible gap is latency made legible: the seconds between two lines
+        // are exactly the seconds the backend spent waiting (a Groq cooldown, a
+        // scrape, a PDF compile) before it had anything new to say.
+        if (entry.gapMs >= 1500) {
+          const badge = el("span", `log-gap${entry.gapMs >= 5000 ? " log-gap-hot" : ""}`, `⏱ +${(entry.gapMs / 1000).toFixed(1)}s`);
+          badge.title = "Time since the previous log line";
+          line.append(badge);
+        }
+        if (entry.phase) line.append(el("span", "log-phase", entry.phase));
+        const text = el("span", "log-text");
+        highlightInto(text, entry.line, query);
+        line.append(text);
+        frag.append(line);
+      }
+      body.append(frag);
     }
-    for (const entry of logLines) {
-      const line = el("div", `log-line ${entry.kind}`);
-      if (entry.phase) line.append(el("span", "tag", `[${entry.phase}] `));
-      line.append(document.createTextNode(entry.line));
-      panel.append(line);
+
+    const count = $("#log-count");
+    if (count) {
+      count.textContent = visible.length === logLines.length
+        ? `${logLines.length} line${logLines.length === 1 ? "" : "s"}`
+        : `${visible.length} of ${logLines.length}`;
     }
-    // Only auto-scroll when the user was already following the tail.
-    if (atBottom) panel.scrollTop = panel.scrollHeight;
+
+    // Only auto-scroll when the user was already following the tail; otherwise
+    // surface a "jump to latest" affordance instead of yanking their scroll
+    // position while they're reading something further up.
+    const jump = $("#log-jump");
+    if (atBottom) {
+      body.scrollTop = body.scrollHeight;
+      if (jump) jump.hidden = true;
+    } else if (jump && logLines.length) {
+      jump.hidden = false;
+    }
   }
 
   /* ---------------- Settings panel ---------------- */
@@ -1472,6 +2044,8 @@
     });
     panel.append(prefForm);
 
+    runOptionsSection(panel);
+
     /* --- Where things land --- */
     panel.append(el("h4", null, "Output locations"));
     const dl = el("dl", "kv");
@@ -1480,6 +2054,38 @@
     dl.append(el("dt", null, "Tracker"), el("dd", null, state.paths.tracker));
     dl.append(el("dt", null, "Jobs CSV"), el("dd", null, state.paths.jobs_csv));
     panel.append(dl);
+    groupSections(panel);
+  }
+
+  // The settings form is long, so each block becomes a collapsible section.
+  // Open/closed state lives here (not in the DOM) because saving re-renders
+  // the whole panel and would otherwise snap everything back.
+  const settingsOpen = new Set(["Resume", "Search parameters"]);
+  const SECTION_TITLES = { "Input: resume": "Resume", "Input: search parameters": "Search parameters" };
+
+  function groupSections(panel) {
+    const nodes = [...panel.children];
+    panel.replaceChildren();
+    let body = null;
+    for (const node of nodes) {
+      if (node.matches("h3, h4")) {
+        const name = SECTION_TITLES[node.textContent] || node.textContent;
+        const details = el("details", "sec");
+        details.open = settingsOpen.has(name);
+        details.addEventListener("toggle", () => {
+          if (details.open) settingsOpen.add(name); else settingsOpen.delete(name);
+        });
+        const summary = el("summary");
+        summary.append(el("span", null, name), icon("chevron"));
+        body = el("div", "sec-body");
+        details.append(summary, body);
+        panel.append(details);
+      } else if (body) {
+        body.append(node);
+      } else {
+        panel.append(node);
+      }
+    }
   }
 
   function textField(name, label, value, hint) {
@@ -1657,73 +2263,243 @@
     }
     return link;
   }
+  // Jobs the candidate chose to skip. Recorded on the server (not only hidden here) so the
+  // next search does not resurface them and evaluation does not spend quota scoring them
+  // again. It is still not an application outcome: nothing reaches the tracker.
+  const skippedJobs = new Set();
+  // Skips made before they were stored on the server lived in this browser only; send them
+  // once, then forget the local copy.
+  async function migrateLocalSkips(knownIds) {
+    let local = [];
+    try { local = JSON.parse(localStorage.getItem("jobAgentSkipped") || "[]"); } catch { return; }
+    if (!local.length) return;
+    for (const id of local) {
+      if (skippedJobs.has(id) || !knownIds.has(id)) continue;
+      try { await api("/api/jobs/skip", {method: "POST", body: JSON.stringify({job_id: id})}); skippedJobs.add(id); }
+      catch { /* an unknown or already-recorded job: nothing to carry over */ }
+    }
+    try { localStorage.removeItem("jobAgentSkipped"); } catch { /* private mode */ }
+  }
+  let openJobId = null;
+
+  function fitTone(score) {
+    const n = Number(score);
+    if (score === "" || score == null || !Number.isFinite(n)) return "none";
+    return n >= 7 ? "good" : n >= 5 ? "mid" : "low";
+  }
+  const FIT_WORD = { good: "strong fit", mid: "possible fit", low: "weak fit", none: "not scored" };
+
+  function fitBadge(row) {
+    const tone = fitTone(row["Fit Score"]);
+    const badge = el("span", `fit fit-${tone}`, tone === "none" ? "—" : String(row["Fit Score"]));
+    badge.setAttribute("aria-label", tone === "none" ? "Not scored" : `Fit ${row["Fit Score"]} out of 10, ${FIT_WORD[tone]}`);
+    return badge;
+  }
+
+  function chipList(text, cls) {
+    const wrap = el("div", "chips");
+    String(text || "").split(/[,;]\s*/).map((s) => s.trim()).filter(Boolean)
+      .forEach((item) => wrap.append(el("span", `chip ${cls || ""}`, item)));
+    return wrap;
+  }
+
+  function drawerSection(title, ...children) {
+    const section = el("section", "drawer-section");
+    section.append(el("h4", null, title), ...children);
+    return section;
+  }
+
+  function jobFileLink(row, column, label, download) {
+    if (!row[column]) return null;
+    return safeLink(label, `/api/file?${download ? "download=1&" : ""}path=${encodeURIComponent(row[column])}`);
+  }
+
+  function renderJobDrawer(row) {
+    const drawer = $("#job-drawer");
+    drawer.replaceChildren();
+    if (!row) { openJobId = null; drawer.hidden = true; $(".jobs-layout").classList.remove("has-drawer"); return; }
+    const id = row["Job ID"];
+    openJobId = id;
+    drawer.hidden = false;
+    $(".jobs-layout").classList.add("has-drawer");
+
+    const close = el("button", "btn btn-sm drawer-close", "Close");
+    close.type = "button";
+    close.setAttribute("aria-label", "Close job details");
+    close.addEventListener("click", () => { renderJobDrawer(null); renderJobRows(); });
+
+    const head = el("header", "drawer-head");
+    const titleBox = el("div", "drawer-title");
+    titleBox.append(el("h3", null, row.Title || "Untitled role"),
+      el("p", "drawer-company", `${row.Company || "Unknown company"} · ${row.Location || "Unknown location"}${row["Work Mode"] ? ` · ${row["Work Mode"]}` : ""}`));
+    head.append(fitBadge(row), titleBox, close);
+    drawer.append(head);
+
+    const primary = el("div", "drawer-primary");
+    const apply = safeLink("View job / apply ↗", row["Apply URL"] || row["Job URL"]);
+    apply.classList.add("btn", "btn-primary");
+    primary.append(apply);
+    drawer.append(primary);
+    if (row["Next Step"]) drawer.append(el("p", "drawer-next", row["Next Step"]));
+    if (row["Search Batch"] !== "Current search") drawer.append(el("p", "hint", "Earlier search; fit may be stale."));
+
+    const why = [el("p", null, row["Score Reasoning"] || "No scoring explanation is recorded.")];
+    if (row["Matched Skills"]) why.push(el("p", "hint", "Matched"), chipList(row["Matched Skills"], "chip-ok"));
+    if (row["Missing Skills"]) why.push(el("p", "hint", "Reported gaps"), chipList(row["Missing Skills"], "chip-warn"));
+    if (row["Skills Found In Profile"]) why.push(el("p", "hint", `Already in your profile: ${row["Skills Found In Profile"]}. Review the scorer's gap assessment; the score has not been changed.`));
+    why.push(el("p", "hint", "Only add keywords supported by your actual experience."));
+    drawer.append(drawerSection("Why this score", ...why));
+
+    drawer.append(drawerSection("Eligibility",
+      el("p", null, row["Remote Eligibility"] || "Review eligibility on the employer listing."),
+      ...(row["Eligibility Notes"] ? [el("p", "hint", row["Eligibility Notes"])] : [])));
+
+    const contact = [el("p", null, row["HR / Careers Email"] || "No published email found"),
+      el("p", "hint", row["Email Verification"] || "Deliverability not checked")];
+    if (row["Email Found On"]) contact.push(safeLink("Contact source", row["Email Found On"]));
+    if (row["Possible Contacts"]) contact.push(el("p", "hint", `Possible contacts (unverified): ${row["Possible Contacts"]}`));
+    drawer.append(drawerSection("Contact", ...contact));
+
+    const files = el("div", "drawer-links");
+    [jobFileLink(row, "Tailored Resume Path", "Open tailored PDF"),
+     jobFileLink(row, "Tailored Resume Path", "Download resume", true),
+     jobFileLink(row, "Cover Letter", "Cover letter", true),
+     jobFileLink(row, "Interview Prep", "Interview prep", true)]
+      .filter(Boolean).forEach((link) => files.append(link));
+    if (row["Email Draft File"] && outreachDirectory) {
+      files.append(safeLink("Open unsent email draft", `/api/file?path=${encodeURIComponent(outreachDirectory + "/" + row["Email Draft File"])}`));
+    }
+    drawer.append(drawerSection("Documents", el("p", "hint", row["Resume Check"] || "Resume not yet generated"), files));
+
+    const actions = el("div", "drawer-actions");
+
+    if (fitTone(row["Fit Score"]) === "none") {
+      const retry = el("button", "btn btn-sm", "Retry evaluation");
+      retry.type = "button"; retry.disabled = running;
+      retry.title = "Re-runs the evaluation phase; jobs without a readable description are retried.";
+      retry.addEventListener("click", () => { $("#jobs-dialog").close(); startRun(["evaluate"]); });
+      actions.append(retry);
+    }
+    const resumeBtn = el("button", `btn btn-sm${row["Tailored Resume Path"] ? " btn-ghost" : " btn-primary"}`,
+                         row["Tailored Resume Path"] ? "Regenerate resume" : "Generate tailored resume");
+    resumeBtn.type = "button"; resumeBtn.disabled = running;
+    resumeBtn.title = "Rebuilds your own resume PDF for this job: same design, content reordered for the role. Works with or without a job description.";
+    resumeBtn.addEventListener("click", () => { $("#jobs-dialog").close(); startRun(["tailor"], id); });
+    actions.prepend(resumeBtn);
+    const minScore = Number(state?.thresholds?.min_match_score ?? 7);
+    if (row["Tailored Resume Path"] && !row["Interview Prep"] && Number(row["Fit Score"]) >= minScore) {
+      const prep = el("button", "btn btn-sm", "Prepare interview guide");
+      prep.type = "button"; prep.disabled = running;
+      prep.addEventListener("click", () => { $("#jobs-dialog").close(); startRun(["prep"], id); });
+      actions.append(prep);
+    }
+    if (!String(row.Status || "").startsWith("replied_") && (row.Status !== "applied" || manuallyApplied.has(id))) {
+      const undo = manuallyApplied.has(id);
+      const mark = el("button", "btn btn-sm", undo ? "Undo applied marker" : "Mark as applied");
+      mark.type = "button";
+      mark.addEventListener("click", async () => {
+        mark.disabled = true;
+        try {
+          const result = await api("/api/jobs/applied", {method: "POST", body: JSON.stringify({job_id: id, undo})});
+          toast((result.warnings || []).join(" ") || (undo ? "Manual marker undone." : "Recorded. No application was sent by this action."), "ok");
+          await openJobs();
+        } catch (error) { toast(error.message, "err"); mark.disabled = false; }
+      });
+      actions.append(mark);
+    }
+    const skipped = skippedJobs.has(id);
+    const skip = el("button", "btn btn-sm btn-ghost", skipped ? "Restore to shortlist" : "Skip this job");
+    skip.type = "button";
+    skip.title = "Removes this job from your shortlist and keeps it out of future searches and scoring. It is not recorded as an application.";
+    skip.addEventListener("click", async () => {
+      skip.disabled = true;
+      try {
+        await api("/api/jobs/skip", {method: "POST", body: JSON.stringify({job_id: id, undo: skipped})});
+      } catch (error) { toast(error.message, "err"); skip.disabled = false; return; }
+      if (skipped) skippedJobs.delete(id); else skippedJobs.add(id);
+      toast(skipped ? "Job restored to your shortlist." : "Job skipped. It will not be scored or suggested again.", "ok");
+      if (!skipped && !$("#jobs-skipped").checked) renderJobDrawer(null);
+      renderJobRows();
+    });
+    actions.append(skip);
+    const foot = el("div", "drawer-foot");
+    foot.append(actions);
+    drawer.append(foot);
+  }
+
+  // What a person needs to know about a job at a glance. Having a resume is not the same as
+  // being worth applying to, so the three situations are named separately.
+  const READINESS_LABEL = {
+    "Ready for your review": "Ready to review",
+    "Resume ready, not scored": "Resume · not scored",
+    "Resume ready, below threshold": "Resume · below threshold",
+  };
+
+  function jobStatusText(row) {
+    if (manuallyApplied.has(row["Job ID"])) return "Applied (marked)";
+    if (READINESS_LABEL[row["Application Readiness"]]) return READINESS_LABEL[row["Application Readiness"]];
+    const raw = String(row.Status || "found").replace(/_/g, " ");
+    return raw.charAt(0).toUpperCase() + raw.slice(1);
+  }
+
   function renderJobRows() {
     const query = $("#jobs-query").value.toLowerCase();
     const mode = $("#jobs-mode").value;
     const hiring = $("#jobs-email").checked;
     const current = $("#jobs-current").checked;
     const ready = $("#jobs-ready").checked;
+    const showSkipped = $("#jobs-skipped").checked;
     const rows = jobRows.filter(row => (!mode || row["Work Mode"] === mode)
-      && (!current || row["Search Batch"] === "Current search")
+      && (!current || jobsRun || row["Search Batch"] === "Current search")
       && (!ready || row["Application Readiness"] === "Ready for your review")
       && (!hiring || ["hiring", "person"].includes(row["Email Type"]))
+      && (showSkipped || !skippedJobs.has(row["Job ID"]))
       && ["Title", "Company", "Location"].some(key => (row[key] || "").toLowerCase().includes(query)))
       .sort((a, b) => (Number(b["Fit Score"]) || 0) - (Number(a["Fit Score"]) || 0));
-    $("#jobs-count").textContent = `${rows.length} matching jobs · ${jobRows.length} saved in total · showing ${Math.min(visibleJobs, rows.length)} · scores out of 10`;
+    const hidden = jobRows.filter(r => skippedJobs.has(r["Job ID"])).length;
+    $("#jobs-count").textContent = `${rows.length} matching · ${jobRows.length} saved · showing ${Math.min(visibleJobs, rows.length)} · fit is out of 10${hidden && !showSkipped ? ` · ${hidden} skipped` : ""}`;
     $("#jobs-more").hidden = rows.length <= visibleJobs;
     const body = $("#jobs-rows"); body.replaceChildren();
     for (const row of rows.slice(0, visibleJobs)) {
-      const tr = el("tr");
-      const role = el("td"); role.append(el("strong", null, row.Title), el("p", null, row.Company), el("small", null, `${row.Source || ""} · ${row.Status || "found"}`));
-      if (row["Search Batch"] !== "Current search") role.append(el("p", "hint", "Earlier search; fit may be stale"));
-      const scoreDetails = el("details"); scoreDetails.append(el("summary", null, "Why this score"));
-      scoreDetails.append(el("p", null, row["Score Reasoning"] || "No scoring explanation is recorded."));
-      scoreDetails.append(el("p", "hint", `Matched: ${row["Matched Skills"] || "Not recorded"}`));
-      scoreDetails.append(el("p", "hint", `Reported gaps: ${row["Missing Skills"] || "None recorded"}`));
-      if (row["Skills Found In Profile"]) scoreDetails.append(el("p", "hint", `Already in your profile: ${row["Skills Found In Profile"]}. Review the scorer's gap assessment; the score has not been changed.`));
-      scoreDetails.append(el("p", "hint", "Only add keywords supported by your actual experience.")); role.append(scoreDetails);
-      const location = el("td"); location.append(el("div", null, `${row.Location || "Unknown"} · ${row["Work Mode"] || ""}`), el("p", "hint", row["Remote Eligibility"] || "Review eligibility"));
-      location.title = row["Eligibility Notes"] || "";
-      const contact = el("td"); contact.append(el("div", null, row["HR / Careers Email"] || "No published email found"), el("p", "hint", row["Email Verification"] || "Deliverability not checked"));
-      if (row["Email Found On"]) contact.append(safeLink("Contact source", row["Email Found On"]));
-      if (row["Possible Contacts"]) { const leads = el("details"); leads.append(el("summary", null, "Possible contacts (unverified)"), el("p", null, row["Possible Contacts"])); contact.append(leads); }
-      const actions = el("td");
-      actions.append(safeLink("View job / apply", row["Apply URL"] || row["Job URL"]));
-      if (row["Tailored Resume Path"]) actions.append(el("br"), safeLink("Open PDF", `/api/file?path=${encodeURIComponent(row["Tailored Resume Path"])}`));
-      if (row["Tailored Resume Path"]) actions.append(el("br"), safeLink("Download resume", `/api/file?download=1&path=${encodeURIComponent(row["Tailored Resume Path"])}`));
-      actions.append(el("p", "hint", row["Resume Check"] || "Resume not yet generated"));
-      actions.append(el("p", "hint", row["Next Step"] || "Review the employer listing before applying."));
-      for (const column of ["Interview Prep", "Cover Letter"]) if (row[column]) actions.append(el("br"), safeLink(column, `/api/file?download=1&path=${encodeURIComponent(row[column])}`));
-      if (row["Tailored Resume Path"] && !row["Interview Prep"]) {
-        const prep = el("button", "btn btn-sm", "Prepare interview guide"); prep.disabled = running;
-        prep.addEventListener("click", () => { $("#jobs-dialog").close(); startRun(["prep"], row["Job ID"]); }); actions.append(prep);
-      }
-      if (!row.Status.startsWith("replied_") && (row.Status !== "applied" || manuallyApplied.has(row["Job ID"]))) {
-        const undo = manuallyApplied.has(row["Job ID"]);
-        const mark = el("button", "btn btn-sm", undo ? "Undo applied marker" : "Mark as applied");
-        mark.addEventListener("click", async () => {
-          mark.disabled = true;
-          try {
-            const result = await api("/api/jobs/applied", {method: "POST", body: JSON.stringify({job_id: row["Job ID"], undo})});
-            toast((result.warnings || []).join(" ") || (undo ? "Manual marker undone." : "Recorded. No application was sent by this action."));
-            await openJobs();
-          } catch (error) { toast(error.message, "err"); mark.disabled = false; }
-        });
-        actions.append(mark);
-      }
-      if (row["Email Draft File"] && outreachDirectory) actions.append(safeLink("Open unsent email draft", `/api/file?path=${encodeURIComponent(outreachDirectory + "/" + row["Email Draft File"])}`));
-      tr.append(role, location, el("td", null, row["Fit Score"] || "Not scored"), contact, actions); body.append(tr);
+      const id = row["Job ID"];
+      const tr = el("tr", `job-row${openJobId === id ? " is-open" : ""}${skippedJobs.has(id) ? " is-skipped" : ""}`);
+      tr.tabIndex = 0;
+      tr.setAttribute("aria-label", `${row.Title}, ${row.Company}. Open details.`);
+      const fit = el("td", "col-fit"); fit.append(fitBadge(row));
+      const role = el("td", "col-role");
+      role.append(el("strong", null, row.Title), el("span", "sub", row.Company), el("span", "sub faint", row.Source || ""));
+      const place = el("td", null, `${row.Location || "Unknown"}${row["Work Mode"] ? ` · ${row["Work Mode"]}` : ""}`);
+      const contact = el("td", row["HR / Careers Email"] ? "" : "faint", row["HR / Careers Email"] ? "Email found" : "No email");
+      const status = el("td"); status.append(el("span", `status-chip${manuallyApplied.has(id) ? " is-done" : row["Application Readiness"] === "Ready for your review" ? " is-ready" : ""}`, jobStatusText(row)));
+      tr.append(fit, role, place, contact, status);
+      const open = () => { renderJobDrawer(row); renderJobRows(); $("#job-drawer").scrollTop = 0; };
+      tr.addEventListener("click", open);
+      tr.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+      body.append(tr);
     }
-    if (!rows.length) { const tr = el("tr"); const td = el("td", null, "No jobs match. Run sourcing or adjust your filters."); td.colSpan = 5; tr.append(td); body.append(tr); }
+    if (!rows.length) {
+      const tr = el("tr");
+      const td = el("td", "jobs-empty", jobRows.length
+        ? "No jobs match these filters. Clear a filter to see more."
+        : "No jobs yet. Run sourcing from the pipeline to find some.");
+      td.colSpan = 5; tr.append(td); body.append(tr);
+    }
+    // A job that no longer exists (e.g. archived) must not leave a stale drawer.
+    if (openJobId && !jobRows.some(r => r["Job ID"] === openJobId)) renderJobDrawer(null);
   }
 
   async function openJobs() {
     const dialog = $("#jobs-dialog"); if (!dialog.open) dialog.showModal();
     $("#jobs-count").textContent = "Loading jobs…";
     try {
-      const result = await api("/api/jobs"); jobRows = result.jobs || []; visibleJobs = 50;
+      populateRunSelect();
+      const result = await api(`/api/jobs${jobsRun ? `?run=${encodeURIComponent(jobsRun)}` : ""}`);
+      jobRows = result.jobs || []; visibleJobs = 50;
       outreachDirectory = result.outreach_dir || "";
       manuallyApplied = new Set(result.manually_applied || []);
+      skippedJobs.clear();
+      (result.user_skipped || []).forEach((id) => skippedJobs.add(id));
+      await migrateLocalSkips(new Set(jobRows.map((row) => row["Job ID"])));
       $("#jobs-csv").href = `/api/file?path=${encodeURIComponent(result.csv_path)}`;
       $("#jobs-latest-csv").href = `/api/file?path=${encodeURIComponent(result.latest_csv_path)}`;
       $("#jobs-ready-csv").href = `/api/file?path=${encodeURIComponent(result.ready_csv_path)}`;
@@ -1740,13 +2516,361 @@
         $("#jobs-coverage").textContent += " These saved results are older than your search window. Run a fresh search before applying.";
       }
       renderJobRows();
+      const open = openJobId && jobRows.find(r => r["Job ID"] === openJobId);
+      if (open) renderJobDrawer(open);
     } catch (error) { $("#jobs-count").textContent = error.message; }
   }
 
+  /* ---------------- Command palette and shortcuts ---------------- */
+
+  // Every action here already exists as a button; the palette only gives
+  // keyboard users one place to reach them. Runs go through the same handlers
+  // as the buttons, so the live-apply confirmation and resume checks still apply.
+  function paletteCommands() {
+    const commands = [
+      { title: "Open job shortlist", hint: "J", run: openJobs },
+      { title: "Go to Details", run: () => switchTab("details") },
+      { title: "Go to Live log", run: () => switchTab("log") },
+      { title: "Go to History", run: () => switchTab("history") },
+      { title: "Go to Settings", run: () => switchTab("settings") },
+      { title: "Go to Analytics", run: () => switchTab("analytics") },
+      { title: "Toggle light / dark theme", hint: "T", run: () => $("#theme-btn").click() },
+      { title: "Toggle fit to view", run: () => $("#fit-btn").click() },
+      { title: "Show keyboard shortcuts", hint: "?", run: openShortcuts },
+    ];
+    if (state && !running) {
+      commands.unshift({ title: "Run all phases", run: () => $("#run-btn").click() });
+      (state.order || []).forEach((id) => {
+        commands.splice(1, 0, { title: `Run ${state.phases[id].title} only`, run: () => startRun([id]) });
+      });
+    }
+    return commands;
+  }
+
+  const palette = { items: [], active: 0 };
+
+  function openPalette() {
+    const dialog = $("#palette");
+    if (dialog.open) { dialog.close(); return; }
+    $("#palette-input").value = "";
+    renderPalette();
+    dialog.showModal();
+    $("#palette-input").focus();
+  }
+
+  function renderPalette() {
+    const query = $("#palette-input").value.trim().toLowerCase();
+    const words = query.split(/\s+/).filter(Boolean);
+    palette.items = paletteCommands().filter((c) => words.every((w) => c.title.toLowerCase().includes(w)));
+    palette.active = Math.min(palette.active, Math.max(0, palette.items.length - 1));
+    const list = $("#palette-list");
+    list.replaceChildren();
+    palette.items.forEach((command, i) => {
+      const item = el("li", `palette-item${i === palette.active ? " is-active" : ""}`);
+      item.id = `palette-opt-${i}`;
+      item.setAttribute("role", "option");
+      item.setAttribute("aria-selected", String(i === palette.active));
+      item.append(el("span", null, command.title));
+      if (command.hint) item.append(el("kbd", null, command.hint));
+      item.addEventListener("click", () => runPaletteItem(i));
+      item.addEventListener("mousemove", () => { if (palette.active !== i) { palette.active = i; renderPalette(); } });
+      list.append(item);
+    });
+    if (!palette.items.length) list.append(el("li", "palette-empty", "No matching command."));
+    $("#palette-input").setAttribute("aria-activedescendant", palette.items.length ? `palette-opt-${palette.active}` : "");
+    list.querySelector(".is-active")?.scrollIntoView({ block: "nearest" });
+  }
+
+  function runPaletteItem(index) {
+    const command = palette.items[index];
+    if (!command) return;
+    $("#palette").close();
+    // Let the dialog finish closing so a command that opens another dialog
+    // (the shortlist) is not immediately dismissed.
+    setTimeout(command.run, 0);
+  }
+
+  function openShortcuts() {
+    const dialog = $("#shortcuts");
+    if (!dialog.open) dialog.showModal();
+  }
+
+  function initPalette() {
+    $("#palette-input").addEventListener("input", () => { palette.active = 0; renderPalette(); });
+    $("#palette-input").addEventListener("keydown", (e) => {
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const n = palette.items.length;
+        if (n) { palette.active = (palette.active + (e.key === "ArrowDown" ? 1 : n - 1)) % n; renderPalette(); }
+      } else if (e.key === "Enter") {
+        e.preventDefault();
+        runPaletteItem(palette.active);
+      }
+    });
+    $("#palette").addEventListener("click", (e) => { if (e.target === $("#palette")) $("#palette").close(); });
+    $("#shortcuts-close").addEventListener("click", () => $("#shortcuts").close());
+    $("#shortcuts").addEventListener("click", (e) => { if (e.target === $("#shortcuts")) $("#shortcuts").close(); });
+
+    document.addEventListener("keydown", (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") { e.preventDefault(); openPalette(); return; }
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = e.target;
+      const typing = target.matches?.("input, textarea, select, [contenteditable]");
+      if (typing || $("#palette").open || $("#shortcuts").open) return;
+      if (e.key === "?") { e.preventDefault(); openShortcuts(); }
+      else if (e.key === "/") {
+        e.preventDefault();
+        if ($("#jobs-dialog").open) $("#jobs-query").focus();
+        else { switchTab("log"); $("#log-search").focus(); }
+      } else if (e.key.toLowerCase() === "j" && !$("#jobs-dialog").open && !$("#setup-root").children.length) openJobs();
+      else if (e.key.toLowerCase() === "t") $("#theme-btn").click();
+    });
+  }
+
+  /* ---------------- Last run summary ---------------- */
+
+  function oneLine(summary) {
+    const parts = [];
+    for (const [key, value] of Object.entries(summary || {})) {
+      if (["string", "number", "boolean"].includes(typeof value) && String(value).length <= 24 && !/path|tracker|note|warning/i.test(key)) {
+        parts.push(`${key.replace(/_/g, " ")} ${value}`);
+      }
+      if (parts.length === 3) break;
+    }
+    return parts.join(" · ");
+  }
+
+  function lastRunCard() {
+    const report = state?.run_report;
+    if (!report || !report.started_at || !report.phases || !Object.keys(report.phases).length) return null;
+    const card = el("section", "last-run");
+    const verdict = { ok: "Completed", warning: "Completed with warnings", error: "Failed", interrupted: "Stopped" }[report.status] || report.status || "Unknown";
+    const started = new Date(report.started_at), finished = report.finished_at ? new Date(report.finished_at) : null;
+    const seconds = finished ? Math.max(0, (finished - started) / 1000) : null;
+    const head = el("div", "last-run-head");
+    head.append(el("strong", null, verdict), el("span", "hint", `${started.toLocaleString()}${seconds != null ? ` · ${formatElapsed(seconds * 1000)}` : ""}${report.dry_run ? " · dry run" : ""}`));
+    card.append(head);
+    const rows = el("ul", "last-run-phases");
+    (state.order || Object.keys(report.phases)).forEach((id) => {
+      const phase = report.phases[id];
+      if (!phase) return;
+      const li = el("li", `lr-${phase.status === "ok" ? "ok" : phase.status === "warning" ? "warn" : "err"}`);
+      li.append(el("span", "lr-dot"), el("span", "lr-name", state.phases[id]?.title || title(id)), el("span", "lr-sum", oneLine(phase.summary) || (STATUS_LABEL[phase.status === "ok" ? "ready" : phase.status] || phase.status)));
+      rows.append(li);
+    });
+    card.append(rows);
+    if ((report.warnings || []).length) {
+      const warn = el("div", "callout warn");
+      report.warnings.slice(0, 3).forEach((w) => warn.append(el("div", null, w)));
+      card.append(warn);
+    }
+    return card;
+  }
+
+  /* ---------------- Run history ---------------- */
+
+  const RUN_VERDICT = { ok: "Completed", warning: "Completed with warnings", error: "Failed", halted: "Stopped",
+                        cancelled: "Stopped", interrupted: "Interrupted", running: "Running" };
+  let jobsRun = "";            // run whose jobs the shortlist shows ("" = every saved job)
+  let historyRuns = [];
+  let historyProfiles = [];        // [{key, name}] of everyone who has run on this machine
+  let currentProfile = "";         // the candidate whose profile is loaded now
+  let historyProfile = null;       // null = not chosen yet, which means the current candidate
+
+  function runLabel(run) {
+    const when = new Date(run.started_at);
+    return `${when.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })} `
+         + `${when.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`;
+  }
+
+  function totalsLine(totals) {
+    const t = totals || {};
+    const parts = [];
+    if (t.jobs_found != null) parts.push(`${t.jobs_found} found`);
+    if (t.scored != null) parts.push(`${t.scored} scored`);
+    if (t.qualified != null) parts.push(`${t.qualified} qualified`);
+    if (t.resumes != null) parts.push(`${t.resumes} resumes`);
+    if (t.submitted) parts.push(`${t.submitted} submitted`);
+    return parts.join(" · ") || "No results recorded";
+  }
+
+  function runCard(run) {
+    const card = el("article", "run-card");
+    const verdict = RUN_VERDICT[run.status] || run.status || "Unknown";
+    const tone = run.status === "ok" ? "ok" : run.status === "warning" ? "warn" : run.status === "running" ? "run" : "err";
+    const head = el("div", "run-head");
+    head.append(el("strong", null, new Date(run.started_at).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })),
+                el("span", `run-status run-${tone}`, verdict));
+    if (run.dry_run) head.append(el("span", "run-tag", "dry run"));
+    card.append(head);
+    const who = [run.candidate_name || "Unknown profile", run.resume_file].filter(Boolean).join(" · ");
+    card.append(el("p", "run-who", who), el("p", "run-totals", totalsLine(run.totals)));
+
+    const results = run.results || {};
+    const names = Object.keys(results);
+    if (names.length) {
+      const details = el("details", "run-phases");
+      const seconds = run.finished_at ? (new Date(run.finished_at) - new Date(run.started_at)) / 1000 : null;
+      details.append(el("summary", null, `${names.length} phase${names.length === 1 ? "" : "s"}${seconds != null ? ` · ${formatElapsed(seconds * 1000)}` : ""}`));
+      const list = el("ul");
+      for (const name of names) {
+        const item = results[name];
+        const li = el("li", `lr-${item.status === "ok" ? "ok" : item.status === "warning" ? "warn" : "err"}`);
+        li.append(el("span", "lr-dot"), el("span", "lr-name", title(name)),
+                  el("span", "lr-sum", `${oneLine(item.summary) || item.status}${item.duration != null ? ` · ${formatElapsed(item.duration * 1000)}` : ""}`));
+        list.append(li);
+      }
+      details.append(list);
+      card.append(details);
+    }
+    const actions = el("div", "run-actions");
+    const view = el("button", "btn btn-sm", `View jobs (${run.job_count || 0})`);
+    view.type = "button";
+    view.disabled = !run.job_count;
+    view.title = run.job_count ? "Open the shortlist with only the jobs this run found." : "This run did not record any jobs.";
+    view.addEventListener("click", () => { jobsRun = run.run_id; openJobs(); });
+    actions.append(view);
+    card.append(actions);
+    return card;
+  }
+
+  function drawHistory() {
+    const panel = $("#panel-history");
+    const shown = historyProfile === null ? currentProfile : historyProfile;
+    panel.replaceChildren(el("h3", null, "Run history"),
+      el("p", "hint", "Every run is kept with its date, profile and resume. Open one to see the jobs it found."));
+    if (historyProfiles.length > 1) {
+      const field = el("div", "field");
+      field.append(el("label", null, "Profile"));
+      const select = el("select");
+      select.setAttribute("aria-label", "Filter runs by profile");
+      [{ key: "", name: "All profiles" }, ...historyProfiles].forEach(({ key, name }) => {
+        const option = el("option", null, key && key === currentProfile ? `${name} (current)` : name);
+        option.value = key; option.selected = key === shown;
+        select.append(option);
+      });
+      select.addEventListener("change", () => { historyProfile = select.value; drawHistory(); });
+      field.append(select);
+      panel.append(field);
+    }
+    const runs = historyRuns.filter((r) => !shown || r.candidate_key === shown);
+    if (!runs.length) {
+      const empty = el("div", "empty-state");
+      empty.append(el("strong", null, "No runs yet"), el("span", null, "Press Run all phases. Each run is saved here with its date and profile."));
+      panel.append(empty);
+      return;
+    }
+    let day = "";
+    for (const run of runs) {
+      const label = new Date(run.started_at).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", year: "numeric" });
+      if (label !== day) { day = label; panel.append(el("h4", null, label)); }
+      panel.append(runCard(run));
+    }
+  }
+
+  async function renderHistory() {
+    const panel = $("#panel-history");
+    panel.replaceChildren(el("p", "hint", "Loading history…"));
+    try {
+      const data = await api("/api/runs");
+      historyRuns = data.runs || [];
+      historyProfiles = data.profiles || [];
+      currentProfile = data.current_profile || "";
+      drawHistory();
+    } catch (error) {
+      panel.replaceChildren(el("div", "callout err", `Could not load run history: ${error.message}`));
+    }
+  }
+
+  // Fill the shortlist's run picker: grouped by profile, newest first.
+  async function populateRunSelect() {
+    const select = $("#jobs-run");
+    let runs = [];
+    try {
+      const data = await api("/api/runs");
+      currentProfile = data.current_profile || currentProfile;
+      // Another candidate's runs are not offered here; they stay available in History.
+      runs = (data.runs || []).filter((run) => !currentProfile || run.candidate_key === currentProfile);
+    } catch { /* the list still works without it */ }
+    select.replaceChildren();
+    const all = el("option", null, "All saved jobs"); all.value = ""; select.append(all);
+    const byProfile = new Map();
+    for (const run of runs) {
+      const key = run.candidate_name || "Unknown profile";
+      if (!byProfile.has(key)) byProfile.set(key, []);
+      byProfile.get(key).push(run);
+    }
+    for (const [profile, items] of byProfile) {
+      const group = el("optgroup"); group.label = profile;
+      for (const run of items) {
+        const option = el("option", null, `${runLabel(run)} · ${run.job_count || 0} jobs${run.dry_run ? " · dry run" : ""}`);
+        option.value = run.run_id;
+        group.append(option);
+      }
+      select.append(group);
+    }
+    select.value = jobsRun;
+    if (select.value !== jobsRun) { jobsRun = ""; select.value = ""; }
+    $("#jobs-current").disabled = !!jobsRun;
+  }
+
+  /* ---------------- Run options ---------------- */
+
+  const runOptions = (() => {
+    const defaults = { tailorAll: true, scoreLimit: 0 };
+    try { return { ...defaults, ...JSON.parse(localStorage.getItem("jobAgentRunOptions") || "{}") }; }
+    catch { return defaults; }
+  })();
+  function saveRunOptions() {
+    try { localStorage.setItem("jobAgentRunOptions", JSON.stringify(runOptions)); } catch { /* private mode */ }
+  }
+
+  function runOptionsSection(panel) {
+    panel.append(el("h4", null, "Run options"));
+    panel.append(el("div", "hint", "How a run spends your Groq tokens and what it prepares. Saved in this browser."));
+
+    const limitField = el("div", "field");
+    limitField.append(el("label", null, "Score at most"));
+    const limit = el("select");
+    limit.setAttribute("aria-label", "Maximum number of jobs to score");
+    [[0, "Every job (slowest)"], [30, "30 best matches"], [60, "60 best matches"], [100, "100 best matches"]].forEach(([value, label]) => {
+      const option = el("option", null, label); option.value = String(value); option.selected = Number(runOptions.scoreLimit) === value;
+      limit.append(option);
+    });
+    limit.addEventListener("change", () => { runOptions.scoreLimit = Number(limit.value); saveRunOptions(); });
+    limitField.append(limit, el("div", "hint",
+      "Scoring is limited by Groq's tokens-per-minute cap (about 2 jobs a minute on the free plan). Jobs are scored best-match first, so a limit skips only the weakest."));
+    panel.append(limitField);
+
+    const all = el("label", "check");
+    const box = el("input"); box.type = "checkbox"; box.checked = !!runOptions.tailorAll;
+    box.addEventListener("change", () => { runOptions.tailorAll = box.checked; saveRunOptions(); });
+    all.append(box, el("span", null, "Make a resume for every job found"));
+    const allField = el("div", "field");
+    allField.append(all, el("div", "hint",
+      "On: weak matches and listings with no description get a resume too, so you can apply to any job. Off: only jobs that qualified. Jobs that did not qualify are never applied to automatically."));
+    panel.append(allField);
+  }
+
   function init() {
+    hydrateIcons();
+    initPalette();
     $("#jobs-btn").addEventListener("click", openJobs);
     $("#jobs-close").addEventListener("click", () => $("#jobs-dialog").close());
-    for (const id of ["#jobs-query", "#jobs-mode", "#jobs-email", "#jobs-current", "#jobs-ready"]) $(id).addEventListener("input", () => { visibleJobs = 50; renderJobRows(); });
+    const exportMenu = $("#export-menu");
+    exportMenu.addEventListener("click", (e) => {
+      if (e.target.closest(".export-item")) setTimeout(() => { exportMenu.open = false; }, 0);
+    });
+    document.addEventListener("click", (e) => { if (!exportMenu.contains(e.target)) exportMenu.open = false; });
+    exportMenu.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && exportMenu.open) { e.stopPropagation(); e.preventDefault(); exportMenu.open = false; exportMenu.querySelector("summary").focus(); }
+    });
+    $("#jobs-run").addEventListener("change", () => {
+      jobsRun = $("#jobs-run").value;
+      $("#jobs-current").disabled = !!jobsRun;
+      openJobs();
+    });
+    for (const id of ["#jobs-query", "#jobs-mode", "#jobs-email", "#jobs-current", "#jobs-ready", "#jobs-skipped"]) $(id).addEventListener("input", () => { visibleJobs = 50; renderJobRows(); });
     $("#jobs-more").addEventListener("click", () => { visibleJobs += 50; renderJobRows(); });
     $("#jobs-bundle").addEventListener("click", async () => {
       const button = $("#jobs-bundle"); button.disabled = true; button.textContent = "Preparing download…";
@@ -1758,8 +2882,48 @@
       } catch (error) { toast(error.message, "err"); }
       finally { button.disabled = false; button.textContent = "Download everything (ZIP)"; }
     });
-    document.querySelectorAll(".tab").forEach((tab) => {
+    const tabButtons = [...document.querySelectorAll(".tab")];
+    tabButtons.forEach((tab, i) => {
       tab.addEventListener("click", () => switchTab(tab.dataset.tab));
+      // Arrow keys move between tabs, as the tablist pattern expects.
+      tab.addEventListener("keydown", (e) => {
+        const step = { ArrowRight: 1, ArrowLeft: -1 }[e.key];
+        if (!step) return;
+        const next = tabButtons[(i + step + tabButtons.length) % tabButtons.length];
+        switchTab(next.dataset.tab);
+        next.focus();
+      });
+    });
+    switchTab("details");
+
+    $("#log-search").addEventListener("input", (e) => { logFilter.query = e.target.value; renderLog(); });
+    document.querySelectorAll(".log-level").forEach((button) => {
+      button.addEventListener("click", () => {
+        logFilter.level = button.dataset.level;
+        document.querySelectorAll(".log-level").forEach((b) => b.classList.toggle("is-active", b === button));
+        renderLog();
+      });
+    });
+    $("#log-jump").addEventListener("click", () => {
+      const body = $("#log-body");
+      body.scrollTop = body.scrollHeight;
+      $("#log-jump").hidden = true;
+    });
+    $("#log-clear").addEventListener("click", () => {
+      logLines.length = 0;
+      renderLog();
+    });
+    $("#log-copy").addEventListener("click", async () => {
+      const text = filteredLogLines()
+        .map((entry) => `${fmtTime(entry.ts)}${entry.phase ? ` [${entry.phase}]` : ""} ${entry.line}`)
+        .join("\n");
+      if (!text) { toast("Nothing to copy."); return; }
+      try {
+        await navigator.clipboard.writeText(text);
+        toast("Log copied to clipboard.", "ok");
+      } catch {
+        toast("Couldn't access the clipboard.", "err");
+      }
     });
 
     $("#run-btn").addEventListener("click", () => {
@@ -1772,6 +2936,29 @@
     });
 
     $("#dry-run").addEventListener("change", render);
+
+    $("#fit-btn").addEventListener("click", () => {
+      fitMode = !fitMode;
+      try { localStorage.setItem("flowFit", fitMode ? "1" : "0"); } catch { /* private mode */ }
+      renderNodes();
+      requestAnimationFrame(renderEdges);
+    });
+
+    // Re-fit when the window (or the inspector beside the canvas) changes size.
+    // Only reacts to a real size change (a scrollbar appearing or the layout
+    // swapping must not retrigger a re-fit), so it cannot feed back on itself.
+    let resizeTimer = null, lastSize = "";
+    new ResizeObserver(() => {
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => {
+        const canvas = $(".canvas");
+        const size = `${canvas.clientWidth}x${canvas.clientHeight}`;
+        if (!state || size === lastSize) return;
+        lastSize = size;
+        renderNodes();
+        requestAnimationFrame(renderEdges);
+      }, 120);
+    }).observe($(".canvas"));
 
     $("#theme-btn").addEventListener("click", () => {
       const root = document.documentElement;
@@ -1809,9 +2996,11 @@
         openSetup(0);
       }
       connectEvents();
+      startStatePolling();
     });
     // A CLI run uses the same artifacts but has no dashboard SSE connection.
     setInterval(() => { if (!document.hidden) refreshState(); }, 10000);
+    setInterval(() => { if (!document.hidden) tickRunningTimer(); }, 1000);
   }
 
   if (document.readyState === "loading") {

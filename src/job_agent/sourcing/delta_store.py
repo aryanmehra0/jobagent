@@ -20,6 +20,16 @@ from job_agent.config.settings import settings
 
 # Lifecycle states a posting moves through. Kept as a tuple rather than a CHECK
 # constraint so that adding a state does not require a database migration.
+def profile_identity(path) -> Optional[str]:
+    """Who a profile file is for (email, else name); None when it cannot be read."""
+    try:
+        contact = json.loads(Path(path).read_text(encoding="utf-8")).get("contact") or {}
+    except (OSError, ValueError):
+        return None
+    key = str(contact.get("email") or contact.get("full_name") or "").strip().casefold()
+    return key or None
+
+
 VALID_STATUSES = (
     "scraped",
     "evaluated",
@@ -101,6 +111,12 @@ class DeltaStore:
                     [(job_fingerprint(row["company"] or "", row["title"] or ""), row["job_id"]) for row in rows],
                 )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_seen_fingerprint ON seen_jobs(fingerprint)")
+            conn.execute("CREATE TABLE IF NOT EXISTS delta_meta (key TEXT PRIMARY KEY, value TEXT)")
+
+            # Migration: a job can be "reopened" for a new candidate's profile. It stays
+            # in the table (its history is kept) but is no longer treated as already seen.
+            if "reopened" not in existing:
+                conn.execute("ALTER TABLE seen_jobs ADD COLUMN reopened INTEGER DEFAULT 0")
 
             # One row per outreach email drafted, so no address is written to twice
             # about the same role however many sweeps find it.
@@ -167,7 +183,8 @@ class DeltaStore:
         if not jobs:
             return []
         with self._connect() as conn:
-            rows = conn.execute("SELECT job_id, fingerprint FROM seen_jobs").fetchall()
+            rows = conn.execute(
+                "SELECT job_id, fingerprint FROM seen_jobs WHERE COALESCE(reopened, 0) = 0").fetchall()
         seen_ids = {row["job_id"] for row in rows}
         seen_prints = {row["fingerprint"] for row in rows if row["fingerprint"]}
         return [job for job in jobs if job.id not in seen_ids and job.fingerprint() not in seen_prints]
@@ -249,6 +266,12 @@ class DeltaStore:
                 """,
                 records,
             )
+            # A reopened job found again is back in play for the new profile.
+            conn.executemany(
+                "UPDATE seen_jobs SET reopened = 0, status = ?, status_updated_at = ? "
+                "WHERE job_id = ? AND COALESCE(reopened, 0) = 1",
+                [(status, now, job.id) for job in jobs],
+            )
 
     def update_status(self, job_id: str, new_status: str) -> None:
         """Advance a posting's lifecycle status.
@@ -263,9 +286,48 @@ class DeltaStore:
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:
             conn.execute(
-                "UPDATE seen_jobs SET status = ?, status_updated_at = ? WHERE job_id = ?",
+                "UPDATE seen_jobs SET status = ?, status_updated_at = ?, reopened = 0 WHERE job_id = ?",
                 (new_status, now, job_id),
             )
+
+    # Statuses that mean "judged for the previous candidate". Applied and replied jobs
+    # are real history and are never reopened.
+    _REOPENABLE = ("scraped", "evaluated", "qualified", "evaluated_rejected", "prefilter_rejected",
+                   "tailored", "failed", "skipped")
+
+    def note_profile(self, identity: Optional[str]) -> int:
+        """Record whose profile the stored job statuses were produced for.
+
+        The first call just records it. If the profile has since become a
+        different candidate's, by whatever route (intake, a replaced file, the
+        CLI), the jobs judged for the old one are reopened. Returns how many.
+        """
+        if not identity:
+            return 0
+        with self._connect() as conn:
+            row = conn.execute("SELECT value FROM delta_meta WHERE key = 'profile_identity'").fetchone()
+            conn.execute("INSERT INTO delta_meta (key, value) VALUES ('profile_identity', ?) "
+                         "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (identity,))
+        if row is None or row["value"] == identity:
+            return 0
+        return self.reopen_for_new_profile()
+
+    def reopen_for_new_profile(self) -> int:
+        """Let a different candidate's profile re-consider jobs judged for the last one.
+
+        Statuses are global, not per profile: a job rejected for the previous
+        candidate would otherwise never be scored for the new one, and a fresh
+        sweep would find almost nothing "new". Reopened jobs are treated as unseen
+        the next time a sweep finds them, so only those still in the search
+        window come back. Returns how many were reopened.
+        """
+        marks = ",".join("?" for _ in self._REOPENABLE)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"UPDATE seen_jobs SET reopened = 1 WHERE COALESCE(reopened, 0) = 0 AND status IN ({marks})",
+                self._REOPENABLE,
+            )
+            return cursor.rowcount or 0
 
     def reset(self) -> None:
         """Delete every tracked listing.

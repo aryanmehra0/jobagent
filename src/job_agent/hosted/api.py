@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional

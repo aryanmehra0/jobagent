@@ -30,6 +30,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from job_agent.config.settings import settings
 from job_agent.runtime import RunCancelled, cancellation, pipeline_lock
+from job_agent.web.run_history import RunHistory
 from job_agent.web.state import PHASE_ORDER, build_snapshot
 
 # Events replayed to a dashboard that connects mid-run, so a late arrival still
@@ -109,18 +110,23 @@ class PipelineRunner:
             if channel in self._subscribers:
                 self._subscribers.remove(channel)
 
-    def _record_phase(self, phase: str, status: str, started: float, started_at: str,
-                      summary: Dict[str, Any]) -> None:
-        """Keep the run history in the jobs database, beside what the run produced."""
-        from job_agent.storage.jobs_db import record_phase
+    def _close_phase(self, name: str, status: str, started: float, started_at: str, history: RunHistory,
+                     *, summary: Optional[Dict[str, Any]] = None, recorded: Optional[Dict[str, Any]] = None,
+                     error: Optional[str] = None) -> None:
+        """Everything that happens when one phase ends, whatever way it ended.
 
-        record_phase(
-            phase, status, run_id=str((self.current or {}).get("id") or ""), started_at=started_at,
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            duration_seconds=round(time.perf_counter() - started, 2),
-            summary={key: value for key, value in (summary or {}).items() if key != "_status"},
-            started_from=(self.current or {}).get("options", {}).get("started_from", "dashboard"),
-        )
+        Writes the phase to the history table, adds it to the run record, and tells the
+        dashboard. The success, stop and failure paths each used to do this by hand and
+        had drifted apart (different fields, different order).
+
+        `summary` is what the dashboard is shown; `recorded` is what the history keeps
+        when that differs (a failure shows nothing but records its error).
+        """
+        summary = summary if summary is not None else {}
+        kept = summary if recorded is None else recorded
+        duration = history.phase_ended(name, status, started, started_at, kept)
+        self.publish({"type": "phase_end", "phase": name, "status": status, "duration": duration,
+                      "summary": summary, "error": error})
 
     def publish(self, event: Dict[str, Any]) -> None:
         """Broadcast one event to every connected dashboard."""
@@ -212,6 +218,18 @@ class PipelineRunner:
                   "phases": {}, "warnings": [], "files": {}, "dry_run": bool(options.get("dry_run", True))}
         write_run_report(report)
 
+        # Every run gets an identity: when it started, whose profile it ran for and
+        # on which resume. Without one, the run history could not say which profile
+        # a record belonged to.
+        import secrets
+
+        run_id = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{secrets.token_hex(2)}"
+        report["run_id"] = run_id
+        if self.current is not None:
+            self.current["id"] = run_id
+        history = RunHistory(run_id, report, phases, options)
+        history.begin()
+
         def emit_log(phase: Optional[str]) -> Callable[[str], None]:
             return lambda line: self.publish({"type": "log", "phase": phase, "line": line})
 
@@ -251,17 +269,10 @@ class PipelineRunner:
                     if summary.get("warning"):
                         report["warnings"].append(summary["warning"])
                 write_run_report(report)
-                self.publish({
-                    "type": "phase_end",
-                    "phase": name,
-                    "status": phase_status,
-                    "duration": round(time.perf_counter() - started, 2),
-                    "summary": summary,
-                    "error": None,
-                })
                 if self.current is not None:
                     self.current["results"][name] = summary
-                self._record_phase(name, phase_status, started, started_at, summary)
+                self._close_phase(name, phase_status, started, started_at, history, summary=summary)
+                history.checkpoint()
                 self.publish({"type": "state", "snapshot": build_snapshot()})
 
                 # A phase that produced nothing makes the phases after it
@@ -276,31 +287,16 @@ class PipelineRunner:
             except RunCancelled:
                 report["phases"][name] = {"status": "cancelled", "error": "Stopped by user"}
                 tee.flush()
-                self._record_phase(name, "cancelled", started, started_at, {})
-                self.publish({
-                    "type": "phase_end",
-                    "phase": name,
-                    "status": "cancelled",
-                    "duration": round(time.perf_counter() - started, 2),
-                    "summary": {},
-                    "error": "Stopped by user.",
-                })
+                self._close_phase(name, "cancelled", started, started_at, history, error="Stopped by user.")
                 overall = "cancelled"
                 break
 
             except Exception as exc:
                 report["phases"][name] = {"status": "error", "error": str(exc)}
-                self._record_phase(name, "error", started, started_at, {"error": str(exc)[:200]})
                 tee.flush()
                 detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-                self.publish({
-                    "type": "phase_end",
-                    "phase": name,
-                    "status": "error",
-                    "duration": round(time.perf_counter() - started, 2),
-                    "summary": {},
-                    "error": detail,
-                })
+                self._close_phase(name, "error", started, started_at, history,
+                                  recorded={"error": str(exc)[:200]}, error=detail)
                 overall = "error"
                 break
 
@@ -316,6 +312,7 @@ class PipelineRunner:
         if report["warnings"] and overall == "ok":
             report["status"] = overall = "warning"
         write_run_report(report)
+        history.finish(report)
         if self.current is not None:
             self.current.update(status=overall, report=report)
         for warning in publication["warnings"]:
@@ -378,8 +375,10 @@ def _phase_intake(options: Dict[str, Any], cancel: threading.Event) -> Dict[str,
         try:
             saved = json.loads(receipt.read_text(encoding="utf-8"))
             existing, valid = load_and_verify_profile(settings.profile_path)
+            from job_agent.intake.parser import PARSER_VERSION
             if (valid and saved.get("source_sha256") == hashlib.sha256(pdf_path.read_bytes()).hexdigest()
-                    and saved.get("profile_hash") == existing.profile_hash):
+                    and saved.get("profile_hash") == existing.profile_hash
+                    and saved.get("parser_version") == PARSER_VERSION):
                 return {"candidate": existing.contact.full_name, "reused": True,
                         "note": "Resume and sealed profile unchanged; preserved pending work."}
         except (OSError, ValueError):
@@ -439,7 +438,7 @@ def _phase_evaluate(options: Dict[str, Any], cancel: threading.Event) -> Dict[st
 
     evaluated, qualified = SemanticEvaluationPipeline().run_evaluation(
         tier1_threshold=options.get("threshold"),
-        limit=options.get("limit"),
+        limit=options.get("score_limit") or options.get("limit"),
     )
 
     summary: Dict[str, Any] = {"scored": len(evaluated), "qualified": len(qualified)}
@@ -454,7 +453,13 @@ def _phase_evaluate(options: Dict[str, Any], cancel: threading.Event) -> Dict[st
             f"{summary['failed']} failed evaluations and {summary['deferred_by_limit']} jobs deferred by the limit. "
             "These jobs remain pending for a later run."
         )
-    if not qualified:
+    # Nothing qualified normally ends the run: the later phases have nothing to
+    # work on. But when a resume is wanted for every job found, the tailor phase
+    # still has work (and applying skips non-qualified jobs by design), so the
+    # run continues as long as the search found jobs.
+    keeps_going = (options.get("tailor_all", True) and (options.get("tailoring_mode") or "auto") in ("auto", "faithful")
+                   and summary.get("input_jobs", 0) > 0)
+    if not qualified and not keeps_going:
         summary["halt_reason"] = (
             f"No scored jobs reached the fit threshold of {settings.min_match_score:g}/10. "
             f"{summary['missing_descriptions']} jobs have no readable description; {summary['failed']} evaluations failed. "
@@ -464,13 +469,33 @@ def _phase_evaluate(options: Dict[str, Any], cancel: threading.Event) -> Dict[st
 
 
 def _phase_tailor(options: Dict[str, Any], cancel: threading.Event) -> Dict[str, Any]:
-    """Compile a bespoke resume for each qualified job."""
+    """Compile a bespoke resume for the qualified jobs, then for every other job found.
+
+    One job (`options["job_id"]`) is tailored on its own, qualified or not, and
+    the resumes already made are kept. A full run tailors the qualified jobs
+    first, then every remaining job of the latest search: a listing that scored
+    low, or arrived with no description, still gets a resume, so any job can be
+    applied to. Set `tailor_all` to false to keep it to the qualified jobs.
+    """
     from job_agent.tailoring.pipeline import ResumeTailoringPipeline
 
-    records = ResumeTailoringPipeline().run_tailoring(limit=options.get("limit"),
-                                                    cover_letter=bool(options.get("cover_letter", False)),
-                                                    mode=options.get("tailoring_mode"),
-                                                    country=options.get("resume_country"))
+    pipeline = ResumeTailoringPipeline()
+    mode = (options.get("tailoring_mode") or settings.tailoring_mode or "auto").lower()
+    faithful_mode = mode in {"auto", "faithful"} and not options.get("resume_country")
+
+    job_id = options.get("job_id")
+    if job_id:
+        outcome = pipeline.tailor_jobs([job_id], only_missing=False)
+        summary = {"compiled": outcome["tailored"], "from_your_resume": outcome["tailored"],
+                   "validated": outcome["passed"], "no_description": outcome["title_only"]}
+        if not outcome["tailored"]:
+            summary["halt_reason"] = "that job could not be found, so no resume was made."
+        return summary
+
+    records = pipeline.run_tailoring(limit=options.get("limit"),
+                                     cover_letter=bool(options.get("cover_letter", False)),
+                                     mode=options.get("tailoring_mode"),
+                                     country=options.get("resume_country"))
 
     summary: Dict[str, Any] = {
         "compiled": len(records),
@@ -479,7 +504,22 @@ def _phase_tailor(options: Dict[str, Any], cancel: threading.Event) -> Dict[str,
         "restored": sum(len(item.get("restored_metrics", [])) for item in records),
         "blocked": sum(len(item.get("dropped_fabrications", [])) for item in records),
     }
-    if not records:
+
+    if faithful_mode and options.get("tailor_all", True):
+        try:
+            extra = pipeline.tailor_jobs(None, limit=options.get("tailor_limit"), only_missing=True)
+            summary["also_tailored"] = extra["tailored"]
+            summary["no_description"] = extra["title_only"]
+            summary["compiled"] += extra["tailored"]
+            summary["from_your_resume"] += extra["tailored"]
+            summary["validated"] += extra["passed"]
+        except ValueError as exc:
+            # No readable source PDF (e.g. a Word resume): the qualified resumes
+            # above still stand; say why the rest were not made.
+            summary["warning"] = f"Resumes for the other jobs were not made: {exc}"
+            summary["_status"] = "warning"
+
+    if not summary["compiled"]:
         summary["halt_reason"] = "no resumes were compiled."
     return summary
 

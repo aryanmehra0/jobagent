@@ -32,7 +32,7 @@ def analytics():
         applied = status == 'applied' or replied
         tailored = bool(row.get('Tailored Resume'))
         counts['sourced'] += 1
-        counts['qualified'] += score >= settings.min_match_score or tailored
+        counts['qualified'] += score >= settings.min_match_score   # a resume is not a qualification
         counts['tailored'] += tailored
         counts['applied'] += applied
         counts['replied'] += replied

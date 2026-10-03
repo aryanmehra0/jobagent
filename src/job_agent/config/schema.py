@@ -27,6 +27,7 @@ from pydantic import (
     EmailStr,
     Field,
     field_validator,
+    ValidationInfo,
     model_validator,
 )
 
@@ -89,6 +90,16 @@ CITY_COUNTRIES: Dict[str, str] = {
     )},
     **{city: "usa" for city in ("New York, NY", "San Francisco, CA", "San Francisco Bay Area")},
 }
+
+# Further Indian cities boards print without a country ("Nagpur", "Mysuru, Karnataka" is covered by
+# the state). Used only to recognise where a posting is: unlike CITY_ALIASES these never change where
+# a sweep searches. Without them an onsite role in a smaller city was "unknown" and dropped.
+CITY_COUNTRIES.update({city: "india" for city in (
+    "Nagpur", "Surat", "Vadodara", "Visakhapatnam", "Vizag", "Mysuru", "Mysore", "Mangaluru", "Mangalore",
+    "Thane", "Navi Mumbai", "Gandhinagar", "Bhubaneswar", "Nashik", "Kanpur", "Patna", "Ranchi",
+    "Dehradun", "Vijayawada", "Faridabad", "Ghaziabad", "Thiruvananthapuram", "Madurai", "Rajkot",
+    "Amritsar", "Ludhiana", "Raipur", "Guwahati", "Kozhikode", "Hubli", "Belagavi", "Jodhpur",
+)})
 
 
 # Two-letter codes and alternative names boards use in a location string
@@ -1068,7 +1079,14 @@ _TITLE_NOISE = re.compile(r"\b(remote|hybrid|onsite|on-site|wfh|work from home|u
 
 
 def job_fingerprint(company: str, title: str) -> str:
-    """Board-independent key for a role: normalised company plus normalised title."""
+    """Board-independent key for a role: normalised company plus normalised title.
+
+    Location is deliberately NOT part of it. This key also decides "have we already emailed or
+    applied to this employer for this role?", so a second posting of the same title in another
+    city must not produce a second email to the same company. The cost is that two genuinely
+    separate openings in different cities collapse to one; measured on a real job store that was
+    25 groups out of about 940 roles, and applying to either reaches the same employer.
+    """
     company_key = _COMPANY_SUFFIXES.sub(" ", re.sub(r"[^a-z0-9 ]+", " ", clean_text(company).casefold()))
     title_text = re.sub(r"\(.*?\)|\[.*?\]", " ", clean_text(title).casefold())
     title_key = _TITLE_NOISE.sub(" ", re.sub(r"[^a-z0-9+# ]+", " ", title_text))
@@ -1296,6 +1314,11 @@ class JobPosting(StrictModel):
 DEFAULT_MATCH_THRESHOLD = 7.0
 
 
+# A score above 10 but no higher than this is read as an overshoot of the 0-10 scale,
+# not as a percentage.
+OVERSHOOT_CEILING = 12.0
+
+
 class RerankerVerdict(StrictModel):
     """Schema an LLM re-ranker response must satisfy before it is trusted.
 
@@ -1314,14 +1337,14 @@ class RerankerVerdict(StrictModel):
 
     @field_validator("fit_score", "technical_score", "seniority_score", mode="before")
     @classmethod
-    def _coerce_score(cls, value: Any) -> float:
+    def _coerce_score(cls, value: Any, info: ValidationInfo) -> float:
         """Accept '8.5/10' and percentage-style scores, then clamp into range.
 
         Models frequently answer on the wrong scale; clamping keeps a usable
         ordering instead of discarding the evaluation entirely.
         """
         if value is None:
-            return 0.0
+            value = 0.0
         if isinstance(value, str):
             match = re.search(r"-?\d+(?:\.\d+)?", value)
             if not match:
@@ -1329,9 +1352,18 @@ class RerankerVerdict(StrictModel):
             value = float(match.group(0))
         score = float(value)
         if score > 10.0:
-            # A 0-100 answer rescales cleanly; anything else clamps to the ceiling.
-            score = score / 10.0 if score <= 100.0 else 10.0
-        return round(max(0.0, min(10.0, score)), 2)
+            # A model that overshoots the 0-10 scale (10.5, 11, 12) means "as good as
+            # it gets"; dividing by ten turned the best possible match into 1.05,
+            # the worst, with no error. Only a clearly 0-100 answer is rescaled.
+            if score <= OVERSHOOT_CEILING:
+                score = 10.0
+            else:
+                score = score / 10.0 if score <= 100.0 else 10.0
+        # The public scale starts at 1.0, so a judge that answers 0 for a disqualified role means
+        # "the worst fit", not an invalid response. Rejecting it aborted a whole evaluation run
+        # in strict mode. Sub-scores may legitimately be 0 (no overlap at all).
+        floor = 1.0 if info.field_name == "fit_score" else 0.0
+        return round(max(floor, min(10.0, score)), 2)
 
     @field_validator("reasoning", mode="before")
     @classmethod
@@ -1379,8 +1411,8 @@ class EvaluationScore(StrictModel):
 
     @field_validator("fit_score", "technical_score", "seniority_score", mode="before")
     @classmethod
-    def _coerce_score(cls, value: Any) -> float:
-        return RerankerVerdict._coerce_score(value)
+    def _coerce_score(cls, value: Any, info: ValidationInfo) -> float:
+        return RerankerVerdict._coerce_score(value, info)
 
     @field_validator("reasoning", mode="before")
     @classmethod

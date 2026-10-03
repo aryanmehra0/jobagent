@@ -98,7 +98,8 @@ class Settings(BaseSettings):
         validation_alias="SEMANTIC_EMBEDDING_MODEL",
     )
     min_match_score: float = Field(default=7.0, ge=0.0, le=10.0, validation_alias="MIN_MATCH_SCORE")
-    tier1_threshold: float = Field(default=0.15, ge=0.0, le=1.0, validation_alias="TIER1_THRESHOLD")
+    # None picks the cutoff for whichever embedding backend is running (see SemanticEmbedder).
+    tier1_threshold: Optional[float] = Field(default=None, ge=0.0, le=1.0, validation_alias="TIER1_THRESHOLD")
 
     # --- Browser automation safeguards ---
     use_vision: bool = Field(default=False, validation_alias="USE_VISION")

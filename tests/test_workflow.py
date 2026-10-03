@@ -105,14 +105,41 @@ def test_unchanged_resume_reuses_sealed_profile(monkeypatch, tmp_path, candidate
     source.write_bytes(b"unchanged source bytes")
     profile_file = tmp_path / "profile.json"
     profile_file.write_text(candidate_profile.model_dump_json())
+    from job_agent.intake.parser import PARSER_VERSION, ResumeParser
     profile_file.with_suffix(".source.json").write_text(json.dumps({
+        "parser_version": PARSER_VERSION,
         "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "profile_hash": candidate_profile.profile_hash,
     }))
     monkeypatch.setattr(settings, "profile_path", profile_file)
-    from job_agent.intake.parser import ResumeParser
     monkeypatch.setattr(ResumeParser, "parse", lambda *a, **kw: pytest.fail("Unchanged resume should not be parsed"))
     assert run._phase_intake({"resume": str(source)}, threading.Event())["reused"] is True
+
+
+def test_a_profile_made_by_an_older_parser_is_rebuilt_not_reused(monkeypatch, tmp_path, candidate_profile):
+    # A parsing fix must reach profiles that were sealed before it, instead of the
+    # old mistake being reused for ever because the resume file did not change.
+    source = tmp_path / "resume.pdf"
+    source.write_bytes(b"unchanged source bytes")
+    profile_file = tmp_path / "profile.json"
+    profile_file.write_text(candidate_profile.model_dump_json())
+    from job_agent.intake.parser import PARSER_VERSION, ResumeParser
+    profile_file.with_suffix(".source.json").write_text(json.dumps({
+        "parser_version": PARSER_VERSION - 1,
+        "source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+        "profile_hash": candidate_profile.profile_hash,
+    }))
+    monkeypatch.setattr(settings, "profile_path", profile_file)
+    parsed = []
+
+    def fake_parse(self, pdf_path, output_path=None):
+        parsed.append(pdf_path)
+        return candidate_profile
+
+    monkeypatch.setattr(ResumeParser, "parse", fake_parse)
+    monkeypatch.setattr("job_agent.intake.validator.describe_profile_gaps", lambda profile: [])
+    result = run._phase_intake({"resume": str(source)}, threading.Event())
+    assert parsed and "reused" not in result
 
 
 def test_sales_role_requires_an_explicit_sales_target():
@@ -257,7 +284,10 @@ def test_cli_full_run_uses_shared_flow_and_defaults_to_dry_run(monkeypatch, tmp_
     assert calls[0][0] == ["source", "evaluate", "tailor", "apply", "track", "prep"]
     assert calls[0][1]["dry_run"] is True
     assert calls[0][1]["assume_yes"] is False
-    assert calls[0][1]["tailoring_mode"] == "regional"
+    # None, not a hardcoded mode: falls through to TAILORING_MODE (default "auto"),
+    # the same default the standalone `tailor` command uses, so a full run keeps
+    # the candidate's own PDF design unless they've set TAILORING_MODE themselves.
+    assert calls[0][1]["tailoring_mode"] is None
 
 
 def test_cli_daily_builds_cover_letter_pack_by_default(monkeypatch, tmp_path, candidate_profile):

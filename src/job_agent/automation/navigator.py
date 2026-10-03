@@ -6,7 +6,6 @@ enforcing wait_until='networkidle' wait strategies across dynamic JavaScript app
 
 from __future__ import annotations
 
-import time
 from typing import List, Dict, Any, Optional
 from playwright.sync_api import Page, Locator
 from rich.console import Console

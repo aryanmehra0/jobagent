@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import hashlib
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.table import Table
@@ -31,6 +31,24 @@ from job_agent.tailoring.compiler import TypstResumeCompiler
 from job_agent.tailoring.rewriter import ResumeTailorer
 
 console = Console()
+
+
+def _faithful_task(source_pdf: Path, job: Any, pdf_path: Path) -> Any:
+    """Reorder one resume. Module level so a worker process can import and run it."""
+    from job_agent.tailoring.faithful import tailor_pdf
+
+    try:
+        return tailor_pdf(source_pdf, job, pdf_path)
+    except Exception as exc:
+        # Your own resume, unchanged, beats a generated one.
+        import shutil
+
+        from job_agent.tailoring.faithful import FaithfulResult, Plan, read_layout, validate
+
+        shutil.copyfile(source_pdf, pdf_path)
+        validation = validate(read_layout(source_pdf), Plan(groups=[], skipped=[]), pdf_path)
+        return FaithfulResult(pdf_path, False, validation, [],
+                              [f"Could not reorder ({exc.__class__.__name__}); your original resume is used."])
 
 
 class ResumeTailoringPipeline:
@@ -240,27 +258,56 @@ class ResumeTailoringPipeline:
             )
         return path if usable else None
 
+    def _tailor_in_parallel(self, source_pdf: Path, items: List[Any], workers: Optional[int] = None) -> Dict[str, Any]:
+        """Run the PDF reordering for many jobs on worker processes; {job_id: result}.
+
+        One resume takes about 2.4 s and the work is CPU-bound PyMuPDF, which is not thread
+        safe, so this uses processes. Each job writes its own file, so nothing is shared.
+        Results are returned to the caller, which records them one at a time in order.
+        """
+        import os
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        workers = workers or max(1, min(4, (os.cpu_count() or 2) - 1))
+        if workers < 2 or len(items) < 3:
+            return {}
+        out: Dict[str, Any] = {}
+        console.print(f"[dim]Reordering {len(items)} resume(s) on {workers} worker processes...[/dim]")
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_faithful_task, source_pdf, job, self.compiler.output_dir / f"resume_{job.id}.pdf"): job.id
+                for job in items
+            }
+            try:
+                for future in as_completed(futures):
+                    check_cancelled()
+                    try:
+                        out[futures[future]] = future.result()
+                    except Exception:
+                        pass   # recomputed serially below, where the fallback and logging live
+            finally:
+                for future in futures:
+                    future.cancel()
+        return out
+
     def _tailor_faithfully(self, source_pdf: Path, profile: Any, job: Any,
-                           score: float) -> Optional[TailoredResumeRecord]:
-        """Reorder the candidate's own PDF for one job and record the validation."""
-        from job_agent.tailoring.faithful import summarize, tailor_pdf
+                           score: float, result: Any = None) -> Optional[TailoredResumeRecord]:
+        """Reorder the candidate's own PDF for one job and record the validation.
+
+        `result` is the output of `_faithful_task` when a worker process has already done the
+        PDF work; the validation record and files below are still written here, in order.
+        """
+        from job_agent.tailoring.faithful import summarize
 
         pdf_path = self.compiler.output_dir / f"resume_{job.id}.pdf"
         json_path = self.compiler.output_dir / f"tailored_{job.id}.json"
-        try:
-            result = tailor_pdf(source_pdf, job, pdf_path)
-        except Exception as exc:
-            # Your own resume, unchanged, beats a generated one.
-            import shutil
-
-            from job_agent.tailoring.faithful import FaithfulResult, Plan, read_layout, validate
-
-            shutil.copyfile(source_pdf, pdf_path)
-            validation = validate(read_layout(source_pdf), Plan(groups=[], skipped=[]), pdf_path)
-            result = FaithfulResult(pdf_path, False, validation, [],
-                                    [f"Could not reorder ({exc.__class__.__name__}); your original resume is used."])
+        if result is None:
+            result = _faithful_task(source_pdf, job, pdf_path)
 
         summary = summarize(result)
+        if len((getattr(job, "description", "") or "").strip()) < 80:
+            result.notes.append("This listing has no usable description, so the order of your own content follows "
+                                "the job title and typical requirements for that role; nothing was added.")
         for change in result.changes:
             console.print(f"  [green]•[/green] {change}")
         for note in result.notes:
@@ -304,7 +351,6 @@ class ResumeTailoringPipeline:
         each is looked up in the current artifacts and the history archives.
         """
         import csv as csv_module
-        import glob
 
         from job_agent.config.schema import JobPosting
 
@@ -408,6 +454,151 @@ class ResumeTailoringPipeline:
             "passed": sum(1 for record in rebuilt if record.validation_passed),
             "missing": missing,
         }
+
+    # --- Any job, not only the qualified ones -----------------------------------
+
+    def find_postings(self, job_ids: Optional[List[str]] = None, *, limit: Optional[int] = None,
+                      only_missing: bool = False) -> Dict[str, Tuple[Any, float]]:
+        """Look jobs up wherever they are stored: (JobPosting, fit score or 0.0) by ID.
+
+        Searches the current artifacts, then the history archives, then the jobs
+        database (which keeps every job's description). With no `job_ids` it
+        returns every job the latest search found, best fit first.
+        """
+        from job_agent.config.schema import JobPosting
+
+        out = settings.outputs_dir
+        roots = [out] + (sorted((out / "history").glob("*"), reverse=True) if (out / "history").is_dir() else [])
+        wanted = set(job_ids) if job_ids else None
+        found: Dict[str, Tuple[Any, float]] = {}
+        scores: Dict[str, float] = {}
+
+        def consider(raw: Any, score: Optional[float]) -> None:
+            try:
+                job = JobPosting.model_validate(raw)
+            except Exception:
+                return
+            if wanted is not None and job.id not in wanted:
+                return
+            if job.id not in found:
+                found[job.id] = (job, 0.0)
+            if score is not None and job.id not in scores:
+                scores[job.id] = float(score)
+
+        for root in roots:
+            for name in ("qualified_jobs.json", "evaluated_jobs.json", "latest_jobs.json", "scraped_jobs.json"):
+                path = root / name
+                if not path.is_file():
+                    continue
+                try:
+                    items = json.loads(path.read_text(encoding="utf-8"))
+                except ValueError:
+                    continue
+                for item in items if isinstance(items, list) else []:
+                    if isinstance(item, dict) and "job" in item:
+                        consider(item["job"], (item.get("evaluation") or {}).get("fit_score"))
+                    else:
+                        consider(item, None)
+            if wanted is not None and wanted <= set(found):
+                break
+            if wanted is None and found:
+                break  # the newest source with jobs is enough; archives only fill specific lookups
+
+        if wanted is not None and not wanted <= set(found):
+            # The database remembers jobs (and their full descriptions) after the
+            # working files were archived.
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                with JobsDatabase()._connect() as conn:
+                    for job_id in wanted - set(found):
+                        row = conn.execute(JobsDatabase()._sql(
+                            "SELECT job_id, title, company, location, source, job_url, description, "
+                            "is_remote, date_posted, apply_url, fit_score FROM jobs WHERE job_id = ?"), (job_id,)).fetchone()
+                        if row:
+                            data = dict(row)
+                            consider({"id": data["job_id"], "title": data["title"], "company": data["company"],
+                                      "location": data.get("location") or "Remote", "job_url": data.get("job_url") or "https://example.invalid",
+                                      "description": data.get("description") or "", "source": data.get("source") or "unknown",
+                                      "is_remote": bool(data.get("is_remote")), "date_posted": data.get("date_posted"),
+                                      "apply_url": data.get("apply_url")}, data.get("fit_score"))
+            except Exception as exc:
+                # Not silent: the jobs asked for that are missing now would otherwise just
+                # look "not found", with the real cause (a locked or unreachable database) hidden.
+                console.print(f"[yellow]Could not look the remaining job(s) up in the jobs database "
+                              f"({exc.__class__.__name__}: {str(exc)[:120]}).[/yellow]")
+
+        result = {job_id: (job, scores.get(job_id, 0.0)) for job_id, (job, _) in found.items()}
+        ordered = dict(sorted(result.items(), key=lambda item: -item[1][1]))
+        if only_missing:
+            have = {entry.get("job_id") for entry in self._read_manifest() if isinstance(entry, dict)}
+            ordered = {job_id: value for job_id, value in ordered.items() if job_id not in have}
+        if limit is not None:
+            ordered = dict(list(ordered.items())[:limit])
+        return ordered
+
+    def _read_manifest(self) -> List[Dict[str, Any]]:
+        path = self.compiler.output_dir / "manifest.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        return data if isinstance(data, list) else []
+
+    @exclusive_run
+    def tailor_jobs(self, job_ids: Optional[List[str]] = None, *, limit: Optional[int] = None,
+                    only_missing: bool = True, profile_path: Optional[Path] = None) -> Dict[str, Any]:
+        """Tailor the candidate's own PDF for any set of jobs, qualified or not.
+
+        Unlike `run_tailoring` this never archives the resumes already made: the
+        results are merged into the manifest, so asking for one job (or the next
+        batch) cannot lose the rest. Jobs with no description are still tailored,
+        using the title and role knowledge to order the candidate's own content;
+        nothing is added to it.
+        """
+        profile, is_valid = load_and_verify_profile(profile_path or settings.profile_path)
+        if not is_valid:
+            raise ValueError("Refusing to tailor: the profile's fact seal does not verify. Re-run intake first.")
+        source_pdf = self._faithful_source(profile)
+        if source_pdf is None:
+            raise ValueError(
+                "Tailoring any job needs your uploaded resume as a readable PDF in "
+                f"{settings.raw_resumes_dir} (the profile names {profile.source_document or 'none'}).")
+
+        console.print("\n[bold cyan]=== Resume tailoring for selected jobs ===[/bold cyan]")
+        postings = self.find_postings(job_ids, limit=limit, only_missing=only_missing and not job_ids)
+        if not postings:
+            console.print("[yellow]No jobs to tailor (everything found already has a resume).[/yellow]")
+            return {"tailored": 0, "passed": 0, "title_only": 0, "missing": sorted(job_ids or [])}
+        console.print(f"Tailoring [bold green]{len(postings)}[/bold green] job(s) from {source_pdf.name}.\n")
+
+        made: List[TailoredResumeRecord] = []
+        title_only = 0
+        precomputed = self._tailor_in_parallel(source_pdf, [job for job, _ in postings.values()])
+        for index, (job_id, (job, score)) in enumerate(postings.items(), start=1):
+            check_cancelled()
+            thin = len((job.description or "").strip()) < 80
+            title_only += thin
+            console.print(f"[{index}/{len(postings)}] {job.title} @ {job.company}"
+                          + ("  [dim](no description: ordered by role knowledge)[/dim]" if thin else ""))
+            record = self._tailor_faithfully(source_pdf, profile, job, min(max(score, 0.0), 10.0),
+                                             result=precomputed.get(job.id))
+            if record is not None:
+                made.append(record)
+                self.delta_store.update_status(job.id, "tailored")
+
+        manifest = {entry["job_id"]: entry for entry in self._read_manifest()
+                    if isinstance(entry, dict) and entry.get("job_id")}
+        for record in made:
+            manifest[record.job_id] = record.model_dump()
+        manifest_path = self.compiler.output_dir / "manifest.json"
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest_path.write_text(json.dumps(list(manifest.values()), indent=2), encoding="utf-8")
+        missing = sorted(set(job_ids or []) - set(postings))
+        if missing:
+            console.print(f"[yellow]{len(missing)} requested job(s) could not be found on disk or in the database.[/yellow]")
+        return {"tailored": len(made), "passed": sum(1 for r in made if r.validation_passed),
+                "title_only": title_only, "missing": missing}
 
     def _archive_foreign_resumes(self, profile: Any) -> List[str]:
         """Move resumes that are not the candidate's out of the output folder.

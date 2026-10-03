@@ -15,19 +15,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from rich.console import Console
 from rich.table import Table
 
-from job_agent.config.schema import CandidateProfile, EvaluatedJob, EvaluationScore, JobPosting
+from job_agent.config.schema import CandidateProfile, EvaluatedJob, JobPosting
 from job_agent.config.settings import settings
 from job_agent.runtime import check_cancelled, exclusive_run, invalidate_after
 from job_agent.evaluation.embedder import SemanticEmbedder
 from job_agent.evaluation.reranker import LLMReranker
 from job_agent.intake.validator import load_and_verify_profile
 from job_agent.sourcing.delta_store import DeltaStore
+from job_agent.sourcing.details import enrich_missing_descriptions
 
 console = Console()
 
@@ -66,7 +68,9 @@ class SemanticEvaluationPipeline:
         profile_file = profile_path or settings.profile_path
         jobs_file = jobs_path or (settings.outputs_dir / "scraped_jobs.json")
         out_dir = output_dir or settings.outputs_dir
-        threshold = settings.tier1_threshold if tier1_threshold is None else tier1_threshold
+        configured = settings.tier1_threshold if tier1_threshold is None else tier1_threshold
+        resolve = getattr(self.embedder, "resolve_threshold", None)  # injected embedders may not have one
+        threshold = resolve(configured) if resolve else (SemanticEmbedder.TFIDF_THRESHOLD if configured is None else configured)
 
         console.print("\n[bold cyan]=== Phase 3: semantic evaluation ===[/bold cyan]")
 
@@ -75,12 +79,29 @@ class SemanticEvaluationPipeline:
             raise ValueError("Profile integrity failed. Re-run intake before evaluation.")
 
         jobs = self._load_jobs(jobs_file)
+        from job_agent.tracking.skips import feedback_note, load_skips
+        user_skipped = set(load_skips(out_dir))
+        if hasattr(self.reranker, "feedback_note"):
+            self.reranker.feedback_note = feedback_note(out_dir)
+        skipped_by_user = sum(1 for job in jobs if job.id in user_skipped)
+        if skipped_by_user:
+            # The candidate already said no to these; scoring them would spend LLM quota on a settled question.
+            jobs = [job for job in jobs if job.id not in user_skipped]
+            console.print(f"[dim]{skipped_by_user} job(s) you skipped are not scored again.[/dim]")
         input_count = len(jobs)
+        without = sum(1 for job in jobs if not (job.description or "").strip())
+        if without:
+            console.print(f"[cyan]Fetching the description for {without} listing(s) that arrived without one...[/cyan]")
+            jobs, fetched = enrich_missing_descriptions(jobs)
+            console.print(f"  Fetched {fetched['fetched']} of {fetched['requested']} requested "
+                          f"({fetched['unavailable']} have no page to read).")
+            if fetched["fetched"]:
+                self._save_descriptions(jobs_file, jobs)
         missing_descriptions = [job.id for job in jobs if not (job.description or "").strip()]
         jobs = [job for job in jobs if (job.description or "").strip()]
         progress = {"input_jobs": input_count, "missing_descriptions": len(missing_descriptions),
                     "below_similarity_gate": 0, "deferred_by_limit": 0, "scored": 0,
-                    "qualified": 0, "failed": 0, "complete": False}
+                    "qualified": 0, "failed": 0, "skipped_by_user": skipped_by_user, "complete": False}
         def save_progress():
             out_dir.mkdir(parents=True, exist_ok=True)
             target = out_dir / "evaluation_progress.json"
@@ -100,6 +121,9 @@ class SemanticEvaluationPipeline:
         # --- Tier 1 -----------------------------------------------------------
         console.print(f"\n[cyan]Tier 1 dense embedding filter (threshold >= {threshold})...[/cyan]")
         tier1_passed = self.embedder.filter_and_rank(profile=profile, jobs=jobs, threshold=threshold)
+        stats = getattr(self.embedder, "last_cache_stats", None)
+        if stats and stats.get("hits"):
+            console.print(f"  [dim]{stats['hits']} job embedding(s) reused from the last run, {stats['misses']} computed.[/dim]")
         passed_ids = {job.id for job, _ in tier1_passed}
         for job in jobs:
             if job.id not in passed_ids:
@@ -132,44 +156,75 @@ class SemanticEvaluationPipeline:
                 "will not be sent to the judge again.[/cyan]"
             )
 
-        for index, (job, similarity) in enumerate(tier1_passed, start=1):
-            # Scores so far are already in the checkpoint, so stopping here loses
-            # nothing and the next run resumes from this job.
-            check_cancelled()
-            prior = resumed.get(job.id)
-            if prior is not None:
-                score = prior.evaluation
-                console.print(f"  [{index}/{len(tier1_passed)}] [dim]Reused score for {job.title} @ {job.company}[/dim]")
-            else:
-                console.print(f"  [{index}/{len(tier1_passed)}] Scoring: [bold]{job.title}[/bold] @ {job.company}")
-                try:
-                    score = self.reranker.evaluate_job(profile, job, similarity)
-                except Exception as exc:
-                    if settings.llm_strict:
-                        # Scores already paid for are kept in the checkpoint, so
-                        # re-running after a rate limit continues from here.
-                        raise
-                    # One bad posting must not abort the run; record it as unscored.
-                    console.print(f"    [red]Evaluation failed: {exc}. Skipping this listing.[/red]")
-                    progress["failed"] += 1
-                    save_progress()
-                    continue
+        # Results are written every 15 seconds and when the loop ends or is
+        # interrupted, not after every job: rewriting the whole result file per
+        # job made the cost of a long batch grow with its length.
+        scored_now = 0
+        started_scoring = time.monotonic()
+        dirty = {"value": False}
+        last_persist = {"at": time.monotonic()}
 
-            evaluated_all.append(EvaluatedJob(job=job, evaluation=score))
-
-            if score.passed_threshold:
-                qualified.append(evaluated_all[-1])
-                self.delta_store.update_status(job.id, "qualified")
-                if prior is None:
-                    console.print(f"    [bold green]Qualified[/bold green] fit {score.fit_score:.1f}/10")
-            else:
-                self.delta_store.update_status(job.id, "evaluated_rejected")
-                if prior is None:
-                    console.print(f"    [dim]Below {score.threshold_used:g}: fit {score.fit_score:.1f}/10[/dim]")
+        def persist() -> None:
+            if not dirty["value"]:
+                return
             self._write_outputs(out_dir, evaluated_all, qualified)
-            progress.update(scored=len(evaluated_all), qualified=len(qualified))
             save_progress()
             self._save_checkpoint(out_dir, checkpoint_key, evaluated_all)
+            dirty["value"] = False
+            last_persist["at"] = time.monotonic()
+
+        try:
+            for index, (job, similarity) in enumerate(tier1_passed, start=1):
+                # Scores so far are already in the checkpoint, so stopping here loses
+                # nothing and the next run resumes from this job.
+                check_cancelled()
+                prior = resumed.get(job.id)
+                if prior is not None:
+                    score = prior.evaluation
+                    console.print(f"  [{index}/{len(tier1_passed)}] [dim]Reused score for {job.title} @ {job.company}[/dim]")
+                else:
+                    console.print(f"  [{index}/{len(tier1_passed)}] Scoring: [bold]{job.title}[/bold] @ {job.company}")
+                    try:
+                        score = self.reranker.evaluate_job(profile, job, similarity)
+                    except Exception as exc:
+                        if settings.llm_strict:
+                            # Scores already paid for are kept in the checkpoint, so
+                            # re-running after a rate limit continues from here.
+                            raise
+                        # One bad posting must not abort the run; record it as unscored.
+                        console.print(f"    [red]Evaluation failed: {exc}. Skipping this listing.[/red]")
+                        progress["failed"] += 1
+                        save_progress()
+                        continue
+
+                evaluated_all.append(EvaluatedJob(job=job, evaluation=score))
+
+                if score.passed_threshold:
+                    qualified.append(evaluated_all[-1])
+                    self.delta_store.update_status(job.id, "qualified")
+                    if prior is None:
+                        console.print(f"    [bold green]Qualified[/bold green] fit {score.fit_score:.1f}/10")
+                else:
+                    self.delta_store.update_status(job.id, "evaluated_rejected")
+                    if prior is None:
+                        console.print(f"    [dim]Below {score.threshold_used:g}: fit {score.fit_score:.1f}/10[/dim]")
+                progress.update(scored=len(evaluated_all), qualified=len(qualified))
+                dirty["value"] = True
+                if prior is None:
+                    scored_now += 1
+                    if scored_now % 5 == 0:
+                        per_job = (time.monotonic() - started_scoring) / scored_now
+                        left = len(tier1_passed) - index
+                        console.print(f"    [dim]{scored_now} scored this run; about {per_job:.0f}s per job, "
+                                      f"roughly {left * per_job / 60:.0f} min left.[/dim]")
+                if time.monotonic() - last_persist["at"] >= 15:
+                    persist()
+
+        finally:
+            try:
+                persist()
+            except OSError as exc:
+                console.print(f"[yellow]Could not save evaluation progress: {exc}[/yellow]")
 
         self._write_outputs(out_dir, evaluated_all, qualified)
         progress["complete"] = True
@@ -233,6 +288,27 @@ class SemanticEvaluationPipeline:
         (out_dir / self.CHECKPOINT_NAME).unlink(missing_ok=True)
 
     # --- Helpers --------------------------------------------------------------
+
+    @staticmethod
+    def _save_descriptions(jobs_file: Path, jobs: List[JobPosting]) -> None:
+        """Write newly fetched descriptions back, so later phases and the database keep them."""
+        by_id = {job.id: job for job in jobs if (job.description or "").strip()}
+        for target in (jobs_file, jobs_file.parent / "latest_jobs.json"):
+            try:
+                raw = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            changed = False
+            for item in raw if isinstance(raw, list) else []:
+                job = by_id.get(item.get("id")) if isinstance(item, dict) else None
+                if job is not None and not (item.get("description") or "").strip():
+                    item["description"] = job.description
+                    item["contacts"] = [contact.model_dump() for contact in job.contacts]
+                    changed = True
+            if changed:
+                temporary = target.with_suffix(".json.tmp")
+                temporary.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+                temporary.replace(target)
 
     @staticmethod
     def _load_jobs(jobs_file: Path) -> List[JobPosting]:

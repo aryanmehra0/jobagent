@@ -11,11 +11,11 @@ output. Nothing here re-derives or infers anything the pipeline did not record.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
+from job_agent.config.normalize import read_json as _read_json
 from job_agent.config.schema import JobPosting
 from job_agent.config.settings import settings
 
@@ -53,13 +53,6 @@ class JobRecord:
     @property
     def id(self) -> str:
         return self.job.id
-
-
-def _read_json(path: Path, default: Any) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return default
 
 
 def collect_records(outputs_dir: Optional[Path] = None) -> Dict[str, JobRecord]:

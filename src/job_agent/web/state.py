@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from job_agent.config.normalize import read_json as _read_json
 from job_agent.config.settings import settings
 
 # Phase identifiers, in execution order. The dashboard draws its graph from this.
@@ -50,7 +51,7 @@ PHASE_META: Dict[str, Dict[str, str]] = {
     "tailor": {
         "title": "Tailoring",
         "subtitle": "Bespoke ATS PDFs",
-        "detail": "Rewrites bullets per role behind the anti-hallucination gate, compiles with Typst.",
+        "detail": "Builds a resume for each job from your own PDF: your wording, fonts and layout are never changed, only the order of bullets, projects and skills. Other formats are generated and pass the anti-hallucination gate.",
         "command": "python main.py tailor",
     },
     "apply": {
@@ -66,14 +67,6 @@ PHASE_META: Dict[str, Dict[str, str]] = {
         "command": "python main.py track --all",
     },
 }
-
-
-def _read_json(path: Path, default: Any) -> Any:
-    """Read a JSON artifact, returning `default` when it is missing or corrupt."""
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
 
 
 JOBS_CSV_NAME = "jobs_master.csv"
@@ -497,7 +490,7 @@ def build_snapshot() -> Dict[str, Any]:
         "formats": supported_formats(),
         "provider": settings.active_provider,
         "thresholds": {
-            "tier1": settings.tier1_threshold,
+            "tier1": settings.tier1_threshold if settings.tier1_threshold is not None else "auto",
             "fit": settings.min_match_score,
         },
         "paths": {

@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 
 from rich.console import Console
 
+from job_agent.sourcing.delta_store import profile_identity as _profile_identity
 from job_agent.config.schema import CandidateProfile
 from job_agent.config.settings import settings
 from job_agent.runtime import exclusive_run, invalidate_after
@@ -344,7 +345,9 @@ class ResumeParser:
             except ResumeParseError:
                 pass
             for attempt in range(2):
-                data = groq_complete(SYSTEM_EXTRACTION_PROMPT, prompt, max_tokens=8000)
+                # A parsed profile is ~1-3k tokens. Reserving 8000 for output made
+                # Groq reject ordinary resumes as "too large" (HTTP 413).
+                data = groq_complete(SYSTEM_EXTRACTION_PROMPT, prompt, max_tokens=4500)
                 # Reconcile against the source *before* validating. Validating
                 # the raw draft first meant a date the model omitted failed the
                 # whole intake, even though the resume text supplied it — and the
@@ -421,8 +424,22 @@ class ResumeParser:
         profile_dict.setdefault("source_document", pdf_path.name)
         profile_dict["extraction_method"] = method
 
+        # "LinkedIn" and "GitHub" on a resume are usually link text; the address itself is
+        # a hyperlink in the PDF and never appears in the extracted words. Take it from
+        # there, but never over a value the resume itself states.
+        found = pdf_hyperlinks(pdf_path) if pdf_path.suffix.lower() == ".pdf" else {}
+        contact = profile_dict.get("contact")
+        if isinstance(contact, dict):
+            for field, key in (("linkedin_url", "linkedin"), ("github_url", "github")):
+                if not contact.get(field) and found.get(key):
+                    contact[field] = found[key]
+
         # Groq drafts were already reconciled against the source inside
         # `_llm_extract`, before validation.
+
+        # Who the profile belonged to before this intake replaces it.
+        replacing_live_profile = target_output.resolve() == settings.profile_path.resolve()
+        previous_identity = _profile_identity(target_output) if replacing_live_profile else None
 
         # Validate, fact-check against the source text, seal, and persist.
         profile = validate_and_save_profile(profile_dict, target_output, source_text=raw_text)
@@ -431,10 +448,38 @@ class ResumeParser:
             # candidate saved earlier carry over to the new profile.
             from job_agent.intake.preferences import reapply_saved_preferences
 
+            now_identity = _profile_identity(target_output)
+            from job_agent.intake.switch import is_different_candidate
+            switched = is_different_candidate(previous_identity, now_identity)
+            if switched:
+                # A different person: their tracker, drafts, scores and saved
+                # preferences must not carry over. Archived, never deleted, and
+                # done BEFORE preferences are re-applied so none leak across.
+                from job_agent.intake.switch import retire_previous_candidate
+                retired = retire_previous_candidate()
+                if retired["complete"]:
+                    console.print(f"[cyan]This resume is for a different candidate. The previous candidate's tracker, "
+                                  f"drafts, scores and preferences were archived to {retired['archive']}; "
+                                  "nothing carries over to this profile.[/cyan]")
+                else:
+                    console.print("[bold red]This resume is for a different candidate, but the previous candidate's "
+                                  "data was NOT fully cleared:[/bold red]")
+                    for problem in retired["problems"]:
+                        console.print(f"[red]  - {problem}[/red]")
+                    console.print("[red]Close anything holding those files open (Excel, another run) and load the "
+                                  "resume again.[/red]")
             profile = reapply_saved_preferences(profile, target_output)
             invalidate_after("intake", settings.outputs_dir)
+            if switched:
+                # Jobs judged for the last candidate must be re-scored, not skipped as "already seen".
+                from job_agent.sourcing.delta_store import DeltaStore
+                reopened = DeltaStore().reopen_for_new_profile()
+                if reopened:
+                    console.print(f"[cyan]{reopened} previously processed job(s) will be re-scored for this "
+                                  "profile when the next search finds them.[/cyan]")
         import hashlib
         target_output.with_suffix(".source.json").write_text(json.dumps({
+            "parser_version": PARSER_VERSION,
             "source_sha256": hashlib.sha256(pdf_path.read_bytes()).hexdigest(),
             "profile_hash": profile.profile_hash,
         }, indent=2), encoding="utf-8")
@@ -499,6 +544,47 @@ def _reconcile_with_source(profile_dict: Dict[str, Any], baseline: Dict[str, Any
     profile_dict["work_authorization"] = baseline["work_authorization"]
     profile_dict["years_of_experience"] = baseline["years_of_experience"]
 
+    # The offline parser's total is only as good as its date reading: on a CV
+    # whose dates it cannot parse it reports 0.0 even when the reconciled roles
+    # carry valid dates. The evaluator scores "years of experience" against each
+    # job's requirement, so a false 0.0 quietly lowers every score. Prefer the
+    # total derived from the roles' own dates when the draft is clearly lower.
+    try:
+        derived = CandidateProfile(**profile_dict).computed_years_of_experience()
+    except Exception:
+        derived = None  # not yet valid; the validator reports whatever is wrong
+    if derived is not None and derived > float(profile_dict["years_of_experience"] or 0) + 0.2:
+        profile_dict["years_of_experience"] = round(derived, 1)
+
+
+# Bump when intake's output could change for the same resume (a parsing fix, a
+# new field). A sealed profile made by an older version is then rebuilt on the
+# next run instead of being reused with the old mistake in it.
+PARSER_VERSION = 2
+
+
+
+
+def pdf_hyperlinks(pdf_path: Path) -> Dict[str, str]:
+    """LinkedIn and GitHub profile addresses from a PDF's own hyperlinks."""
+    found: Dict[str, str] = {}
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                for link in page.hyperlinks:
+                    uri = (link.get("uri") or "").strip()
+                    lowered = uri.lower()
+                    if not lowered.startswith(("http://", "https://")):
+                        continue  # mailto:, tel: and anything else
+                    if "linkedin.com/in/" in lowered:
+                        found.setdefault("linkedin", uri)
+                    elif re.match(r"https?://(www\.)?github\.com/[^/?#]+/?$", lowered):
+                        found.setdefault("github", uri)
+    except Exception:
+        return {}  # links are a convenience; the resume parses without them
+    return found
 
 def _extract_json_object(content: str) -> Dict[str, Any]:
     """Pull a JSON object out of a model response that may be fenced or prose-wrapped."""

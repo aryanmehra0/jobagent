@@ -63,6 +63,46 @@ class GroqClient:
         self._invalid = set()
         self._next = 0
         self._retry_at = 0.0
+        # What Groq last reported about the per-minute token budget, so the next
+        # call can wait exactly as long as needed instead of colliding with a 429.
+        self._tokens_remaining = None
+        self._tokens_limit = None
+        self._tokens_seen_at = 0.0
+
+    @staticmethod
+    def _parse_duration(value):
+        """Seconds in Groq's reset headers: '58.6s', '1m2.5s', '2m'."""
+        total, found = 0.0, False
+        for amount, unit in re.findall(r"([\d.]+)\s*(ms|m|s)", str(value or "")):
+            found = True
+            total += float(amount) * {"ms": 0.001, "s": 1.0, "m": 60.0}[unit]
+        return total if found else None
+
+    def _note_limits(self, headers):
+        try:
+            self._tokens_remaining = int(headers.get("x-ratelimit-remaining-tokens"))
+            self._tokens_limit = int(headers.get("x-ratelimit-limit-tokens"))
+            self._tokens_seen_at = time.monotonic()
+        except (TypeError, ValueError):
+            pass
+
+    def _pace_seconds(self, messages, max_tokens):
+        """How long to wait so this request fits the token budget Groq last reported.
+
+        The budget refills continuously (limit per 60s), so the wait is the time
+        to earn back the shortfall. A request that would be rejected anyway
+        (429) costs a full cooldown; waiting the exact shortfall does not.
+        """
+        if self._tokens_remaining is None or not self._tokens_limit:
+            return 0.0
+        rate = self._tokens_limit / 60.0
+        refilled = (time.monotonic() - self._tokens_seen_at) * rate
+        available = min(self._tokens_limit, self._tokens_remaining + refilled)
+        prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages) / 3.5
+        needed = prompt_tokens + min(max_tokens, 1000)
+        if needed >= self._tokens_limit:
+            return 0.0  # can never fit; let the request through and let Groq answer
+        return max(0.0, (needed - available) / rate) + 0.3
 
     @staticmethod
     def _retry_seconds(headers):
@@ -86,6 +126,9 @@ class GroqClient:
                 seconds = int(self._retry_at - time.monotonic()) + 1
                 raise LLMError(f"Groq rate limit: retry in {seconds}s; organization quota is shared across keys.")
             model = self._active_model()
+            wait = self._pace_seconds(messages, max_tokens)
+            if wait > 0.5:
+                time.sleep(min(wait, 65.0))
             payload = dict(model=model, messages=messages, temperature=temperature,
                            max_completion_tokens=max_tokens)
             if json_mode:
@@ -150,6 +193,24 @@ class GroqClient:
                         # than returning it. A fresh sample usually succeeds.
                         return self.complete(messages, json_mode=json_mode, max_tokens=max_tokens,
                                              temperature=temperature, _retried=_retried + 1, _waited=_waited)
+                    if status == 413:
+                        # Groq counts the prompt PLUS the reserved output allowance
+                        # against a per-request token limit, so a generous
+                        # max_tokens can reject a short prompt. Halve the
+                        # allowance and retry before giving up; the output a
+                        # structured extraction needs is far below the ceiling.
+                        if max_tokens > 1500 and _retried < 3:
+                            smaller = max(1500, max_tokens // 2)
+                            from rich.console import Console
+                            Console().print(
+                                f"[yellow]Groq says the request is too large for {model}'s per-request limit; "
+                                f"retrying with a smaller output allowance ({smaller} tokens).[/yellow]")
+                            return self.complete(messages, json_mode=json_mode, max_tokens=smaller,
+                                                 temperature=temperature, _retried=_retried + 1, _waited=_waited)
+                        raise LLMError(
+                            f"Groq request too large (HTTP 413) for {model}: the prompt plus the output allowance "
+                            "exceeds its per-request token limit. Shorten the input, or set GROQ_MODEL to a model "
+                            "with a larger limit.")
                     if status != 200:
                         raise LLMError(f"Groq request rejected (HTTP {status}); check model access and configuration.")
                     try:
@@ -163,6 +224,7 @@ class GroqClient:
                         raise LLMError("Groq returned an incomplete or invalid response; nothing was accepted.") from None
                     self._next = index
                     self.last_model = model
+                    self._note_limits(response.headers)
                     return content.strip()
             raise LLMError(last_error)
 
@@ -170,6 +232,15 @@ class GroqClient:
 _client = None
 _configuration = None
 _client_lock = threading.Lock()
+
+
+def last_groq_model():
+    """The model that answered the most recent Groq call, or None before any call.
+
+    It differs from the configured model once a daily limit pushes the client onto its fallback.
+    """
+    client = _client
+    return client.last_model if client is not None else None
 
 
 def groq_complete(system, prompt, *, json_mode=True, max_tokens=4096):
