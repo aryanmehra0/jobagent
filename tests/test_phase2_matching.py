@@ -8,7 +8,7 @@ H3  matched skills were stored without being checked against the profile
 from __future__ import annotations
 
 import pytest
-from test_tailoring import candidate_profile  # noqa: F401
+from tests.test_tailoring import candidate_profile  # noqa: F401
 
 from job_agent.sourcing.relevance import suspicious_role_words, title_matches
 
