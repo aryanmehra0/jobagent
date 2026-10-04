@@ -402,10 +402,20 @@ The safe migration path is:
 
 1. Keep local SQLite for the open-source personal agent.
 2. Use the hosted API scaffold for smoke testing queue/API behavior.
-3. Add Postgres tables that mirror `DeltaStore` and `HostedQueue`.
+3. Set `DATABASE_URL` so `HostedQueue`, `JobsDatabase`, and `DeltaStore` use
+   Postgres for queued runs, jobs, normalized candidate state, seen jobs,
+   application attempts, and outreach ledgers.
 4. Run every queued job in a per-user worker container with its own mounted data
    directory or object-storage prefix.
 5. Store API keys in a managed secret store, never in shared project files.
+
+To verify the Postgres path against a real database, point the opt-in
+integration test at a disposable database. It creates and drops its own schema:
+
+```powershell
+$env:JOB_AGENT_POSTGRES_TEST_URL='postgresql://user:pass@localhost:5432/job_agent_test'
+python -m pytest tests/test_postgres_integration.py -q
+```
 
 ## Email status
 

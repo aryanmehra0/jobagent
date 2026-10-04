@@ -209,7 +209,13 @@ class FallbackTrackingPipeline:
     def _load_evaluations(qualified_file: Path) -> Dict[str, EvaluatedJob]:
         """Index the Phase 3 evaluations by job ID for score and posting lookup."""
         if not qualified_file.exists():
-            return {}
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                records = JobsDatabase().evaluated_jobs(qualified_only=True)
+            except Exception:
+                records = []
+            return {record.job.id: record for record in records}
         try:
             raw = json.loads(qualified_file.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:

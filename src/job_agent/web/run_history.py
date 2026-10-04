@@ -73,18 +73,46 @@ def run_job_ids(results: Dict[str, Any]) -> List[str]:
             return []
         return data if isinstance(data, list) else []
 
+    def db_source_ids() -> List[str]:
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            return [job.id for job in JobsDatabase().source_jobs(limit=100_000)]
+        except Exception:
+            return []
+
+    def db_evaluated_ids() -> List[str]:
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            return [item.job.id for item in JobsDatabase().evaluated_jobs(qualified_only=False)]
+        except Exception:
+            return []
+
+    def db_tailored_ids() -> List[str]:
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            return [str(item["job_id"]) for item in JobsDatabase().tailored_resumes(limit=100_000)
+                    if item.get("job_id")]
+        except Exception:
+            return []
+
     def ran(phase: str) -> bool:
         return (results.get(phase) or {}).get("status") in ("ok", "warning")
 
     ids: List[str] = []
     if ran("source"):
-        ids += [str(item["id"]) for item in read("latest_jobs.json") if isinstance(item, dict) and item.get("id")]
+        source = [str(item["id"]) for item in read("latest_jobs.json") if isinstance(item, dict) and item.get("id")]
+        ids += source or db_source_ids()
     if ran("evaluate"):
-        ids += [str(item["job"]["id"]) for item in read("evaluated_jobs.json")
-                if isinstance(item, dict) and isinstance(item.get("job"), dict) and item["job"].get("id")]
+        evaluated = [str(item["job"]["id"]) for item in read("evaluated_jobs.json")
+                     if isinstance(item, dict) and isinstance(item.get("job"), dict) and item["job"].get("id")]
+        ids += evaluated or db_evaluated_ids()
     if ran("tailor"):
-        ids += [str(item["job_id"]) for item in read("tailored_resumes/manifest.json")
-                if isinstance(item, dict) and item.get("job_id")]
+        tailored = [str(item["job_id"]) for item in read("tailored_resumes/manifest.json")
+                    if isinstance(item, dict) and item.get("job_id")]
+        ids += tailored or db_tailored_ids()
     return list(dict.fromkeys(ids))
 
 

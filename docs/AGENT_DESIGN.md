@@ -22,8 +22,22 @@ keeping it that way as the system grows.
 
 ## What's genuinely partial, stated plainly
 
+- **Long-term memory is moving from artifact-first to DB-first.** `jobs.db`
+  remains SQLite locally and Postgres-capable through `DATABASE_URL`;
+  normalized tables now hold users, candidate profiles/preferences, job
+  matches, evaluation history, source listings, applications, application
+  events and artifact metadata. `job_overview` prefers those normalized rows.
+  Some phase hand-offs still read JSON artifacts for compatibility, so a
+  hosted multi-device version must keep moving read paths to the database
+  rather than assuming that migration is complete.
+
 - **Observation doesn't yet trigger automatic re-planning.** `quality`/`performance`/`audit` produce a report a human reads; nothing currently says "performance report shows evaluation is the bottleneck, so automatically cap the next run's `--limit`." That's a deliberate boundary today, not a bug — an unattended agent silently changing its own scope is exactly the kind of thing this project's human-in-the-loop philosophy avoids. If this ever changes, it should be opt-in and logged, the same way `LLM_STRICT` and `--strict-llm` are explicit opt-ins rather than silent defaults.
-- **Long-term memory is single-machine.** `delta_store.db`/`jobs.db` are local SQLite files (Postgres-capable via `DATABASE_URL`, see `docs/DEPLOYMENT.md`, but not synced anywhere by default). Fine for one candidate on one machine; a multi-device or multi-user version needs that migration done first, not assumed.
+- **Long-term memory is local by default, hosted-capable by configuration.**
+  `delta_store.db`/`jobs.db` are local SQLite files unless `DATABASE_URL` is
+  set. With `DATABASE_URL`, queue state, fetched jobs, normalized candidate/job
+  state, and duplicate-prevention state use Postgres; a multi-device or
+  multi-user version still needs deployment, identity, access-control, and data
+  retention decisions rather than assuming local files are shared.
 - **CAPTCHA solving is stubbed, permanently, on purpose** (`automation/hitl.py`) — it always falls through to a human-in-the-loop pause rather than attempting to solve it autonomously. This is a guardrail choice, not a missing feature: autonomously defeating a bot challenge is the kind of capability this project deliberately doesn't build.
 
 ## Guardrails

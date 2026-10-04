@@ -201,6 +201,14 @@ class AutoApplyPipeline:
     def _load_manifest(manifest_file: Path) -> List[Dict[str, Any]]:
         """Load the tailored-resume manifest produced by Phase 4."""
         if not manifest_file.exists():
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                entries = JobsDatabase().tailored_resumes(limit=100_000)
+            except Exception:
+                entries = []
+            if entries:
+                return [entry for entry in entries if entry.get("job_id") and entry.get("pdf_path")]
             raise FileNotFoundError(
                 f"Tailored resume manifest not found at {manifest_file}. Run 'python main.py tailor' first."
             )
@@ -214,6 +222,17 @@ class AutoApplyPipeline:
     def _load_qualified(qualified_file: Path) -> Tuple[Dict[str, JobPosting], Dict[str, float]]:
         """Build job and fit-score lookups keyed by job ID."""
         if not qualified_file.exists():
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                records = JobsDatabase().evaluated_jobs(qualified_only=True)
+            except Exception:
+                records = []
+            if records:
+                return (
+                    {record.job.id: record.job for record in records},
+                    {record.job.id: float(record.evaluation.fit_score) for record in records},
+                )
             raise FileNotFoundError(
                 f"Qualified jobs file not found at {qualified_file}. Run 'python main.py evaluate' first."
             )

@@ -1,6 +1,6 @@
 # Autonomous AI Job Search & Application Agent — Complete Architecture Reference
 
-> **Version**: 0.3.0 · **Last verified**: 2026-09-25 · **Tests**: 513 passed, 6 opt-in skipped (519 total) · **Phases**: 7 core + 2 opt-in (reply tracking, warm contacts)
+> **Version**: 0.3.0 · **Last verified**: 2026-10-04 · **Tests**: 829 passed, 1 opt-in skipped in CI-style local run · **Phases**: 7 core + 2 opt-in (reply tracking, warm contacts)
 
 This document is the **single source of truth** for any AI agent (Claude, Codex, Gemini, etc.) or developer working on this codebase. It maps every file, class, function, constant, data flow, and design invariant so you can make changes without reading all 78 source files.
 
@@ -26,7 +26,7 @@ This document is the **single source of truth** for any AI agent (Claude, Codex,
 14. [Web UI (Visual Flow Console)](#14-web-ui-visual-flow-console)
 15. [CLI Reference (26 Subcommands + `db` group)](#15-cli-reference-26-subcommands--db-group)
 16. [Environment Variables](#16-environment-variables)
-17. [Test Suite (519 Tests)](#17-test-suite-519-tests)
+17. [Test Suite](#17-test-suite)
 18. [Key Design Invariants](#18-key-design-invariants)
 
 ---
@@ -115,14 +115,15 @@ job agent/
 │   ├── interview/          Phase 7 — pipeline.py (module is `interview`, not `prep`)
 │   ├── contacts/           Warm contact leads (separate top-level package, not under tracking/)
 │   │                        — extract.py, finder.py, warm.py
-│   ├── storage/            jobs_db.py — the queryable jobs.db/Postgres layer
+│   ├── storage/            jobs_db.py + migrations.py — queryable jobs.db/Postgres
+│   │                        layer, schema ledger, normalized candidate/job state
 │   ├── hosted/             Separate control-plane scaffold — api.py, auth.py, queue.py,
 │   │                        worker.py (queue+auth storage is queue.py, there is no db.py)
 │   └── web/                Flow console — runner.py, run_history.py (per-run persistence),
 │                            server.py, state.py, analytics.py,
 │                            static/{index.html,styles.css,app.js}
 │
-└── tests/                            # 42 test files, 813 tests (807 run in CI, plus 6 opt-in browser tests that pass with JOB_AGENT_BROWSER_TESTS=1)
+└── tests/                            # 43 test files; latest CI-style local run: 829 passed, 1 opt-in Postgres integration skipped
 ```
 
 ---
@@ -152,6 +153,31 @@ flowchart LR
 | 5. Auto-Apply | `profile.json`, `manifest.json` | `application_results.json` |
 | 6. Tracking | `application_results.json`, `qualified_jobs.json` | `applications_tracker.xlsx`, `application_pack.zip` |
 | 7. Interview Prep | `profile.json`, `qualified_jobs.json` | `data/outputs/interview_prep.json` |
+
+### Database Authority Migration
+
+`storage/jobs_db.py` still keeps legacy projection tables for compatibility, but
+new syncs also write normalized state into `users`, `candidate_profiles`,
+`candidate_preferences`, `job_matches`, `job_evaluation_history`,
+`applications`, `application_events`, `job_source_listings`, and
+`resume_artifacts`. `storage/migrations.py` records the schema ledger visible
+through `python main.py db migrations`. `job_overview` now prefers normalized
+match/application/artifact data and falls back to legacy columns only when the
+normalized rows are absent. CSV exports overlay DB state, dashboard summaries, CLI
+`status`, Phase 2/4 dashboard state, Phase 3 sourced-job loading, Phase 5
+resume-manifest/application-pack loading, and the qualified-job loaders used by
+tailoring/apply/interview prep and fallback tracking can be rebuilt from the
+database when JSON artifacts are missing, so CSV/XLSX/JSON are moving toward
+export/debug outputs rather than authoritative state. Run history also links
+jobs from DB source/evaluation/resume-artifact state when per-run JSON files
+are absent, and tracker resume checks can be refreshed from normalized resume
+artifacts when the tailoring manifest is missing.
+
+`sourcing/delta_store.py` follows the same local/hosted split: without
+`DATABASE_URL` it uses `data/outputs/delta_store.db`; with `DATABASE_URL` it
+stores `seen_jobs`, `application_attempts`, `outreach_log`, and `delta_meta` in
+Postgres so duplicate-prevention state is no longer a separate SQLite island in
+hosted mode.
 
 ---
 
@@ -307,11 +333,11 @@ Configured via `.env` file (see `.env.example`):
 
 ---
 
-## 17. Test Suite (519 Tests)
+## 17. Test Suite
 
-Run with `python -m pytest -v`:
-- **Current status**: 500 passed, 6 skipped (browser integration tests opt-in via `JOB_AGENT_BROWSER_TESTS=1`).
-- **Test execution time**: ~2.5 minutes across 34 test modules.
+Run with `python -m pytest -v` or the CI-style command in `CLAUDE.md`:
+- **Current CI-style status**: 829 passed, 1 skipped on 2026-10-04; the skipped test is the real Postgres integration gated by `JOB_AGENT_POSTGRES_TEST_URL`.
+- **Test execution time**: ~3 minutes across 43 test files.
 - **Key test modules**:
   - `test_anti_hallucination.py`: Fact sealing, intake audit, tailoring gate, cold email verification.
   - `test_application_pack.py`: Portable ZIP bundle generation and document hash validation.

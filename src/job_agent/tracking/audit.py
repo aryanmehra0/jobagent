@@ -59,6 +59,12 @@ def audit_report(outputs_dir: Path | None = None, *, sync: bool = True) -> dict[
         "evaluations": _count_table(database, "job_evaluations"),
         "applications": _count_table(database, "job_applications"),
         "outreach": _count_table(database, "job_outreach"),
+        "job_matches": _count_table(database, "job_matches"),
+        "evaluation_history": _count_table(database, "job_evaluation_history"),
+        "application_records": _count_table(database, "applications"),
+        "application_events": _count_table(database, "application_events"),
+        "source_listings": _count_table(database, "job_source_listings"),
+        "resume_artifacts": _count_table(database, "resume_artifacts"),
     }
     artifact_counts = {
         "jobs_master_rows": len(master),
@@ -81,6 +87,10 @@ def audit_report(outputs_dir: Path | None = None, *, sync: bool = True) -> dict[
         f"pack checked documents={pack_stats.get('checked_documents', 0)}")
     add("qualified_have_tailored_docs", artifact_counts["qualified_json"] <= db_counts["resumes"],
         f"qualified jobs={artifact_counts['qualified_json']}, stored resumes={db_counts['resumes']}")
+    add("normalized_matches_cover_jobs", db_counts["job_matches"] >= db_counts["jobs"] or db_counts["jobs"] == 0,
+        f"matches={db_counts['job_matches']}, jobs={db_counts['jobs']}")
+    add("source_listings_cover_jobs", db_counts["source_listings"] >= db_counts["jobs"] or db_counts["jobs"] == 0,
+        f"source listings={db_counts['source_listings']}, jobs={db_counts['jobs']}")
     add("quality_report_present", bool(quality),
         f"quality={quality.get('grade_out_of_10', 'missing')}/10")
     add("performance_report_present", bool(performance),
@@ -88,7 +98,11 @@ def audit_report(outputs_dir: Path | None = None, *, sync: bool = True) -> dict[
 
     return {
         "checked_at": datetime.now(timezone.utc).isoformat(),
-        "database": {"backend": db_stats["backend"], "location": db_stats["location"], "counts": db_counts},
+        "database": {
+            "backend": db_stats["backend"], "location": db_stats["location"],
+            "schema_version": db_stats.get("schema_version"), "migrations": db_stats.get("migrations", []),
+            "counts": db_counts,
+        },
         "artifacts": artifact_counts,
         "quality": {"grade_out_of_10": quality.get("grade_out_of_10"), "ready": quality.get("jobs", {}).get("ready")},
         "pack": pack_stats,

@@ -144,7 +144,12 @@ class MasterTracker:
         try:
             entries = _json.loads((resumes_dir / "manifest.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            return {}
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                entries = JobsDatabase().tailored_resumes(limit=100_000)
+            except Exception:
+                entries = []
         return {
             str(entry["job_id"]): entry.get("validation_summary") or "generated from profile (integrity gate)"
             for entry in entries if isinstance(entry, dict) and entry.get("job_id")

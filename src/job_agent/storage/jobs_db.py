@@ -9,10 +9,10 @@ alongside the queue, so one connection answers "what did the agent find?".
 The same tables are created on Postgres (when `DATABASE_URL` is set) and on
 SQLite otherwise, so a query written against one works against the other.
 
-This is a *view* of the artifacts, not a second source of truth: every sync
-rebuilds rows from what the pipeline wrote. Clearing the outputs and re-running
-cannot produce disagreement, because the sync only ever adds or updates rows and
-keeps the furthest lifecycle stage a job has reached.
+The legacy tables and overview view are still kept for the local dashboard and
+CLI. New code is dual-written into normalized, candidate-owned tables so the
+database can become the operational source of truth without breaking existing
+artifact-driven phases in one migration.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from job_agent.config.settings import settings
+from job_agent.storage.migrations import latest_version, migration_status, run_migrations
 from job_agent.tracking.records import JobRecord, collect_records, promote_status
 
 JOBS_DB_NAME = "jobs.db"
@@ -38,6 +39,8 @@ _SCHEMA = (
         company TEXT NOT NULL,
         location TEXT,
         is_remote INTEGER,
+        work_mode TEXT,
+        employment_type TEXT,
         source TEXT,
         date_posted TEXT,
         discovered_at TEXT,
@@ -62,6 +65,179 @@ _SCHEMA = (
     "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(fit_score)",
     "CREATE INDEX IF NOT EXISTS idx_jobs_company ON jobs(company)",
+    "CREATE INDEX IF NOT EXISTS idx_jobs_active_posted ON jobs(status, date_posted)",
+    """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id TEXT PRIMARY KEY,
+        email TEXT,
+        full_name TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS candidate_profiles (
+        candidate_id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(user_id),
+        profile_hash TEXT,
+        full_name TEXT,
+        email TEXT,
+        phone TEXT,
+        location TEXT,
+        years_of_experience DOUBLE PRECISION,
+        current_country TEXT,
+        authorized_countries TEXT,
+        requires_sponsorship INTEGER,
+        remote_worldwide INTEGER,
+        skills TEXT,
+        source_resume TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_candidate_profiles_user ON candidate_profiles(user_id)",
+    """
+    CREATE TABLE IF NOT EXISTS candidate_preferences (
+        candidate_id TEXT PRIMARY KEY REFERENCES candidate_profiles(candidate_id) ON DELETE CASCADE,
+        desired_salary DOUBLE PRECISION,
+        desired_salary_max DOUBLE PRECISION,
+        salary_currency TEXT,
+        target_roles TEXT,
+        locations TEXT,
+        onsite_countries TEXT,
+        work_modes TEXT,
+        remote_only INTEGER,
+        hours_old INTEGER,
+        job_boards TEXT,
+        country_indeed TEXT,
+        min_salary DOUBLE PRECISION,
+        max_results_per_board INTEGER,
+        find_contacts INTEGER,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS resumes (
+        resume_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL REFERENCES candidate_profiles(candidate_id) ON DELETE CASCADE,
+        object_key TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        version INTEGER,
+        kind TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_resumes_candidate ON resumes(candidate_id, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS job_source_listings (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+        source TEXT NOT NULL,
+        source_job_id TEXT,
+        source_url TEXT,
+        apply_url TEXT,
+        raw_payload TEXT,
+        first_seen_at TEXT,
+        last_seen_at TEXT,
+        source_posted_at TEXT,
+        is_active INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_job_source_identity ON job_source_listings(source, source_job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_job_source_job_seen ON job_source_listings(job_id, last_seen_at)",
+    """
+    CREATE TABLE IF NOT EXISTS job_matches (
+        match_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL REFERENCES candidate_profiles(candidate_id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id),
+        state TEXT NOT NULL,
+        fit_score DOUBLE PRECISION,
+        technical_score DOUBLE PRECISION,
+        seniority_score DOUBLE PRECISION,
+        semantic_score DOUBLE PRECISION,
+        matching_skills TEXT,
+        missing_skills TEXT,
+        scoring_version TEXT,
+        prompt_hash TEXT,
+        model TEXT,
+        profile_hash TEXT,
+        tailored_resume TEXT,
+        resume_check TEXT,
+        notes TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_job_matches_current ON job_matches(candidate_id, job_id, scoring_version, profile_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_job_matches_lookup ON job_matches(candidate_id, state, fit_score)",
+    """
+    CREATE TABLE IF NOT EXISTS job_evaluation_history (
+        evaluation_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL REFERENCES candidate_profiles(candidate_id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id),
+        profile_hash TEXT,
+        embedding_similarity DOUBLE PRECISION,
+        technical_score DOUBLE PRECISION,
+        seniority_score DOUBLE PRECISION,
+        fit_score DOUBLE PRECISION,
+        model_provider TEXT,
+        model_name TEXT,
+        model_version TEXT,
+        prompt_hash TEXT,
+        scoring_version TEXT,
+        threshold DOUBLE PRECISION,
+        passed INTEGER,
+        reasoning TEXT,
+        matching_skills TEXT,
+        missing_skills TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_eval_history_job ON job_evaluation_history(candidate_id, job_id, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS applications (
+        application_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL REFERENCES candidate_profiles(candidate_id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id),
+        current_status TEXT NOT NULL,
+        channel TEXT,
+        apply_url TEXT,
+        resume_used TEXT,
+        submitted_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_applications_candidate_job ON applications(candidate_id, job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(candidate_id, current_status, updated_at)",
+    """
+    CREATE TABLE IF NOT EXISTS application_events (
+        event_id TEXT PRIMARY KEY,
+        application_id TEXT NOT NULL REFERENCES applications(application_id) ON DELETE CASCADE,
+        event_type TEXT NOT NULL,
+        from_status TEXT,
+        to_status TEXT,
+        source TEXT,
+        metadata TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_application_events_timeline ON application_events(application_id, created_at)",
+    """
+    CREATE TABLE IF NOT EXISTS resume_artifacts (
+        artifact_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL REFERENCES candidate_profiles(candidate_id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id),
+        file_name TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        size_bytes INTEGER NOT NULL,
+        resume_check TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_resume_artifacts_candidate_job ON resume_artifacts(candidate_id, job_id)",
     """
     CREATE TABLE IF NOT EXISTS job_contacts (
         job_id TEXT NOT NULL,
@@ -211,13 +387,22 @@ _SCHEMA = (
 # One row per job with its best contact email: the view most people want.
 _VIEW = """
     CREATE VIEW IF NOT EXISTS job_overview AS
-    SELECT j.job_id, j.title, j.company, j.location, j.source, j.status, j.fit_score,
+    SELECT j.job_id, j.title, j.company, j.location, j.work_mode, j.employment_type, j.source,
+           COALESCE(a.current_status, m.state, j.status) AS status,
+           COALESCE(m.fit_score, j.fit_score) AS fit_score,
            j.date_posted, j.salary_min, j.salary_max, j.salary_currency,
            c.email AS contact_email, c.kind AS contact_kind, c.source AS contact_source,
            j.apply_method, j.auto_apply, j.apply_url, j.job_url, j.tailored_resume, j.resume_check,
-           r.file_path AS resume_file, r.size_bytes AS resume_bytes,
+           COALESCE(ra.file_path, r.file_path) AS resume_file,
+           COALESCE(ra.size_bytes, r.size_bytes) AS resume_bytes,
            o.recipient AS outreach_to, o.status AS outreach_status, o.subject AS outreach_subject
     FROM jobs j
+    LEFT JOIN job_matches m
+      ON m.match_id = (SELECT x.match_id FROM job_matches x WHERE x.job_id = j.job_id
+                       ORDER BY x.updated_at DESC, x.created_at DESC LIMIT 1)
+    LEFT JOIN applications a
+      ON a.application_id = (SELECT x.application_id FROM applications x WHERE x.job_id = j.job_id
+                             ORDER BY x.updated_at DESC, x.created_at DESC LIMIT 1)
     LEFT JOIN job_contacts c
       ON c.job_id = j.job_id
      AND c.email = (SELECT email FROM job_contacts x WHERE x.job_id = j.job_id
@@ -225,11 +410,15 @@ _VIEW = """
                                          WHEN 'general' THEN 2 ELSE 3 END, x.email LIMIT 1)
     LEFT JOIN job_outreach o ON o.job_id = j.job_id
     LEFT JOIN job_resumes r ON r.job_id = j.job_id
+    LEFT JOIN resume_artifacts ra
+      ON ra.artifact_id = (SELECT x.artifact_id FROM resume_artifacts x WHERE x.job_id = j.job_id
+                           ORDER BY x.created_at DESC LIMIT 1)
 """
 
 
 # SQLite files whose schema this process has already created: {path: file identity}.
 _PREPARED_FILES: Dict[str, Optional[int]] = {}
+_PG_POOLS: Dict[str, Any] = {}
 
 
 class JobsDatabase:
@@ -270,6 +459,13 @@ class JobsDatabase:
             except ImportError as exc:
                 raise RuntimeError("DATABASE_URL requires psycopg. Install psycopg[binary].") from exc
 
+            pool = self._postgres_pool(dict_row)
+            if pool is not None:
+                with pool.connection() as conn:
+                    with conn:
+                        yield conn
+                return
+
             conn = psycopg.connect(self.database_url, row_factory=dict_row)
             try:
                 with conn:
@@ -280,11 +476,30 @@ class JobsDatabase:
 
         conn = sqlite3.connect(str(self.db_path), timeout=15.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             with conn:
                 yield conn
         finally:
             conn.close()
+
+    def _postgres_pool(self, row_factory: Any) -> Optional[Any]:
+        """Reuse Postgres connections when psycopg_pool is installed."""
+        if not self.database_url:
+            return None
+        try:
+            from psycopg_pool import ConnectionPool
+        except ImportError:
+            return None
+        pool = _PG_POOLS.get(self.database_url)
+        if pool is None:
+            pool = ConnectionPool(
+                self.database_url, kwargs={"row_factory": row_factory},
+                min_size=1, max_size=4, open=False,
+            )
+            pool.open()
+            _PG_POOLS[self.database_url] = pool
+        return pool
 
     def _sql(self, statement: str) -> str:
         """Adapt one statement to the active backend."""
@@ -316,6 +531,7 @@ class JobsDatabase:
             for statement in _SCHEMA:
                 conn.execute(self._sql(statement))
             self._migrate(conn)
+            run_migrations(conn, self._sql, postgres=bool(self.database_url))
             try:
                 conn.execute(self._sql(_VIEW))
             except Exception:
@@ -326,7 +542,7 @@ class JobsDatabase:
 
     def _migrate(self, conn) -> None:
         """Add columns introduced after a database was created."""
-        added = {"resume_check": "TEXT"}
+        added = {"resume_check": "TEXT", "work_mode": "TEXT", "employment_type": "TEXT"}
         if self.database_url:
             for column, kind in added.items():
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN IF NOT EXISTS {column} {kind}")
@@ -344,6 +560,11 @@ class JobsDatabase:
             conn.execute("ALTER TABLE runs ADD COLUMN candidate_key TEXT")
         # The overview view predates the column; rebuild it to include it.
         conn.execute("DROP VIEW IF EXISTS job_overview")
+
+    def migrations(self) -> List[Dict[str, Any]]:
+        """Applied/pending schema migrations for diagnostics."""
+        with self._connect() as conn:
+            return migration_status(conn, self._sql)
 
     # --- Writing --------------------------------------------------------------
 
@@ -365,8 +586,11 @@ class JobsDatabase:
 
         now = datetime.now(timezone.utc).isoformat()
         stats = {"jobs": 0, "contacts": 0, "outreach": 0, "evaluations": 0, "applications": 0}
+        profile = self._profile_snapshot()
+        candidate_id = self._candidate_id(profile)
 
         with self._connect() as conn:
+            self._store_profile(conn, now, profile, candidate_id)
             known = {
                 row["job_id"]: row["status"]
                 for row in conn.execute(self._sql("SELECT job_id, status FROM jobs")).fetchall()
@@ -377,14 +601,16 @@ class JobsDatabase:
                 status = promote_status(known.get(job.id, ""), record.status)
                 conn.execute(self._sql(_UPSERT_JOB), (
                     job.id, job.fingerprint(), job.title, job.company, job.location,
-                    1 if job.is_remote else 0, job.source, job.date_posted, job.discovered_at,
-                    job.salary_min, job.salary_max,
+                    1 if job.is_remote else 0, job.work_mode, job.job_type, job.source,
+                    job.date_posted, job.discovered_at, job.salary_min, job.salary_max,
                     job.salary_currency if (job.salary_min or job.salary_max) else None,
                     job.job_url, record.apply_url or route.url, route.channel,
                     1 if route.automatable else 0, route.reason, job.company_website,
                     job.description, status, record.fit_score, record.tailored_resume,
                     record.resume_check, record.notes, now,
                 ))
+                self._store_source_listing(conn, record, now)
+                self._store_match(conn, record, candidate_id, now)
                 stats["jobs"] += 1
 
                 conn.execute(self._sql("DELETE FROM job_contacts WHERE job_id = ?"), (job.id,))
@@ -409,15 +635,22 @@ class JobsDatabase:
 
             for record in records.values():
                 if record.evaluation:
-                    stats["evaluations"] += self._store_evaluation(conn, record)
+                    stats["evaluations"] += self._store_evaluation(conn, record, candidate_id, now)
                 if record.application:
-                    stats["applications"] += self._store_application(conn, record)
+                    stats["applications"] += self._store_application(conn, record, candidate_id, now)
 
-            self._backfill_from_csv(conn, set(records) | set(known), now, stats, outputs_dir)
-            stats["resumes"] = self._store_resumes(conn, outputs_dir, now)
-            self._store_profile(conn, now)
-            self._store_search_parameters(conn, now)
+            self._backfill_from_csv(conn, set(records) | set(known), now, stats, outputs_dir, candidate_id)
+            stats["resumes"] = self._store_resumes(conn, outputs_dir, now, candidate_id)
+            self._store_search_parameters(conn, now, candidate_id, profile)
         return stats
+
+    @staticmethod
+    def _hash_id(*parts: Any, prefix: str = "") -> str:
+        import hashlib
+
+        token = "|".join("" if part is None else str(part) for part in parts)
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()[:24]
+        return f"{prefix}{digest}" if prefix else digest
 
     @staticmethod
     def _as_text(value: Any) -> Optional[str]:
@@ -428,7 +661,128 @@ class JobsDatabase:
             return "; ".join(str(item) for item in value) or None
         return str(value)
 
-    def _store_evaluation(self, conn, record: JobRecord) -> int:
+    def _profile_snapshot(self) -> Dict[str, Any]:
+        """Read the sealed profile once for candidate-owned normalized rows."""
+        import json as json_module
+
+        try:
+            data = json_module.loads(settings.profile_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _candidate_id(self, profile: Dict[str, Any]) -> str:
+        contact = profile.get("contact") or {}
+        email = (contact.get("email") or "").casefold()
+        profile_hash = profile.get("profile_hash") or ""
+        return email or profile_hash or "local-candidate"
+
+    def _split_model(self, scored_by: Optional[str]) -> Dict[str, Optional[str]]:
+        if not scored_by:
+            return {"provider": None, "name": None}
+        provider, _, name = scored_by.partition(":")
+        return {"provider": provider or None, "name": name or None}
+
+    def _store_source_listing(self, conn, record: JobRecord, now: str) -> None:
+        import json as json_module
+
+        job = record.job
+        source_job_id = job.id
+        listing_id = self._hash_id(job.source, source_job_id or job.job_url, prefix="src_")
+        raw_payload = json_module.dumps(job.model_dump(), default=str)
+        conn.execute(self._sql("""
+            INSERT INTO job_source_listings (id, job_id, source, source_job_id, source_url, apply_url,
+                                             raw_payload, first_seen_at, last_seen_at, source_posted_at, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT (id) DO UPDATE SET
+                job_id = excluded.job_id, source_url = excluded.source_url, apply_url = excluded.apply_url,
+                raw_payload = excluded.raw_payload, last_seen_at = excluded.last_seen_at,
+                source_posted_at = excluded.source_posted_at, is_active = 1
+        """), (
+            listing_id, job.id, job.source, source_job_id, job.job_url,
+            record.apply_url or job.apply_url, raw_payload, job.discovered_at or now,
+            now, job.date_posted,
+        ))
+
+    def _store_source_listing_from_csv(self, conn, row: Dict[str, str], now: str) -> None:
+        import json as json_module
+
+        job_id = row["Job ID"]
+        source = row.get("Source") or "csv"
+        source_job_id = job_id
+        listing_id = self._hash_id(source, source_job_id, prefix="src_")
+        conn.execute(self._sql("""
+            INSERT INTO job_source_listings (id, job_id, source, source_job_id, source_url, apply_url,
+                                             raw_payload, first_seen_at, last_seen_at, source_posted_at, is_active)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT (id) DO UPDATE SET
+                job_id = excluded.job_id, source_url = excluded.source_url, apply_url = excluded.apply_url,
+                raw_payload = excluded.raw_payload, last_seen_at = excluded.last_seen_at,
+                source_posted_at = excluded.source_posted_at, is_active = 1
+        """), (
+            listing_id, job_id, source, source_job_id, row.get("Job URL") or None,
+            row.get("Apply URL") or None, json_module.dumps(row, default=str),
+            row.get("Date Found") or now, now, row.get("Posted") or None,
+        ))
+
+    def _store_match(self, conn, record: JobRecord, candidate_id: str, now: str) -> None:
+        evaluation = record.evaluation or {}
+        scoring_version = evaluation.get("scoring_version") or "artifact-v1"
+        profile_hash = evaluation.get("profile_hash") or self._current_profile_hash(conn)
+        match_id = self._hash_id(candidate_id, record.id, scoring_version, profile_hash, prefix="match_")
+        conn.execute(self._sql("""
+            INSERT INTO job_matches (match_id, candidate_id, job_id, state, fit_score, technical_score,
+                                     seniority_score, semantic_score, matching_skills, missing_skills,
+                                     scoring_version, prompt_hash, model, profile_hash, tailored_resume,
+                                     resume_check, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (match_id) DO UPDATE SET
+                state = excluded.state, fit_score = COALESCE(excluded.fit_score, job_matches.fit_score),
+                technical_score = COALESCE(excluded.technical_score, job_matches.technical_score),
+                seniority_score = COALESCE(excluded.seniority_score, job_matches.seniority_score),
+                semantic_score = COALESCE(excluded.semantic_score, job_matches.semantic_score),
+                matching_skills = COALESCE(excluded.matching_skills, job_matches.matching_skills),
+                missing_skills = COALESCE(excluded.missing_skills, job_matches.missing_skills),
+                tailored_resume = COALESCE(excluded.tailored_resume, job_matches.tailored_resume),
+                resume_check = COALESCE(excluded.resume_check, job_matches.resume_check),
+                notes = COALESCE(excluded.notes, job_matches.notes), updated_at = excluded.updated_at
+        """), (
+            match_id, candidate_id, record.id, record.status, record.fit_score,
+            evaluation.get("technical_score"), evaluation.get("seniority_score"),
+            evaluation.get("embedding_similarity"), self._as_text(evaluation.get("matching_skills")),
+            self._as_text(evaluation.get("missing_skills")), scoring_version,
+            evaluation.get("prompt_hash"), evaluation.get("scored_by"), profile_hash,
+            record.tailored_resume, record.resume_check, record.notes, now, now,
+        ))
+
+    def _store_match_from_csv(self, conn, row: Dict[str, str], candidate_id: str, now: str) -> None:
+        score = row.get("Fit Score") or ""
+        fit_score = float(score) if score else None
+        state = row.get("Status") or "found"
+        match_id = self._hash_id(candidate_id, row["Job ID"], "csv-v1", None, prefix="match_")
+        conn.execute(self._sql("""
+            INSERT INTO job_matches (match_id, candidate_id, job_id, state, fit_score, scoring_version,
+                                     tailored_resume, resume_check, notes, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (match_id) DO UPDATE SET
+                state = excluded.state, fit_score = COALESCE(excluded.fit_score, job_matches.fit_score),
+                tailored_resume = COALESCE(excluded.tailored_resume, job_matches.tailored_resume),
+                resume_check = COALESCE(excluded.resume_check, job_matches.resume_check),
+                notes = COALESCE(excluded.notes, job_matches.notes), updated_at = excluded.updated_at
+        """), (
+            match_id, candidate_id, row["Job ID"], state, fit_score, "csv-v1",
+            row.get("Tailored Resume") or None, row.get("Resume Check") or None,
+            row.get("Notes") or None, now, now,
+        ))
+
+    def _current_profile_hash(self, conn) -> Optional[str]:
+        try:
+            row = conn.execute(self._sql("SELECT profile_hash FROM candidate_profile WHERE id = 1")).fetchone()
+        except Exception:
+            return None
+        return dict(row).get("profile_hash") if row else None
+
+    def _store_evaluation(self, conn, record: JobRecord, candidate_id: str, now: str) -> int:
         """The fit score with its reasoning and skill match, as Phase 3 recorded it."""
         evaluation = record.evaluation
         conn.execute(self._sql("""
@@ -451,9 +805,36 @@ class JobsDatabase:
             self._as_text(evaluation.get("missing_skills")), evaluation.get("scored_by"),
             evaluation.get("evaluated_at"),
         ))
+        model = self._split_model(evaluation.get("scored_by"))
+        scoring_version = evaluation.get("scoring_version") or "artifact-v1"
+        created_at = evaluation.get("evaluated_at") or now
+        evaluation_id = self._hash_id(
+            candidate_id, record.id, evaluation.get("profile_hash") or self._current_profile_hash(conn),
+            scoring_version, evaluation.get("prompt_hash"), evaluation.get("scored_by"), created_at,
+            prefix="eval_",
+        )
+        conn.execute(self._sql("""
+            INSERT INTO job_evaluation_history (evaluation_id, candidate_id, job_id, profile_hash,
+                                                embedding_similarity, technical_score, seniority_score,
+                                                fit_score, model_provider, model_name, model_version,
+                                                prompt_hash, scoring_version, threshold, passed,
+                                                reasoning, matching_skills, missing_skills, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (evaluation_id) DO NOTHING
+        """), (
+            evaluation_id, candidate_id, record.id,
+            evaluation.get("profile_hash") or self._current_profile_hash(conn),
+            evaluation.get("embedding_similarity"), evaluation.get("technical_score"),
+            evaluation.get("seniority_score"), evaluation.get("fit_score"), model["provider"],
+            model["name"], evaluation.get("model_version"), evaluation.get("prompt_hash"),
+            scoring_version, evaluation.get("threshold_used"),
+            1 if evaluation.get("passed_threshold") else 0, evaluation.get("reasoning"),
+            self._as_text(evaluation.get("matching_skills")), self._as_text(evaluation.get("missing_skills")),
+            created_at,
+        ))
         return 1
 
-    def _store_application(self, conn, record: JobRecord) -> int:
+    def _store_application(self, conn, record: JobRecord, candidate_id: str, now: str) -> int:
         """What the apply phase did, including a dry run and a hand-off to manual apply."""
         outcome = record.application
         # The apply phase says "skipped" for a job it cannot submit itself; the
@@ -473,9 +854,53 @@ class JobsDatabase:
             outcome.get("apply_url"), outcome.get("steps_taken"), outcome.get("error"),
             Path(outcome["pdf_path"]).name if outcome.get("pdf_path") else None, outcome.get("finished_at"),
         ))
+        self._store_application_current(conn, candidate_id, record.id, status, outcome, now)
         return 1
 
-    def _backfill_application(self, conn, row: Dict[str, str]) -> int:
+    def _store_application_current(self, conn, candidate_id: str, job_id: str, status: str,
+                                   outcome: Dict[str, Any], now: str) -> str:
+        application_id = self._hash_id(candidate_id, job_id, prefix="app_")
+        previous = conn.execute(self._sql(
+            "SELECT current_status FROM applications WHERE application_id = ?"), (application_id,)).fetchone()
+        previous_status = dict(previous)["current_status"] if previous else None
+        finished_at = outcome.get("finished_at") or now
+        submitted_at = finished_at if status == "applied" else None
+        resume_used = Path(outcome["pdf_path"]).name if outcome.get("pdf_path") else outcome.get("resume_used")
+        conn.execute(self._sql("""
+            INSERT INTO applications (application_id, candidate_id, job_id, current_status, channel, apply_url,
+                                      resume_used, submitted_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (application_id) DO UPDATE SET
+                current_status = excluded.current_status, channel = excluded.channel,
+                apply_url = excluded.apply_url, resume_used = excluded.resume_used,
+                submitted_at = COALESCE(excluded.submitted_at, applications.submitted_at),
+                updated_at = excluded.updated_at
+        """), (
+            application_id, candidate_id, job_id, status, outcome.get("channel"),
+            outcome.get("apply_url"), resume_used, submitted_at, now, finished_at,
+        ))
+        event_type = "submitted" if status == "applied" else status or "updated"
+        self._store_application_event(conn, application_id, event_type, previous_status, status, "sync", outcome,
+                                      finished_at)
+        return application_id
+
+    def _store_application_event(self, conn, application_id: str, event_type: str, from_status: Optional[str],
+                                 to_status: Optional[str], source: str, metadata: Dict[str, Any],
+                                 created_at: str) -> None:
+        import json as json_module
+
+        event_id = self._hash_id(application_id, event_type, from_status, to_status, created_at, prefix="appevt_")
+        conn.execute(self._sql("""
+            INSERT INTO application_events (event_id, application_id, event_type, from_status, to_status,
+                                            source, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (event_id) DO NOTHING
+        """), (
+            event_id, application_id, event_type, from_status, to_status,
+            source, json_module.dumps(metadata, default=str), created_at,
+        ))
+
+    def _backfill_application(self, conn, row: Dict[str, str], candidate_id: str, now: str) -> int:
         """The apply outcome a sheet row records, when the database has none for it."""
         status = row.get("Status") or ""
         if status not in ("applied", "manual_apply", "failed", "dry_run", "skipped"):
@@ -489,16 +914,19 @@ class JobsDatabase:
                (row.get("Apply Method") or "").replace(" ", "_") or None,
                row.get("Apply URL") or None, None, row.get("Notes") or None,
                row.get("Tailored Resume") or None, None))
+        self._store_application_current(conn, candidate_id, row["Job ID"], status, {
+            "channel": (row.get("Apply Method") or "").replace(" ", "_") or None,
+            "apply_url": row.get("Apply URL") or None,
+            "resume_used": row.get("Tailored Resume") or None,
+            "error": row.get("Notes") or None,
+        }, now)
         return 1 if cursor.rowcount else 0
 
-    def _store_profile(self, conn, now: str) -> None:
+    def _store_profile(self, conn, now: str, data: Optional[Dict[str, Any]] = None,
+                       candidate_id: Optional[str] = None) -> None:
         """The sealed candidate profile the run worked from, as one row."""
-        import json as json_module
-
-        try:
-            data = json_module.loads(settings.profile_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
+        data = data if data is not None else self._profile_snapshot()
+        candidate_id = candidate_id or self._candidate_id(data)
         contact = data.get("contact") or {}
         auth = data.get("work_authorization") or {}
         skills = data.get("skills") or {}
@@ -528,8 +956,39 @@ class JobsDatabase:
             data.get("desired_salary"), data.get("desired_salary_max"), data.get("salary_currency"),
             self._as_text(flat), data.get("source_document"), data.get("profile_hash"), now,
         ))
+        user_id = (contact.get("email") or candidate_id or "local-user").casefold()
+        conn.execute(self._sql("""
+            INSERT INTO users (user_id, email, full_name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (user_id) DO UPDATE SET
+                email = excluded.email, full_name = excluded.full_name, updated_at = excluded.updated_at
+        """), (user_id, contact.get("email"), contact.get("full_name"), now, now))
+        conn.execute(self._sql("""
+            INSERT INTO candidate_profiles (candidate_id, user_id, profile_hash, full_name, email, phone,
+                                            location, years_of_experience, current_country,
+                                            authorized_countries, requires_sponsorship, remote_worldwide,
+                                            skills, source_resume, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (candidate_id) DO UPDATE SET
+                profile_hash = excluded.profile_hash, full_name = excluded.full_name, email = excluded.email,
+                phone = excluded.phone, location = excluded.location,
+                years_of_experience = excluded.years_of_experience,
+                current_country = excluded.current_country,
+                authorized_countries = excluded.authorized_countries,
+                requires_sponsorship = excluded.requires_sponsorship,
+                remote_worldwide = excluded.remote_worldwide, skills = excluded.skills,
+                source_resume = excluded.source_resume, updated_at = excluded.updated_at
+        """), (
+            candidate_id, user_id, data.get("profile_hash"), contact.get("full_name"), contact.get("email"),
+            contact.get("phone"), contact.get("location"), data.get("years_of_experience"),
+            auth.get("current_country"), self._as_text(auth.get("authorized_countries")),
+            None if auth.get("requires_sponsorship") is None else int(bool(auth["requires_sponsorship"])),
+            None if auth.get("remote_worldwide") is None else int(bool(auth["remote_worldwide"])),
+            self._as_text(flat), data.get("source_document"), now, now,
+        ))
 
-    def _store_search_parameters(self, conn, now: str) -> None:
+    def _store_search_parameters(self, conn, now: str, candidate_id: Optional[str] = None,
+                                 profile: Optional[Dict[str, Any]] = None) -> None:
         """The search the run was configured with, as one row."""
         try:
             from job_agent.intake.cli import load_search_parameters
@@ -556,6 +1015,34 @@ class JobsDatabase:
             self._as_text(params.job_boards), params.country_indeed, params.min_salary,
             params.salary_currency, params.max_results_per_board, int(bool(params.find_contacts)), now,
         ))
+        if candidate_id:
+            profile = profile or {}
+            conn.execute(self._sql("""
+                INSERT INTO candidate_preferences (candidate_id, desired_salary, desired_salary_max,
+                                                   salary_currency, target_roles, locations, onsite_countries,
+                                                   work_modes, remote_only, hours_old, job_boards,
+                                                   country_indeed, min_salary, max_results_per_board,
+                                                   find_contacts, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (candidate_id) DO UPDATE SET
+                    desired_salary = excluded.desired_salary,
+                    desired_salary_max = excluded.desired_salary_max,
+                    salary_currency = excluded.salary_currency,
+                    target_roles = excluded.target_roles, locations = excluded.locations,
+                    onsite_countries = excluded.onsite_countries, work_modes = excluded.work_modes,
+                    remote_only = excluded.remote_only, hours_old = excluded.hours_old,
+                    job_boards = excluded.job_boards, country_indeed = excluded.country_indeed,
+                    min_salary = excluded.min_salary,
+                    max_results_per_board = excluded.max_results_per_board,
+                    find_contacts = excluded.find_contacts, updated_at = excluded.updated_at
+            """), (
+                candidate_id, profile.get("desired_salary"), profile.get("desired_salary_max"),
+                profile.get("salary_currency") or params.salary_currency, self._as_text(params.target_domains),
+                self._as_text(params.locations), self._as_text(params.onsite_countries),
+                self._as_text(params.selected_work_modes), int(bool(params.is_remote)), params.hours_old,
+                self._as_text(params.job_boards), params.country_indeed, params.min_salary,
+                params.max_results_per_board, int(bool(params.find_contacts)), now,
+            ))
 
     def record_phase_run(self, phase: str, status: str, *, run_id: Optional[str] = None,
                          started_at: Optional[str] = None, finished_at: Optional[str] = None,
@@ -667,8 +1154,8 @@ class JobsDatabase:
             return [row["job_id"] for row in conn.execute(
                 self._sql("SELECT job_id FROM run_jobs WHERE run_id = ?"), (run_id,)).fetchall()]
 
-    def _store_resumes(self, conn, outputs_dir: Optional[Path], now: str) -> int:
-        """Keep each tailored PDF in the database, byte for byte, beside its job."""
+    def _store_resumes(self, conn, outputs_dir: Optional[Path], now: str, candidate_id: str) -> int:
+        """Keep legacy PDF bytes and normalized file metadata beside each job."""
         import hashlib
         import json as json_module
 
@@ -701,12 +1188,24 @@ class JobsDatabase:
                 # A resume from an earlier batch whose job is only in the manifest.
                 conn.execute(self._sql(_UPSERT_JOB), (
                     job_id, None, entry.get("title") or "", entry.get("company") or "", None, 0, None, None,
-                    entry.get("tailored_at"), None, None, None, None, None, None, 0, None, None, None,
+                    None, None, entry.get("tailored_at"), None, None, None, None, None, None, 0, None, None, None,
                     "tailored", entry.get("score"), pdf.name, entry.get("validation_summary"), None, now,
                 ))
                 known_jobs.add(job_id)
             data = pdf.read_bytes()
             digest = hashlib.sha256(data).hexdigest()
+            artifact_id = self._hash_id(candidate_id, job_id, digest, prefix="artifact_")
+            conn.execute(self._sql("""
+                INSERT INTO resume_artifacts (artifact_id, candidate_id, job_id, file_name, file_path,
+                                              sha256, size_bytes, resume_check, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (artifact_id) DO UPDATE SET
+                    file_path = excluded.file_path, size_bytes = excluded.size_bytes,
+                    resume_check = excluded.resume_check
+            """), (
+                artifact_id, candidate_id, job_id, pdf.name, str(pdf.resolve()), digest,
+                len(data), checks.get(job_id), now,
+            ))
             if existing.get(job_id) == digest:
                 continue
             conn.execute(self._sql("""
@@ -733,7 +1232,7 @@ class JobsDatabase:
         return row
 
     def _backfill_from_csv(self, conn, present: set, now: str, stats: Dict[str, int],
-                           outputs_dir: Optional[Path]) -> None:
+                           outputs_dir: Optional[Path], candidate_id: str) -> None:
         """Add jobs from earlier sweeps, which live only in the cumulative CSV.
 
         The sheet carries less than an artifact does — no description — but it
@@ -756,19 +1255,15 @@ class JobsDatabase:
         except (OSError, ValueError):
             return
 
-        # An outcome recorded by an earlier run survives only in the sheet, so
-        # every row's outcome is backfilled, not only rows the database lacks.
-        for row in all_rows:
-            stats["applications"] += self._backfill_application(conn, row)
-
         for row in rows:
             job_id = row["Job ID"]
             score = row.get("Fit Score") or ""
             auto = (row.get("Auto-apply Possible") or "").strip().lower().startswith("yes")
             conn.execute(self._sql(_UPSERT_JOB), (
                 job_id, None, row.get("Title") or "", row.get("Company") or "", row.get("Location"),
-                1 if (row.get("Remote") == "Yes") else 0, row.get("Source"), row.get("Posted") or None,
-                row.get("Date Found") or None,
+                1 if (row.get("Remote") == "Yes") else 0,
+                "remote" if row.get("Remote") == "Yes" else None, None,
+                row.get("Source"), row.get("Posted") or None, row.get("Date Found") or None,
                 float(row["Salary Min"]) if row.get("Salary Min") else None,
                 float(row["Salary Max"]) if row.get("Salary Max") else None,
                 row.get("Currency") or None, row.get("Job URL"), row.get("Apply URL") or None,
@@ -778,6 +1273,8 @@ class JobsDatabase:
                 row.get("Tailored Resume") or None, row.get("Resume Check") or None,
                 row.get("Notes") or None, now,
             ))
+            self._store_source_listing_from_csv(conn, row, now)
+            self._store_match_from_csv(conn, row, candidate_id, now)
             stats["jobs"] += 1
 
             email = (row.get("HR / Careers Email") or "").strip()
@@ -803,6 +1300,11 @@ class JobsDatabase:
                     row.get("Email Draft File") or None, now,
                 ))
                 stats["outreach"] += 1
+
+        # An outcome recorded by an earlier run survives only in the sheet, so
+        # every row's outcome is backfilled after CSV-only jobs have been inserted.
+        for row in all_rows:
+            stats["applications"] += self._backfill_application(conn, row, candidate_id, now)
 
     # --- Reading --------------------------------------------------------------
 
@@ -831,12 +1333,271 @@ class JobsDatabase:
         with self._connect() as conn:
             return [dict(row) for row in conn.execute(self._sql(query), tuple(args)).fetchall()]
 
+    def evaluated_jobs(self, *, qualified_only: bool = True, limit: Optional[int] = None,
+                       candidate: Optional[str] = None) -> List[Any]:
+        """Reconstruct Phase 3 job+evaluation records from normalized DB state."""
+        from job_agent.config.schema import EvaluatedJob, EvaluationScore, JobPosting
+
+        where = ["m.fit_score IS NOT NULL"]
+        args: List[Any] = []
+        if qualified_only:
+            where.append("m.fit_score >= ?")
+            args.append(settings.min_match_score)
+        if candidate:
+            where.append("m.candidate_id = ?")
+            args.append(candidate)
+        clause = " AND ".join(where)
+        query = f"""
+            SELECT j.job_id, j.title, j.company, j.location, j.job_url, j.description,
+                   j.date_posted, j.is_remote, j.work_mode, j.salary_min, j.salary_max,
+                   j.salary_currency, j.employment_type, j.source, j.discovered_at,
+                   j.apply_url, j.company_website,
+                   m.fit_score AS match_fit_score, m.technical_score AS match_technical_score,
+                   m.seniority_score AS match_seniority_score, m.semantic_score AS match_semantic_score,
+                   m.matching_skills AS match_matching_skills, m.missing_skills AS match_missing_skills,
+                   m.model AS match_model, m.updated_at AS match_updated_at,
+                   e.embedding_similarity, e.technical_score, e.seniority_score,
+                   e.fit_score, e.threshold, e.passed, e.reasoning, e.matching_skills,
+                   e.missing_skills, e.model_provider, e.model_name, e.created_at AS evaluated_at
+            FROM job_matches m
+            JOIN jobs j ON j.job_id = m.job_id
+            LEFT JOIN job_evaluation_history e
+              ON e.evaluation_id = (
+                  SELECT x.evaluation_id
+                  FROM job_evaluation_history x
+                  WHERE x.candidate_id = m.candidate_id AND x.job_id = m.job_id
+                  ORDER BY x.created_at DESC
+                  LIMIT 1
+              )
+            WHERE {clause}
+            ORDER BY m.fit_score DESC, m.updated_at DESC
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            args.append(int(limit))
+
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(self._sql(query), tuple(args)).fetchall()]
+
+        records = []
+        for row in rows:
+            try:
+                job = JobPosting(
+                    id=row["job_id"],
+                    title=row["title"],
+                    company=row["company"],
+                    location=row.get("location") or "Remote",
+                    job_url=row.get("job_url") or row.get("apply_url") or "https://example.invalid/job",
+                    description=row.get("description") or "",
+                    date_posted=row.get("date_posted"),
+                    is_remote=bool(row.get("is_remote")),
+                    work_mode=row.get("work_mode"),
+                    salary_min=row.get("salary_min"),
+                    salary_max=row.get("salary_max"),
+                    salary_currency=row.get("salary_currency"),
+                    job_type=row.get("employment_type"),
+                    source=row.get("source") or "database",
+                    discovered_at=row.get("discovered_at") or row.get("match_updated_at"),
+                    apply_url=row.get("apply_url"),
+                    company_website=row.get("company_website"),
+                )
+                fit_score = row.get("fit_score") if row.get("fit_score") is not None else row.get("match_fit_score")
+                threshold = row.get("threshold") if row.get("threshold") is not None else settings.min_match_score
+                scored_by = self._join_model(row.get("model_provider"), row.get("model_name")) or row.get("match_model") or "database"
+                evaluation = EvaluationScore(
+                    embedding_similarity=row.get("embedding_similarity")
+                    if row.get("embedding_similarity") is not None else (row.get("match_semantic_score") or 0.0),
+                    fit_score=fit_score,
+                    technical_score=row.get("technical_score")
+                    if row.get("technical_score") is not None else (row.get("match_technical_score") or 0.0),
+                    seniority_score=row.get("seniority_score")
+                    if row.get("seniority_score") is not None else (row.get("match_seniority_score") or 0.0),
+                    threshold_used=threshold,
+                    passed_threshold=float(fit_score) >= float(threshold),
+                    reasoning=row.get("reasoning") or "Loaded from normalized job match state.",
+                    matching_skills=self._split_text(row.get("matching_skills") or row.get("match_matching_skills")),
+                    missing_skills=self._split_text(row.get("missing_skills") or row.get("match_missing_skills")),
+                    scored_by=scored_by,
+                    evaluated_at=row.get("evaluated_at") or row.get("match_updated_at"),
+                )
+                records.append(EvaluatedJob(job=job, evaluation=evaluation))
+            except Exception:
+                continue
+        return records
+
+    def source_jobs(self, *, limit: Optional[int] = None, active_only: bool = True) -> List[Any]:
+        """Reconstruct sourced postings from normalized source-listing state."""
+        import json as json_module
+
+        from job_agent.config.schema import JobContact, JobPosting
+
+        where = ["l.is_active = 1"] if active_only else []
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        query = f"""
+            SELECT j.job_id, j.title, j.company, j.location, j.job_url, j.description,
+                   j.date_posted, j.is_remote, j.work_mode, j.salary_min, j.salary_max,
+                   j.salary_currency, j.employment_type, j.source, j.discovered_at,
+                   j.apply_url, j.company_website,
+                   l.raw_payload, l.source AS listing_source, l.source_url, l.last_seen_at
+            FROM jobs j
+            LEFT JOIN job_source_listings l
+              ON l.id = (
+                  SELECT x.id
+                  FROM job_source_listings x
+                  WHERE x.job_id = j.job_id
+                  ORDER BY x.last_seen_at DESC, x.first_seen_at DESC
+                  LIMIT 1
+              )
+            {clause}
+            ORDER BY COALESCE(l.last_seen_at, j.updated_at) DESC, j.company, j.title
+        """
+        args: List[Any] = []
+        if limit is not None:
+            query += " LIMIT ?"
+            args.append(int(limit))
+
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(self._sql(query), tuple(args)).fetchall()]
+            contact_rows = [dict(row) for row in conn.execute(self._sql(
+                "SELECT job_id, email, kind, source, source_url, confidence FROM job_contacts"
+            )).fetchall()]
+
+        contacts_by_job: Dict[str, List[Any]] = {}
+        for row in contact_rows:
+            try:
+                contacts_by_job.setdefault(row["job_id"], []).append(JobContact(
+                    email=row["email"],
+                    kind=row.get("kind") or "general",
+                    source=row.get("source") or "job_post",
+                    source_url=row.get("source_url"),
+                    confidence=row.get("confidence"),
+                ))
+            except Exception:
+                continue
+
+        jobs = []
+        for row in rows:
+            raw = row.get("raw_payload")
+            payload: Dict[str, Any] = {}
+            if raw:
+                try:
+                    loaded = json_module.loads(raw)
+                    payload = loaded if isinstance(loaded, dict) else {}
+                except (TypeError, ValueError):
+                    payload = {}
+            if "Job ID" in payload:
+                payload = {}
+            payload.update({
+                "id": row["job_id"],
+                "title": payload.get("title") or row["title"],
+                "company": payload.get("company") or row["company"],
+                "location": payload.get("location") or row.get("location") or "Remote",
+                "job_url": payload.get("job_url") or row.get("job_url") or row.get("source_url") or "https://example.invalid/job",
+                "description": payload.get("description") or row.get("description") or "",
+                "date_posted": payload.get("date_posted") or row.get("date_posted"),
+                "is_remote": payload.get("is_remote") if payload.get("is_remote") is not None else bool(row.get("is_remote")),
+                "work_mode": payload.get("work_mode") or row.get("work_mode"),
+                "salary_min": payload.get("salary_min") if payload.get("salary_min") is not None else row.get("salary_min"),
+                "salary_max": payload.get("salary_max") if payload.get("salary_max") is not None else row.get("salary_max"),
+                "salary_currency": payload.get("salary_currency") or row.get("salary_currency"),
+                "job_type": payload.get("job_type") or row.get("employment_type"),
+                "source": payload.get("source") or row.get("source") or row.get("listing_source") or "database",
+                "discovered_at": payload.get("discovered_at") or row.get("discovered_at") or row.get("last_seen_at"),
+                "apply_url": payload.get("apply_url") or row.get("apply_url"),
+                "company_website": payload.get("company_website") or row.get("company_website"),
+                "contacts": payload.get("contacts") or [contact.model_dump() for contact in contacts_by_job.get(row["job_id"], [])],
+            })
+            try:
+                jobs.append(JobPosting(**payload))
+            except Exception:
+                continue
+        return jobs
+
+    @staticmethod
+    def _split_text(value: Optional[str]) -> List[str]:
+        if not value:
+            return []
+        return [part.strip() for part in str(value).split(";") if part.strip()]
+
+    @staticmethod
+    def _join_model(provider: Optional[str], name: Optional[str]) -> Optional[str]:
+        if provider and name:
+            return f"{provider}:{name}"
+        return provider or name
+
+    def application_stats(self, candidate: Optional[str] = None) -> Dict[str, int]:
+        """Application counts from normalized current application state."""
+        query = "SELECT current_status, COUNT(*) AS n FROM applications"
+        args: List[Any] = []
+        if candidate:
+            query += " WHERE candidate_id = ?"
+            args.append(candidate)
+        query += " GROUP BY current_status"
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(self._sql(query), tuple(args)).fetchall()]
+        by_status = {row["current_status"] or "unknown": int(row["n"]) for row in rows}
+        return {
+            "submitted": by_status.get("applied", 0),
+            "dry_runs": by_status.get("dry_run", 0),
+            "manual_apply": by_status.get("manual_apply", 0) + by_status.get("skipped", 0),
+            "failed": by_status.get("failed", 0),
+            "total": sum(by_status.values()),
+            **{f"status_{key}": value for key, value in by_status.items()},
+        }
+
+    def tailored_resumes(self, *, candidate: Optional[str] = None,
+                         limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Resume artifacts projected into the Phase 5 manifest shape."""
+        where = []
+        args: List[Any] = []
+        if candidate:
+            where.append("ra.candidate_id = ?")
+            args.append(candidate)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        query = f"""
+            SELECT ra.job_id, j.title, j.company, ra.file_path, ra.sha256, ra.resume_check,
+                   ra.created_at, m.fit_score, m.profile_hash, cp.profile_hash AS candidate_profile_hash
+            FROM resume_artifacts ra
+            JOIN jobs j ON j.job_id = ra.job_id
+            LEFT JOIN candidate_profiles cp ON cp.candidate_id = ra.candidate_id
+            LEFT JOIN job_matches m
+              ON m.match_id = (
+                  SELECT x.match_id
+                  FROM job_matches x
+                  WHERE x.candidate_id = ra.candidate_id AND x.job_id = ra.job_id
+                  ORDER BY x.updated_at DESC, x.created_at DESC
+                  LIMIT 1
+              )
+            {clause}
+            ORDER BY ra.created_at DESC, j.company, j.title
+        """
+        if limit is not None:
+            query += " LIMIT ?"
+            args.append(int(limit))
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(self._sql(query), tuple(args)).fetchall()]
+
+        records = []
+        for row in rows:
+            records.append({
+                "job_id": row["job_id"],
+                "title": row.get("title") or "",
+                "company": row.get("company") or "",
+                "score": row.get("fit_score"),
+                "pdf_path": row.get("file_path") or "",
+                "profile_hash": row.get("profile_hash") or row.get("candidate_profile_hash"),
+                "pdf_sha256": row.get("sha256"),
+                "validation_summary": row.get("resume_check"),
+                "tailored_at": row.get("created_at"),
+            })
+        return records
+
     def stats(self) -> Dict[str, Any]:
         """Headline numbers: totals, jobs by stage, and contact coverage."""
         with self._connect() as conn:
-            total = conn.execute(self._sql("SELECT COUNT(*) AS n FROM jobs")).fetchone()
+            total = conn.execute(self._sql("SELECT COUNT(*) AS n FROM job_overview")).fetchone()
             by_status = conn.execute(
-                self._sql("SELECT status, COUNT(*) AS n FROM jobs GROUP BY status")
+                self._sql("SELECT status, COUNT(*) AS n FROM job_overview GROUP BY status")
             ).fetchall()
             by_source = conn.execute(
                 self._sql("SELECT source, COUNT(*) AS n FROM jobs GROUP BY source")
@@ -853,11 +1614,14 @@ class JobsDatabase:
             top = conn.execute(self._sql(
                 "SELECT company, COUNT(*) AS n FROM jobs GROUP BY company ORDER BY n DESC, company LIMIT 5"
             )).fetchall()
+            migrations = migration_status(conn, self._sql)
 
         number = lambda row: int(dict(row)["n"]) if row else 0
         return {
             "backend": self.backend,
             "location": self.location,
+            "schema_version": latest_version(),
+            "migrations": migrations,
             "jobs": number(total),
             "by_status": {dict(row)["status"]: int(dict(row)["n"]) for row in by_status},
             "by_source": {dict(row)["source"] or "unknown": int(dict(row)["n"]) for row in by_source},
@@ -869,17 +1633,19 @@ class JobsDatabase:
 
 
 _UPSERT_JOB = """
-    INSERT INTO jobs (job_id, fingerprint, title, company, location, is_remote, source, date_posted,
-                      discovered_at, salary_min, salary_max, salary_currency, job_url, apply_url,
-                      apply_method, auto_apply, apply_note, company_website, description, status,
-                      fit_score, tailored_resume, resume_check, notes, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO jobs (job_id, fingerprint, title, company, location, is_remote, work_mode,
+                      employment_type, source, date_posted, discovered_at, salary_min, salary_max,
+                      salary_currency, job_url, apply_url, apply_method, auto_apply, apply_note,
+                      company_website, description, status, fit_score, tailored_resume,
+                      resume_check, notes, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (job_id) DO UPDATE SET
         fingerprint = excluded.fingerprint, title = excluded.title, company = excluded.company,
-        location = excluded.location, is_remote = excluded.is_remote, source = excluded.source,
-        date_posted = excluded.date_posted, salary_min = excluded.salary_min,
-        salary_max = excluded.salary_max, salary_currency = excluded.salary_currency,
-        job_url = excluded.job_url, apply_url = excluded.apply_url,
+        location = excluded.location, is_remote = excluded.is_remote,
+        work_mode = excluded.work_mode, employment_type = excluded.employment_type,
+        source = excluded.source, date_posted = excluded.date_posted,
+        salary_min = excluded.salary_min, salary_max = excluded.salary_max,
+        salary_currency = excluded.salary_currency, job_url = excluded.job_url, apply_url = excluded.apply_url,
         apply_method = excluded.apply_method, auto_apply = excluded.auto_apply,
         apply_note = excluded.apply_note, company_website = excluded.company_website,
         description = excluded.description, status = excluded.status,

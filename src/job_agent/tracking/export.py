@@ -131,7 +131,14 @@ class JobsCsvExporter:
         latest_ids = {job.get("id") for job in _read_json(latest_file, []) if isinstance(job, dict)}
         coverage = _read_json(self.outputs_dir / "source_coverage.json", {})
 
-        for record in collect_records(self.outputs_dir).values():
+        records = collect_records(self.outputs_dir)
+        local_outcomes_exist = (
+            (self.outputs_dir / "application_results.json").exists()
+            or (self.outputs_dir / "manual_applications.json").exists()
+        )
+        self._merge_database_rows(rows, include_outcomes=not local_outcomes_exist)
+
+        for record in records.values():
             values = job_row(record.job)
             if record.id in rows:
                 # First discovery date wins; a re-scraped copy has a newer stamp.
@@ -191,6 +198,54 @@ class JobsCsvExporter:
         ready_export = JobsCsvExporter(csv_path=self.csv_path.parent / "applications_ready.csv", outputs_dir=self.outputs_dir)
         ready_export._write(row for row in rows.values() if row.get("Application Readiness") == "Ready for your review")
         return self.csv_path
+
+    def _merge_database_rows(self, rows: Dict[str, Dict[str, str]], *, include_outcomes: bool = True) -> None:
+        """Rebuild export rows from the queryable DB when JSON artifacts are absent."""
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            database_rows = JobsDatabase().jobs(limit=100_000)
+        except Exception:
+            return
+        for item in database_rows:
+            job_id = item.get("job_id")
+            if not job_id:
+                continue
+            score = item.get("fit_score")
+            values = {
+                "Job ID": str(job_id),
+                "Title": item.get("title") or "",
+                "Company": item.get("company") or "",
+                "Location": item.get("location") or "",
+                "Work Mode": str(item.get("work_mode") or "").title(),
+                "Remote": "Yes" if item.get("work_mode") == "remote" else "",
+                "Source": item.get("source") or "",
+                "Posted": str(item.get("date_posted") or "")[:10],
+                "Salary Min": "" if item.get("salary_min") is None else f"{float(item['salary_min']):g}",
+                "Salary Max": "" if item.get("salary_max") is None else f"{float(item['salary_max']):g}",
+                "Currency": item.get("salary_currency") or "",
+                "Fit Score": "" if score is None else f"{float(score):.1f}",
+                "Status": item.get("status") or "found" if include_outcomes else "found",
+                "HR / Careers Email": item.get("contact_email") or "",
+                "Email Type": item.get("contact_kind") or "",
+                "Email Source": _SOURCE_LABELS.get(item.get("contact_source"), item.get("contact_source") or ""),
+                "Company Website": "",
+                "Job URL": item.get("job_url") or "",
+                "Apply URL": item.get("apply_url") or "" if include_outcomes else "",
+                "Apply Method": str(item.get("apply_method") or "").replace("_", " "),
+                "Auto-apply Possible": "Yes" if item.get("auto_apply") else "",
+                "Tailored Resume": Path(item.get("resume_file") or "").name if item.get("resume_file") else "",
+                "Tailored Resume Path": item.get("resume_file") or "",
+                "Resume Check": item.get("resume_check") or "",
+                "Outreach To": item.get("outreach_to") or "",
+                "Outreach Status": item.get("outreach_status") or "",
+                "Cold Email Subject": item.get("outreach_subject") or "",
+                "Search Batch": "Database export",
+                "Last Seen In Search": "",
+            }
+            if values["Tailored Resume Path"]:
+                values["Open Resume"] = f'=HYPERLINK("{values["Tailored Resume Path"]}","Open {values["Tailored Resume"]}")'
+            self._merge(rows, str(job_id), values)
 
     def _refresh_readiness(self, rows, profile_hash):
         import hashlib

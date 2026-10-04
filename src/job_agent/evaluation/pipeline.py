@@ -314,6 +314,14 @@ class SemanticEvaluationPipeline:
     def _load_jobs(jobs_file: Path) -> List[JobPosting]:
         """Load and validate sourced postings, skipping any that no longer validate."""
         if not jobs_file.exists():
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                records = JobsDatabase().source_jobs(limit=100_000)
+            except Exception:
+                records = []
+            if records:
+                return records
             raise FileNotFoundError(
                 f"Scraped jobs file not found: {jobs_file}. Run 'python main.py source' first."
             )

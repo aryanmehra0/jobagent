@@ -146,6 +146,15 @@ def _source_state() -> Dict[str, Any]:
     path = settings.outputs_dir / "scraped_jobs.json"
     jobs = _read_json(path, default=[])
     coverage = _read_json(settings.outputs_dir / "source_coverage.json", {})
+    loaded_from_db = False
+    if not path.exists():
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            jobs = [job.model_dump() for job in JobsDatabase().source_jobs(limit=100_000)]
+            loaded_from_db = bool(jobs)
+        except Exception:
+            jobs = []
 
     tracked: Dict[str, int] = {}
     try:
@@ -156,9 +165,19 @@ def _source_state() -> Dict[str, Any]:
         pass
 
     return {
-        "status": "error" if coverage.get("status") == "failed" else "ready" if path.exists() else "empty",
-        "summary": f"{coverage.get('latest_matching_jobs', len(jobs))} latest matches; {len(jobs)} to process" if path.exists() else "Not run yet",
-        "hint": f"Source status: {coverage.get('status', 'not checked')}. Latest CSV includes already-seen matches; processing avoids repeats.",
+        "status": "error" if coverage.get("status") == "failed" else "ready" if path.exists() or loaded_from_db else "empty",
+        "summary": (
+            f"{coverage.get('latest_matching_jobs', len(jobs))} latest matches; {len(jobs)} to process"
+            if path.exists()
+            else f"{len(jobs)} sourced job(s) in database"
+            if loaded_from_db
+            else "Not run yet"
+        ),
+        "hint": (
+            "Loaded source listings from the database because scraped_jobs.json is absent."
+            if loaded_from_db
+            else f"Source status: {coverage.get('status', 'not checked')}. Latest CSV includes already-seen matches; processing avoids repeats."
+        ),
         "metrics": {
             "This sweep": len(jobs),
             "With contact email": sum(1 for job in jobs if isinstance(job, dict) and job.get("contacts")),
@@ -178,6 +197,18 @@ def _evaluate_state() -> Dict[str, Any]:
     qualified = _read_json(qualified_path, default=[])
     progress = _read_json(settings.outputs_dir / "evaluation_progress.json", {})
 
+    if not evaluated_path.exists() and not qualified_path.exists():
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            database = JobsDatabase()
+            evaluated_records = database.evaluated_jobs(qualified_only=False)
+            qualified_records = database.evaluated_jobs(qualified_only=True)
+            evaluated = [item.model_dump() for item in evaluated_records]
+            qualified = [item.model_dump() for item in qualified_records]
+        except Exception:
+            evaluated, qualified = [], []
+
     top = [
         {
             "company": item["job"]["company"],
@@ -191,8 +222,8 @@ def _evaluate_state() -> Dict[str, Any]:
     ]
 
     return {
-        "status": "ready" if evaluated_path.exists() else "empty",
-        "summary": f"{len(qualified)} qualified" if evaluated_path.exists() else "Not run yet",
+        "status": "ready" if (evaluated_path.exists() or evaluated) else "empty",
+        "summary": f"{len(qualified)} qualified" if (evaluated_path.exists() or evaluated) else "Not run yet",
         "hint": f"Threshold: fit >= {settings.min_match_score:g}/10.",
         "metrics": {"Scored": len(evaluated), "Qualified": len(qualified),
                     "Missing description": progress.get("missing_descriptions", 0),
@@ -206,14 +237,26 @@ def _tailor_state() -> Dict[str, Any]:
     """Compiled resumes and what the anti-hallucination gate did to each."""
     path = settings.outputs_dir / "tailored_resumes" / "manifest.json"
     records = _read_json(path, default=[])
+    loaded_from_db = False
+    if not path.exists():
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            records = JobsDatabase().tailored_resumes(limit=100_000)
+            loaded_from_db = bool(records)
+        except Exception:
+            records = []
 
     restored = sum(len(item.get("restored_metrics", [])) for item in records)
     blocked = sum(len(item.get("dropped_fabrications", [])) for item in records)
 
     return {
-        "status": "ready" if path.exists() else "empty",
-        "summary": f"{len(records)} tailored PDF(s)" if path.exists() else "Not run yet",
-        "hint": "Integrity gate output is recorded per resume.",
+        "status": "ready" if path.exists() or loaded_from_db else "empty",
+        "summary": f"{len(records)} tailored PDF(s)" if path.exists() or loaded_from_db else "Not run yet",
+        "hint": (
+            "Loaded tailored resume artifacts from the database because manifest.json is absent."
+            if loaded_from_db else "Integrity gate output is recorded per resume."
+        ),
         "metrics": {
             "PDFs": len(records),
             "Metrics restored": restored,
@@ -245,20 +288,36 @@ def _apply_state() -> Dict[str, Any]:
     successful = data.get("successful", [])
     failed = data.get("failed", [])
     dry_runs = sum(1 for item in successful if item.get("status") == "dry_run")
+    db_stats = None
+    if not path.exists():
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            db_stats = JobsDatabase().application_stats()
+        except Exception:
+            db_stats = None
 
     return {
-        "status": "ready" if path.exists() else "empty",
+        "status": "ready" if path.exists() or (db_stats and db_stats["total"]) else "empty",
         "summary": (
             f"{len(successful) - dry_runs} submitted, {dry_runs} simulated"
             if path.exists()
+            else f"{db_stats['submitted']} submitted, {db_stats['dry_runs']} simulated"
+            if db_stats and db_stats["total"]
             else "Not run yet"
         ),
         "hint": "A dry run never opens a browser and never submits.",
         "metrics": {
-            "Submitted": len(successful) - dry_runs,
-            "Dry runs": dry_runs,
-            "Manual apply needed": sum(1 for item in failed if item.get("status") == "skipped"),
-            "Failed": sum(1 for item in failed if item.get("status") != "skipped"),
+            "Submitted": len(successful) - dry_runs if path.exists() else (db_stats or {}).get("submitted", 0),
+            "Dry runs": dry_runs if path.exists() else (db_stats or {}).get("dry_runs", 0),
+            "Manual apply needed": (
+                sum(1 for item in failed if item.get("status") == "skipped")
+                if path.exists() else (db_stats or {}).get("manual_apply", 0)
+            ),
+            "Failed": (
+                sum(1 for item in failed if item.get("status") != "skipped")
+                if path.exists() else (db_stats or {}).get("failed", 0)
+            ),
         },
         "artifacts": [_artifact(path)],
     }

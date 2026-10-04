@@ -62,7 +62,9 @@ job agent/
 │                        # knowing up front: cli.py (27 commands + a db group),
 │                        # workflow.py (shared pipeline runner), generation.py
 │                        # (shared anti-hallucination evidence helpers), llm.py,
-│                        # runtime.py (cross-process lock, @exclusive_run)
+│                        # runtime.py (cross-process lock, @exclusive_run),
+│                        # storage/jobs_db.py + storage/migrations.py
+│                        # (SQLite/Postgres jobs store and explicit schema ledger)
 ├── tests/               # 31 files; run with pytest, see "Testing" below
 └── data/                # Gitignored runtime data (profile, resumes, outputs, DBs)
 ```
@@ -132,6 +134,40 @@ or the web server — reading the diff is not the same as proving it runs.
   it stops the pipeline from ever tailoring/sending documents built from the
   bundled fictional resume once a real one is uploaded. If you hit it
   unexpectedly, fix your script's isolation, don't remove the guard.
+- **The jobs database is in a compatibility migration, not a clean-slate ORM.**
+  `JobsDatabase` dual-writes legacy tables (`jobs`, `job_evaluations`,
+  `job_applications`, `job_resumes`) for the existing CLI/dashboard, and the
+  normalized tables (`users`, `candidate_profiles`, `candidate_preferences`,
+  `job_matches`, `job_evaluation_history`, `applications`,
+  `application_events`, `job_source_listings`, `resume_artifacts`) for the
+  target Postgres-first architecture. Run `python main.py db migrations` to
+  inspect the schema ledger. Prefer new reads from `job_overview` or the
+  normalized tables, not directly from `jobs.fit_score` or `jobs.status`.
+- **CSV/XLSX/JSON are becoming exports, not authority.** Existing phases still
+  write artifacts, and sync still backfills from them, but exports overlay DB
+  state and can rebuild from the database when artifacts are absent. Evaluation loads
+  `scraped_jobs.json` when present, but falls back to normalized
+  `job_source_listings`/`jobs` through `JobsDatabase.source_jobs()` when the
+  source hand-off file is missing. Apply also loads
+  `tailored_resumes/manifest.json` when present, but can rebuild the manifest
+  from normalized `resume_artifacts`; the application-pack ZIP builder uses the
+  same fallback. Tailoring, apply, interview prep, and fallback tracking load
+  `qualified_jobs.json` when present, but fall back to
+  normalized `job_matches`/`job_evaluation_history` through
+  `JobsDatabase.evaluated_jobs()` when that hand-off file is missing. The
+  dashboard source/evaluation/tailoring/application state and `python main.py
+  status` also use normalized DB fallbacks for source/evaluation/tailoring/
+  application summaries, including sourced jobs when `scraped_jobs.json` is
+  absent. Run-history job linking also falls back to DB source/evaluation/
+  resume-artifact state when per-run artifacts are missing, and tracker resume
+  checks fall back to normalized resume artifacts when the tailoring manifest is
+  absent.
+  New backend work should keep moving read paths to the database while
+  preserving artifact compatibility.
+- **`DeltaStore` is local SQLite only when no `DATABASE_URL` is set.** Hosted
+  mode now uses Postgres for `seen_jobs`, `application_attempts`,
+  `outreach_log`, and `delta_meta`, so duplicate-prevention state lives beside
+  jobs/queue state instead of in a separate `delta_store.db`.
 - **The dashboard binds to loopback only, and must keep doing so**
   (`web/server.py`'s `run_server` hard-refuses any other host). To reach it
   remotely, the answer is a private tunnel with a login

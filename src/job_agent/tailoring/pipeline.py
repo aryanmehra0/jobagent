@@ -723,6 +723,14 @@ class ResumeTailoringPipeline:
     def _load_qualified(qualified_file: Path) -> List[EvaluatedJob]:
         """Load the qualified jobs produced by Phase 3."""
         if not qualified_file.exists():
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                records = JobsDatabase().evaluated_jobs(qualified_only=True)
+            except Exception:
+                records = []
+            if records:
+                return records
             raise FileNotFoundError(
                 f"Qualified jobs file not found: {qualified_file}. Run 'python main.py evaluate' first."
             )

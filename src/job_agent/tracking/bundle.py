@@ -98,14 +98,26 @@ def validate_application_pack(path: Path) -> dict[str, int | bool]:
         }
 
 
+def _tailored_manifest(out: Path) -> dict[str, dict]:
+    """Tailored resume metadata keyed by job, with a DB fallback."""
+    records = _read_json(out / "tailored_resumes/manifest.json", [])
+    if not records:
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            records = JobsDatabase().tailored_resumes(limit=100_000)
+        except Exception:
+            records = []
+    return {item["job_id"]: item for item in records if isinstance(item, dict) and item.get("job_id")}
+
+
 @exclusive_run
 def build_application_pack(outputs_dir: Path | None = None) -> Path:
     out = Path(outputs_dir or settings.outputs_dir).resolve()
     exporter = JobsCsvExporter(outputs_dir=out, csv_path=out / "jobs_master.csv")
     exporter.export()
     rows = list(exporter.load().values())
-    manifest = {item["job_id"]: item for item in _read_json(out / "tailored_resumes/manifest.json", [])
-                if isinstance(item, dict) and item.get("job_id")}
+    manifest = _tailored_manifest(out)
     profile = _read_json(settings.profile_path, {})
     profile_hash = profile.get("profile_hash")
     target = out / "application_pack.zip"

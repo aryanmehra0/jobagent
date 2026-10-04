@@ -1,7 +1,9 @@
 target_domains:
-- Associate Product Manager
-- AI Product Manager
-- AI ML Engineer
+- ai engineer
+- ml engineer
+- genai
+- deep learning
+- agentic ai
 desired_experience_years: 4.0
 locations:
 - Remote
@@ -11,15 +13,14 @@ locations:
 - Noida
 - Bengaluru
 - Hyderabad
-is_remote: true
+is_remote: false
 work_modes:
 - remote
 - hybrid
 - onsite
-# Remote jobs anywhere in the world, plus on-site/hybrid jobs in these countries.
 onsite_countries:
 - india
-hours_old: 48
+hours_old: 72
 job_boards:
 - linkedin
 - indeed
@@ -42,7 +43,4 @@ ats_companies:
   - linear
   - notion
 proxy_url: null
-
-# Look up published HR / careers emails for each job (job post, company website,
-# and Hunter.io when HUNTER_API_KEY is set). Results go to data/outputs/jobs_master.csv.
 find_contacts: true

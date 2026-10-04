@@ -31,6 +31,7 @@ pandas>=2.0.0                   # JobSpy returns DataFrames; used directly by th
 requests>=2.31.0
 beautifulsoup4>=4.12.0         # Public listing descriptions after deduplication
 psycopg[binary]>=3.2.0               # Optional Postgres backend for hosted queue deployments
+psycopg-pool>=3.2.0                  # Reuses Postgres connections for the jobs DB/backend
 
 # --- Phase 3: semantic evaluation ---
 sentence-transformers>=2.7.0

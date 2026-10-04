@@ -131,6 +131,7 @@ def db_stats_command() -> None:
     table.add_column("Measure", style="cyan")
     table.add_column("Value", justify="right")
     table.add_row("Jobs stored", str(summary["jobs"]))
+    table.add_row("Schema version", str(summary.get("schema_version", "unknown")))
     table.add_row("With a contact email", str(summary["jobs_with_email"]))
     table.add_row("With an HR / careers email", str(summary["jobs_with_hiring_email"]))
     table.add_row("Outreach drafts", str(summary["outreach_drafts"]))
@@ -140,6 +141,26 @@ def db_stats_command() -> None:
         table.add_row(f"Source: {source}", str(count))
     for company, count in summary["top_companies"].items():
         table.add_row(f"Company: {company}", str(count))
+    console.print(table)
+
+
+@db_group.command("migrations")
+def db_migrations_command() -> None:
+    """Show database schema migrations and whether they have run."""
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    try:
+        database = JobsDatabase()
+        rows = database.migrations()
+    except Exception as exc:
+        _fail(f"Could not inspect database migrations: {exc}")
+
+    table = Table(title=f"Schema migrations ({database.backend})", show_header=True, header_style="bold magenta")
+    table.add_column("Version", justify="right")
+    table.add_column("Name", style="cyan")
+    table.add_column("Status")
+    for row in rows:
+        table.add_row(str(row["version"]), row["name"], "[green]applied[/green]" if row["applied"] else "[yellow]pending[/yellow]")
     console.print(table)
 
 
@@ -602,7 +623,6 @@ def evaluate_command(
     profile_path = profile or settings.profile_path
     jobs_path = jobs or (settings.outputs_dir / "scraped_jobs.json")
     _require(profile_path, "profile.json", "Run: python main.py intake --resume <pdf>")
-    _require(jobs_path, "scraped_jobs.json", "Run: python main.py source")
 
     try:
         SemanticEvaluationPipeline().run_evaluation(
@@ -647,7 +667,6 @@ def tailor_command(
         return
     qualified_path = qualified or (settings.outputs_dir / "qualified_jobs.json")
     _require(profile_path, "profile.json", "Run: python main.py intake --resume <pdf>")
-    _require(qualified_path, "qualified_jobs.json", "Run: python main.py evaluate")
 
     try:
         ResumeTailoringPipeline().run_tailoring(
@@ -677,7 +696,6 @@ def apply_command(job_id: Optional[str], dry_run: bool, limit: Optional[int], as
     from job_agent.automation.pipeline import AutoApplyPipeline
 
     manifest = settings.outputs_dir / "tailored_resumes" / "manifest.json"
-    _require(manifest, "Tailored resume manifest", "Run: python main.py tailor")
 
     try:
         AutoApplyPipeline().run_applications(
@@ -693,6 +711,7 @@ def apply_command(job_id: Optional[str], dry_run: bool, limit: Optional[int], as
 def workday_assist_command(job_id):
     """Fill supported Workday fields in a visible browser; never click final Submit."""
     from job_agent.automation.agent import AutoApplyAgent
+    from job_agent.automation.pipeline import AutoApplyPipeline
     from job_agent.automation.routing import is_workday
     from job_agent.tailoring.pipeline import ResumeTailoringPipeline
     from job_agent.tracking.export import _read_json
@@ -704,10 +723,14 @@ def workday_assist_command(job_id):
     job = next((j.job for j in jobs if j.job.id == job_id), None)
     if job is None or not (is_workday(job.job_url) or is_workday(job.apply_url)):
         _fail('Select a qualified Workday job.')
-    record = next((r for r in _read_json(settings.outputs_dir/'tailored_resumes/manifest.json', []) if r.get('job_id') == job_id), {})
-    pdf = settings.outputs_dir/'tailored_resumes'/f'resume_{job_id}.pdf'
+    record = next((r for r in AutoApplyPipeline._load_manifest(settings.outputs_dir/'tailored_resumes/manifest.json')
+                   if r.get('job_id') == job_id), {})
+    pdf = Path(record.get('pdf_path') or (settings.outputs_dir/'tailored_resumes'/f'resume_{job_id}.pdf'))
+    audit = _read_json(pdf.with_suffix(".ats.json"), {})
+    valid_pdf = record.get('validation_passed') is True or (
+        record.get('validation_passed') is None and audit.get('passed') is True)
     if (not pdf.is_file() or record.get('profile_hash') != profile.profile_hash or
-            not record.get('validation_passed') or record.get('pdf_sha256') != hashlib.sha256(pdf.read_bytes()).hexdigest()):
+            not valid_pdf or record.get('pdf_sha256') != hashlib.sha256(pdf.read_bytes()).hexdigest()):
         _fail('Generate a current validated resume first.')
     def review(page, reason):
         click.echo(reason)
@@ -1358,10 +1381,19 @@ def status_command() -> None:
     total = sum(counts.values())
     scraped_file = settings.outputs_dir / "scraped_jobs.json"
     breakdown = ", ".join(f"{status}: {count}" for status, count in sorted(counts.items())) or "empty"
+    db_source_count = 0
+    if not scraped_file.exists():
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            db_source_count = len(JobsDatabase().source_jobs(limit=100_000))
+        except Exception:
+            db_source_count = 0
     table.add_row(
         "2. Sourcing",
-        "[bold green]active[/bold green]" if scraped_file.exists() else "[yellow]pending[/yellow]",
-        f"{total} tracked | {breakdown}",
+        "[bold green]active[/bold green]" if scraped_file.exists() or db_source_count else "[yellow]pending[/yellow]",
+        f"{total} tracked | {breakdown}" if scraped_file.exists() or not db_source_count
+        else f"{db_source_count} sourced job(s) in database | {breakdown}",
     )
 
     # Phase 3: evaluation
@@ -1377,7 +1409,18 @@ def status_command() -> None:
     elif evaluated_file.exists():
         table.add_row("3. Evaluation", "[yellow]no matches[/yellow]", "Nothing met the fit threshold.")
     else:
-        table.add_row("3. Evaluation", "[yellow]pending[/yellow]", "python main.py evaluate")
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            count = len(JobsDatabase().evaluated_jobs(qualified_only=True))
+        except Exception:
+            count = 0
+        table.add_row(
+            "3. Evaluation",
+            "[bold green]ready[/bold green]" if count else "[yellow]pending[/yellow]",
+            f"{count} qualified in database (fit >= {settings.min_match_score:g})"
+            if count else "python main.py evaluate",
+        )
 
     # Phase 4: tailoring
     manifest_file = settings.outputs_dir / "tailored_resumes" / "manifest.json"
@@ -1403,7 +1446,20 @@ def status_command() -> None:
             f"submitted: {len(succeeded) - dry_runs} | dry runs: {dry_runs} | fallbacks: {len(data.get('failed', []))}",
         )
     else:
-        table.add_row("5. Auto-apply", "[yellow]pending[/yellow]", "python main.py apply --dry-run")
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            app_stats = JobsDatabase().application_stats()
+        except Exception:
+            app_stats = {"total": 0}
+        table.add_row(
+            "5. Auto-apply",
+            "[bold green]executed[/bold green]" if app_stats.get("total") else "[yellow]pending[/yellow]",
+            (
+                f"submitted: {app_stats['submitted']} | dry runs: {app_stats['dry_runs']} | "
+                f"manual/failed: {app_stats['manual_apply'] + app_stats['failed']}"
+            ) if app_stats.get("total") else "python main.py apply --dry-run",
+        )
 
     # Phase 6: tracker
     outreach_counts = delta_store.outreach_counts()

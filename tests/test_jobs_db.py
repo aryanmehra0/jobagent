@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 
@@ -194,6 +195,30 @@ def test_statements_are_translated_for_postgres(tmp_path):
     assert database._sql("SELECT * FROM jobs WHERE job_id = ?") == "SELECT * FROM jobs WHERE job_id = %s"
     assert database._sql("CREATE VIEW IF NOT EXISTS v AS SELECT 1").startswith("CREATE OR REPLACE VIEW")
 
+    from job_agent.sourcing.delta_store import DeltaStore
+
+    store = DeltaStore.__new__(DeltaStore)
+    store.database_url = "postgresql://host/db"
+    assert store._sql("SELECT * FROM seen_jobs WHERE job_id = ?") == (
+        "SELECT * FROM seen_jobs WHERE job_id = %s"
+    )
+    assert "ON CONFLICT (job_id) DO NOTHING" in store._insert_ignore(
+        "seen_jobs", "(job_id)", "(job_id) VALUES (?)"
+    )
+
+
+def test_schema_migrations_are_visible_and_applied(tmp_path):
+    database = _db(tmp_path)
+    migrations = database.migrations()
+
+    assert migrations
+    assert all(row["applied"] for row in migrations)
+    assert {row["name"] for row in migrations} >= {
+        "legacy_candidate_columns", "canonical_job_work_mode", "normalized_candidate_job_state",
+    }
+    with database._connect() as conn:
+        assert conn.execute("SELECT COUNT(*) AS n FROM schema_migrations").fetchone()["n"] == len(migrations)
+
 
 # ==============================================================================
 # READING IT FROM THE TERMINAL
@@ -234,6 +259,412 @@ def test_a_query_can_be_written_to_a_csv(outputs, tmp_path, monkeypatch):
     assert result.exit_code == 0
     with target.open(encoding="utf-8-sig", newline="") as handle:
         assert [row["company"] for row in csv.DictReader(handle)] == ["Osfin.ai"]
+
+
+def test_csv_export_can_be_rebuilt_from_the_database_when_artifacts_are_absent(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.tracking.export import JobsCsvExporter
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    job = _job(work_mode="hybrid", contacts=[{"email": "careers@osfin.ai", "kind": "hiring", "source": "job_post"}])
+    _write_artifacts(outputs, [job], evaluated=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}],
+                     qualified=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}])
+    JobsDatabase().sync(outputs)
+    for name in ("scraped_jobs.json", "evaluated_jobs.json", "qualified_jobs.json", "latest_jobs.json"):
+        (outputs / name).unlink(missing_ok=True)
+
+    path = JobsCsvExporter(outputs_dir=outputs).export()
+
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert rows[0]["Job ID"] == "j1"
+    assert rows[0]["Status"] == "qualified"
+    assert rows[0]["Fit Score"] == "8.2"
+    assert rows[0]["Work Mode"] == "Hybrid"
+    assert rows[0]["HR / Careers Email"] == "careers@osfin.ai"
+
+
+def test_csv_export_preserves_database_application_state_when_results_artifact_is_absent(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.tracking.export import JobsCsvExporter
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    job = _job()
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}],
+        qualified=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}],
+        manifest=[{"job_id": "j1", "pdf_path": str(pdf), "validation_summary": "ok"}],
+        results={"successful": [{"job_id": "j1", "status": "applied", "channel": "greenhouse",
+                                 "apply_url": job.apply_url, "pdf_path": str(pdf),
+                                 "finished_at": "2026-09-18T11:00:00Z"}],
+                 "failed": []},
+    )
+    JobsDatabase().sync(outputs)
+    (outputs / "application_results.json").unlink()
+
+    path = JobsCsvExporter(outputs_dir=outputs).export()
+
+    with path.open(encoding="utf-8-sig", newline="") as handle:
+        row = next(csv.DictReader(handle))
+    assert row["Status"] == "applied"
+    assert row["Apply URL"] == job.job_url
+
+
+def test_source_jobs_can_be_rebuilt_from_normalized_source_listings(outputs, tmp_path):
+    job = _job(
+        description="Own billing workflows and roadmap delivery.",
+        work_mode="hybrid",
+        contacts=[{"email": "careers@osfin.ai", "kind": "hiring", "source": "job_post"}],
+    )
+    _write_artifacts(outputs, [job])
+    database = _db(tmp_path)
+    database.sync(outputs)
+    (outputs / "scraped_jobs.json").unlink()
+
+    jobs = database.source_jobs()
+
+    assert len(jobs) == 1
+    assert jobs[0].id == "j1"
+    assert jobs[0].description == "Own billing workflows and roadmap delivery."
+    assert jobs[0].work_mode == "hybrid"
+    assert jobs[0].primary_contact().email == "careers@osfin.ai"
+
+
+def test_evaluation_loader_can_read_sourced_jobs_from_database(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.evaluation.pipeline import SemanticEvaluationPipeline
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    job = _job(description="Own billing workflows and roadmap delivery.")
+    _write_artifacts(outputs, [job])
+    JobsDatabase().sync(outputs)
+    (outputs / "scraped_jobs.json").unlink()
+
+    jobs = SemanticEvaluationPipeline._load_jobs(outputs / "scraped_jobs.json")
+
+    assert [item.id for item in jobs] == ["j1"]
+    assert jobs[0].description == "Own billing workflows and roadmap delivery."
+
+
+def test_quality_report_rebuilds_missing_csvs_from_the_database(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.tracking.quality import quality_report
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    job = _job()
+    _write_artifacts(outputs, [job], evaluated=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}],
+                     qualified=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}])
+    JobsDatabase().sync(outputs)
+    for name in ("scraped_jobs.json", "evaluated_jobs.json", "qualified_jobs.json", "jobs_master.csv"):
+        (outputs / name).unlink(missing_ok=True)
+
+    report = quality_report(outputs)
+
+    assert report["jobs"]["master"] == 1
+    assert (outputs / "jobs_master.csv").is_file()
+
+
+def test_phase_loaders_can_rebuild_qualified_jobs_from_the_database(outputs, tmp_path, monkeypatch):
+    from job_agent.automation.pipeline import AutoApplyPipeline
+    from job_agent.config.settings import settings
+    from job_agent.tailoring.pipeline import ResumeTailoringPipeline
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    job = _job(work_mode="hybrid")
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": ["Kubernetes"], "scored_by": "heuristic",
+        "evaluated_at": "2026-09-18T10:00:00Z",
+    }
+    _write_artifacts(outputs, [job], evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+                     qualified=[{"job": job.model_dump(), "evaluation": evaluation}])
+    JobsDatabase().sync(outputs)
+    (outputs / "qualified_jobs.json").unlink()
+
+    tailored_records = ResumeTailoringPipeline._load_qualified(outputs / "qualified_jobs.json")
+    apply_jobs, apply_scores = AutoApplyPipeline._load_qualified(outputs / "qualified_jobs.json")
+
+    assert tailored_records[0].job.id == "j1"
+    assert tailored_records[0].evaluation.fit_score == pytest.approx(8.2)
+    assert tailored_records[0].evaluation.matching_skills == ["Python"]
+    assert apply_jobs["j1"].work_mode == "hybrid"
+    assert apply_scores["j1"] == pytest.approx(8.2)
+
+
+def test_apply_loader_can_rebuild_manifest_from_resume_artifacts(outputs, tmp_path, monkeypatch):
+    from job_agent.automation.pipeline import AutoApplyPipeline
+    from job_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    job = _job()
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}],
+        qualified=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}],
+        manifest=[{"job_id": "j1", "pdf_path": str(pdf), "profile_hash": "profile-v1",
+                   "pdf_sha256": "sha", "validation_summary": "ok"}],
+    )
+    JobsDatabase().sync(outputs)
+    (outputs / "tailored_resumes" / "manifest.json").unlink()
+
+    entries = AutoApplyPipeline._load_manifest(outputs / "tailored_resumes" / "manifest.json")
+
+    assert entries[0]["job_id"] == "j1"
+    assert entries[0]["pdf_path"] == str(pdf.resolve())
+    assert entries[0]["pdf_sha256"]
+    assert entries[0]["score"] == pytest.approx(8.2)
+
+
+def test_application_pack_includes_resume_artifacts_when_manifest_is_missing(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.tracking.bundle import build_application_pack, validate_application_pack
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    (outputs / "tailored_resumes" / "resume_j1.ats.json").write_text(
+        json.dumps({"passed": True}), encoding="utf-8"
+    )
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    job = _job()
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": [], "scored_by": "heuristic",
+    }
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+        qualified=[{"job": job.model_dump(), "evaluation": evaluation}],
+        manifest=[{"job_id": "j1", "title": job.title, "company": job.company, "score": 8.2,
+                   "pdf_path": str(pdf), "profile_hash": profile.profile_hash,
+                   "pdf_sha256": digest, "validation_passed": True, "validation_summary": "ok"}],
+    )
+    JobsDatabase().sync(outputs)
+    (outputs / "tailored_resumes" / "manifest.json").unlink()
+
+    pack = build_application_pack(outputs)
+
+    assert validate_application_pack(pack)["resumes"] == 1
+
+
+def test_web_state_can_report_evaluation_and_applications_from_the_database(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.web.state import _apply_state, _evaluate_state
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    job = _job()
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": [], "scored_by": "heuristic",
+        "evaluated_at": "2026-09-18T10:00:00Z",
+    }
+    _write_artifacts(
+        outputs, [job], evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+        qualified=[{"job": job.model_dump(), "evaluation": evaluation}],
+        results={"successful": [{"job_id": "j1", "status": "dry_run", "channel": "company_site"}],
+                 "failed": [{"job_id": "j2", "status": "skipped"}]},
+    )
+    JobsDatabase().sync(outputs)
+    for name in ("evaluated_jobs.json", "qualified_jobs.json", "application_results.json"):
+        (outputs / name).unlink()
+
+    evaluate = _evaluate_state()
+    apply = _apply_state()
+
+    assert evaluate["status"] == "ready"
+    assert evaluate["metrics"]["Scored"] == 1
+    assert evaluate["metrics"]["Qualified"] == 1
+    assert evaluate["top"][0]["company"] == "Osfin.ai"
+    assert apply["status"] == "ready"
+    assert apply["metrics"]["Dry runs"] == 1
+
+
+def test_web_source_state_can_report_sourced_jobs_from_the_database(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.web.state import _source_state
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    job = _job(contacts=[{"email": "careers@osfin.ai", "kind": "hiring", "source": "job_post"}])
+    _write_artifacts(outputs, [job])
+    JobsDatabase().sync(outputs)
+    (outputs / "scraped_jobs.json").unlink()
+
+    state = _source_state()
+
+    assert state["status"] == "ready"
+    assert state["summary"] == "1 sourced job(s) in database"
+    assert state["metrics"]["This sweep"] == 1
+    assert state["metrics"]["With contact email"] == 1
+
+
+def test_web_tailor_state_can_report_resume_artifacts_from_the_database(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.web.state import _tailor_state
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    job = _job()
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}],
+        qualified=[{"job": job.model_dump(), "evaluation": {"fit_score": 8.2}}],
+        manifest=[{"job_id": "j1", "title": job.title, "company": job.company, "score": 8.2,
+                   "pdf_path": str(pdf), "validation_summary": "ok"}],
+    )
+    JobsDatabase().sync(outputs)
+    (outputs / "tailored_resumes" / "manifest.json").unlink()
+
+    state = _tailor_state()
+
+    assert state["status"] == "ready"
+    assert state["summary"] == "1 tailored PDF(s)"
+    assert state["metrics"]["PDFs"] == 1
+    assert state["resumes"][0]["pdf"] == "resume_j1.pdf"
+
+
+def test_run_history_job_ids_fall_back_to_database_when_artifacts_are_missing(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.web.run_history import run_job_ids
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    job = _job()
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": [], "scored_by": "heuristic",
+    }
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+        qualified=[{"job": job.model_dump(), "evaluation": evaluation}],
+        manifest=[{"job_id": "j1", "title": job.title, "company": job.company,
+                   "score": 8.2, "pdf_path": str(pdf)}],
+    )
+    JobsDatabase().sync(outputs)
+    for name in ("latest_jobs.json", "evaluated_jobs.json", "qualified_jobs.json"):
+        (outputs / name).unlink(missing_ok=True)
+    (outputs / "tailored_resumes" / "manifest.json").unlink()
+
+    ids = run_job_ids({
+        "source": {"status": "ok"},
+        "evaluate": {"status": "ok"},
+        "tailor": {"status": "ok"},
+    })
+
+    assert ids == ["j1"]
+
+
+def test_tracker_resume_checks_fall_back_to_database_when_manifest_is_missing(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.tracking.tracker import EXTRA_COLUMNS, EXTRA_START, JOB_ID_COLUMN, MasterTracker
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    job = _job()
+    _write_artifacts(
+        outputs,
+        [job],
+        manifest=[{"job_id": "j1", "title": job.title, "company": job.company,
+                   "score": 8.2, "pdf_path": str(pdf), "validation_summary": "PASS - ATS safe"}],
+    )
+    JobsDatabase().sync(outputs)
+    (outputs / "tailored_resumes" / "manifest.json").unlink()
+
+    tracker = MasterTracker(tmp_path / "tracker.xlsx")
+    tracker.log_application(job, match_score=8.2, status="manual_apply", cold_email="", autosave=False)
+    tracker.ws.cell(row=2, column=JOB_ID_COLUMN, value="j1")
+    tracker.refresh_resume_links()
+
+    check_column = EXTRA_START + EXTRA_COLUMNS.index("Resume Check")
+    assert tracker.ws.cell(row=2, column=check_column).value == "PASS - ATS safe"
+
+
+def test_tracking_pipeline_uses_database_evaluations_when_qualified_json_is_missing(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.tracking.pipeline import FallbackTrackingPipeline
+    from job_agent.tracking.tracker import MasterTracker
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+
+    job = _job(contacts=[{"email": "careers@osfin.ai", "kind": "hiring", "source": "job_post"}])
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": [], "scored_by": "heuristic",
+        "evaluated_at": "2026-09-18T10:00:00Z",
+    }
+    _write_artifacts(outputs, [job], evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+                     qualified=[{"job": job.model_dump(), "evaluation": evaluation}])
+    JobsDatabase().sync(outputs)
+    (outputs / "qualified_jobs.json").unlink()
+
+    class _Generator:
+        def generate_email(self, profile, job, fit_score=8.0):
+            return "Subject: Product Manager\n\nHello."
+
+    logged = FallbackTrackingPipeline(
+        email_generator=_Generator(),
+        tracker=MasterTracker(tmp_path / "tracker.xlsx"),
+    ).process_fallbacks(
+        qualified_jobs_path=outputs / "qualified_jobs.json",
+        profile_path=profile_path,
+        force_track_all=True,
+    )
+
+    assert logged[0]["job_id"] == "j1"
+    assert logged[0]["score"] == pytest.approx(8.2)
 
 
 # ==============================================================================
@@ -308,6 +739,74 @@ def test_a_full_run_lands_in_the_database(outputs, tmp_path, monkeypatch):
         assert conn.execute("SELECT COUNT(*) AS n FROM candidate_profile").fetchone()["n"] == 1
 
 
+def test_normalized_candidate_job_state_is_queryable_without_overwriting_history(outputs, tmp_path, monkeypatch):
+    """The Postgres-shaped tables separate global jobs from per-candidate state."""
+    from job_agent.config.settings import settings
+
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps({
+        "contact": {"full_name": "Asha Verma", "email": "asha@example.org"},
+        "summary": "Product manager.", "years_of_experience": 4.0,
+        "work_authorization": {"current_country": "India", "authorized_countries": ["India"]},
+        "skills": {"languages": ["Python"], "frameworks": ["FastAPI"]},
+        "source_document": "asha.pdf", "profile_hash": "profile-v1",
+    }), encoding="utf-8")
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+
+    job = _job(work_mode="hybrid", job_type="fulltime", apply_url="https://jobs.example.com/j1")
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": ["Kubernetes"], "scored_by": "groq:openai/gpt-oss-120b",
+        "scoring_version": "v1", "prompt_hash": "prompt-a", "profile_hash": "profile-v1",
+        "evaluated_at": "2026-09-18T10:00:00Z",
+    }
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    _write_artifacts(
+        outputs, [job], evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+        qualified=[{"job": job.model_dump(), "evaluation": evaluation}],
+        manifest=[{"job_id": "j1", "pdf_path": str(pdf), "validation_summary": "ok"}],
+        results={"successful": [{"job_id": "j1", "status": "applied", "channel": "greenhouse",
+                                 "apply_url": job.apply_url, "pdf_path": str(pdf),
+                                 "finished_at": "2026-09-18T11:00:00Z"}],
+                 "failed": []},
+    )
+    database = _db(tmp_path)
+    database.sync(outputs)
+
+    updated = dict(evaluation, fit_score=7.9, evaluated_at="2026-09-19T10:00:00Z")
+    _write_artifacts(outputs, [job], evaluated=[{"job": job.model_dump(), "evaluation": updated}],
+                     qualified=[{"job": job.model_dump(), "evaluation": updated}])
+    database.sync(outputs)
+
+    with database._connect() as conn:
+        global_job = dict(conn.execute("SELECT work_mode, employment_type FROM jobs WHERE job_id = 'j1'").fetchone())
+        match = dict(conn.execute("SELECT * FROM job_matches WHERE candidate_id = 'asha@example.org'").fetchone())
+        evaluations = [dict(row) for row in conn.execute(
+            "SELECT fit_score, model_provider, model_name FROM job_evaluation_history ORDER BY created_at"
+        ).fetchall()]
+        application = dict(conn.execute("SELECT * FROM applications").fetchone())
+        events = [dict(row) for row in conn.execute("SELECT * FROM application_events").fetchall()]
+        source = dict(conn.execute("SELECT * FROM job_source_listings WHERE job_id = 'j1'").fetchone())
+        artifact = dict(conn.execute("SELECT * FROM resume_artifacts WHERE job_id = 'j1'").fetchone())
+
+    assert global_job == {"work_mode": "hybrid", "employment_type": "fulltime"}
+    assert match["fit_score"] == pytest.approx(7.9)
+    assert match["state"] == "applied" and match["profile_hash"] == "profile-v1"
+    assert database.jobs()[0]["fit_score"] == pytest.approx(7.9)
+    assert database.jobs()[0]["status"] == "applied"
+    assert [row["fit_score"] for row in evaluations] == [pytest.approx(8.2), pytest.approx(7.9)]
+    assert evaluations[0]["model_provider"] == "groq"
+    assert evaluations[0]["model_name"] == "openai/gpt-oss-120b"
+    assert application["candidate_id"] == "asha@example.org"
+    assert application["current_status"] == "applied"
+    assert any(event["event_type"] == "submitted" for event in events)
+    assert source["source"] == "linkedin" and "Associate Product Manager" in source["raw_payload"]
+    assert artifact["file_path"].endswith("resume_j1.pdf") and artifact["size_bytes"] > 0
+
+
 def test_the_run_history_is_recorded_phase_by_phase(tmp_path):
     database = _db(tmp_path)
     database.record_phase_run("source", "ok", run_id="r1", started_at="2026-09-18T10:00:00Z",
@@ -359,6 +858,180 @@ def test_a_cli_phase_records_itself_in_the_run_history(tmp_path, monkeypatch, ou
     with JobsDatabase()._connect() as conn:
         rows = [dict(row) for row in conn.execute("SELECT phase, status, started_from FROM phase_runs")]
     assert rows and rows[-1]["phase"] == "track" and rows[-1]["started_from"] == "cli"
+
+
+def test_tailor_cli_allows_database_fallback_when_qualified_artifact_is_missing(tmp_path, monkeypatch, outputs):
+    from click.testing import CliRunner
+
+    from job_agent.cli import cli
+    from job_agent.config.settings import settings
+    from job_agent.tailoring.pipeline import ResumeTailoringPipeline
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+
+    called = {}
+
+    def fake_run_tailoring(self, **kwargs):
+        called.update(kwargs)
+        return []
+
+    monkeypatch.setattr(ResumeTailoringPipeline, "run_tailoring", fake_run_tailoring)
+
+    result = CliRunner().invoke(cli, ["tailor"])
+
+    assert result.exit_code == 0, result.output
+    assert called["qualified_jobs_path"] == outputs / "qualified_jobs.json"
+    assert not called["qualified_jobs_path"].exists()
+
+
+def test_evaluate_cli_allows_database_fallback_when_scraped_artifact_is_missing(tmp_path, monkeypatch, outputs):
+    from click.testing import CliRunner
+
+    from job_agent.cli import cli
+    from job_agent.config.settings import settings
+    from job_agent.evaluation.pipeline import SemanticEvaluationPipeline
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+
+    called = {}
+
+    def fake_run_evaluation(self, **kwargs):
+        called.update(kwargs)
+        return [], []
+
+    monkeypatch.setattr(SemanticEvaluationPipeline, "run_evaluation", fake_run_evaluation)
+
+    result = CliRunner().invoke(cli, ["evaluate"])
+
+    assert result.exit_code == 0, result.output
+    assert called["jobs_path"] == outputs / "scraped_jobs.json"
+    assert not called["jobs_path"].exists()
+
+
+def test_status_cli_reports_database_sourced_jobs_when_scraped_artifact_is_missing(monkeypatch, outputs):
+    from click.testing import CliRunner
+
+    from job_agent.cli import cli
+    from job_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    job = _job()
+    _write_artifacts(outputs, [job])
+    JobsDatabase().sync(outputs)
+    (outputs / "scraped_jobs.json").unlink()
+
+    result = CliRunner().invoke(cli, ["status"])
+
+    assert result.exit_code == 0, result.output
+    assert "1 sourced job(s) in database" in result.output
+
+
+def test_apply_cli_allows_database_fallback_when_manifest_artifact_is_missing(monkeypatch, outputs):
+    from click.testing import CliRunner
+
+    from job_agent.automation.pipeline import AutoApplyPipeline
+    from job_agent.cli import cli
+    from job_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+
+    called = {}
+
+    def fake_run_applications(self, **kwargs):
+        called.update(kwargs)
+        return [], []
+
+    monkeypatch.setattr(AutoApplyPipeline, "run_applications", fake_run_applications)
+
+    result = CliRunner().invoke(cli, ["apply", "--dry-run"])
+
+    assert result.exit_code == 0, result.output
+    assert called["dry_run"] is True
+    assert not (outputs / "tailored_resumes" / "manifest.json").exists()
+
+
+def test_workday_assist_cli_uses_database_qualified_and_manifest_fallbacks(tmp_path, monkeypatch, outputs):
+    from click.testing import CliRunner
+
+    import job_agent.automation.agent as agent_module
+    from job_agent.cli import cli
+    from job_agent.config.settings import settings
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    (outputs / "tailored_resumes" / "resume_j1.ats.json").write_text(
+        json.dumps({"passed": True}), encoding="utf-8"
+    )
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    job = _job(job_url="https://wd5.myworkdayjobs.com/acme/job/1", apply_url="https://wd5.myworkdayjobs.com/acme/job/1")
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": [], "scored_by": "heuristic",
+    }
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+        qualified=[{"job": job.model_dump(), "evaluation": evaluation}],
+        manifest=[{"job_id": "j1", "title": job.title, "company": job.company, "score": 8.2,
+                   "pdf_path": str(pdf), "profile_hash": profile.profile_hash,
+                   "pdf_sha256": digest, "validation_passed": True, "validation_summary": "ok"}],
+    )
+    JobsDatabase().sync(outputs)
+    (outputs / "qualified_jobs.json").unlink()
+    (outputs / "tailored_resumes" / "manifest.json").unlink()
+
+    called = {}
+
+    class _Agent:
+        def apply_to_job(self, profile, job, pdf_resume_path, assist_workday=False, review_callback=None, **kwargs):
+            called["job_id"] = job.id
+            called["pdf"] = pdf_resume_path
+            called["assist"] = assist_workday
+            return {"status": "dry_run"}
+
+        def close(self):
+            called["closed"] = True
+
+    monkeypatch.setattr(agent_module, "AutoApplyAgent", _Agent)
+
+    result = CliRunner().invoke(cli, ["workday-assist", "--job-id", "j1"])
+
+    assert result.exit_code == 0, result.output
+    assert called == {"job_id": "j1", "pdf": pdf, "assist": True, "closed": True}
 
 
 def test_db_audit_cross_checks_artifacts(tmp_path, monkeypatch, outputs):

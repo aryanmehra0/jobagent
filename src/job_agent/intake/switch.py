@@ -35,8 +35,12 @@ CANDIDATE_FILES = (
 )
 CANDIDATE_DIRS = ("outreach", "cover_letters", "interview_prep")
 
-# Database tables whose rows describe what one candidate did or was scored.
-CANDIDATE_TABLES = ("job_evaluations", "job_resumes", "job_applications", "job_outreach")
+# Database tables whose rows describe one candidate, their scores, documents or actions.
+CANDIDATE_TABLES = (
+    "application_events", "applications", "job_evaluation_history", "job_matches",
+    "resume_artifacts", "resumes", "candidate_preferences", "candidate_profiles", "users",
+    "job_evaluations", "job_resumes", "job_applications", "job_outreach",
+)
 
 
 def is_different_candidate(previous: Optional[str], now: Optional[str]) -> bool:

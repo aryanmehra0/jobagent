@@ -20,6 +20,18 @@ def _read_rows(path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(handle))
 
 
+def _ensure_csv_exports(out: Path) -> None:
+    """Rebuild report CSVs from the database when artifact-backed exports are absent."""
+    if (out / "jobs_master.csv").is_file():
+        return
+    try:
+        from job_agent.tracking.export import JobsCsvExporter
+
+        JobsCsvExporter(outputs_dir=out).export()
+    except Exception:
+        return
+
+
 def _freshness_score(coverage: dict[str, Any]) -> tuple[int, str]:
     checked_at = coverage.get("checked_at")
     if not checked_at:
@@ -42,6 +54,7 @@ def _freshness_score(coverage: dict[str, Any]) -> tuple[int, str]:
 def quality_report(outputs_dir: Path | None = None) -> dict[str, Any]:
     """Score the application workspace on the things that affect applying today."""
     out = Path(outputs_dir or settings.outputs_dir)
+    _ensure_csv_exports(out)
     master = _read_rows(out / "jobs_master.csv")
     latest = _read_rows(out / "jobs_latest.csv")
     ready = _read_rows(out / "applications_ready.csv")
