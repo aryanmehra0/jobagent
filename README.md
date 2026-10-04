@@ -1,27 +1,36 @@
 ﻿# Autonomous AI Job Search & Application Agent
 
+[![CI](https://github.com/aryanmehra0/jobagent/actions/workflows/ci.yml/badge.svg)](https://github.com/aryanmehra0/jobagent/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%2B-blue)
+![Local-first](https://img.shields.io/badge/runs-100%25%20local-2f5d4f)
+![Zero API keys required](https://img.shields.io/badge/API%20keys-optional-a8672b)
+
 A local, seven-stage pipeline that parses your resume into a cryptographically
 sealed profile, sources and scores real job postings, tailors your resume and
 cover letter per role, auto-applies where it safely can, tracks outcomes, and
 drafts interview prep — with a rule that never bends: **no stage may assert a
 fact about you that isn't in your resume.**
 
-## Documentation map
+![The seven-phase flow console, mid-run](docs/images/dashboard-flow-graph.png)
+<p align="center"><sub>The dashboard above is running on the bundled fictional demo profile ("Alex Rivera") against real, live job postings — nothing about you or your real applications is shown here.</sub></p>
 
-This file covers day-to-day use end to end. Everything else lives in
-[`docs/`](docs/):
+## Contents
 
-| Doc | What it's for |
-| --- | --- |
-| [`docs/START_HERE.md`](docs/START_HERE.md) | The shortest path from a fresh checkout to your first download |
-| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, Postgres, the hosted API scaffold, and reaching the dashboard remotely over Tailscale |
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | File-by-file map of the codebase, for anyone (human or AI) changing the code |
-| [`docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md`](docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md) | Full implementation-verified architecture: every component, the one real agent, the orchestrator, DB schema, diagrams, current-vs-planned, gaps |
-| [`docs/JOB_AGENT_ARCHITECTURE_QUICK_REFERENCE.md`](docs/JOB_AGENT_ARCHITECTURE_QUICK_REFERENCE.md) | One-page version of the above |
-| [`docs/AGENT_DESIGN.md`](docs/AGENT_DESIGN.md) | How this maps onto the Perceive/Reason/Memory/Plan/Act/Observe agent loop, and every guardrail, with file references |
-| [`docs/VALIDATION.md`](docs/VALIDATION.md) | What's been verified against live data and how to reproduce it |
-| [`docs/ROADMAP_IMPLEMENTATION.md`](docs/ROADMAP_IMPLEMENTATION.md) | Status and limits of each shipped feature |
-| [`docs/IMPROVEMENT_ROADMAP.md`](docs/IMPROVEMENT_ROADMAP.md) | Historical: the original feature proposals, now implemented |
+- [How it works, in short](#how-it-works-in-short)
+- [See it in action](#see-it-in-action)
+- [Architecture at a glance](#architecture-at-a-glance)
+- [Documentation map](#documentation-map)
+- [Job shortlist and portable downloads](#job-shortlist-and-portable-downloads)
+- [The accuracy guarantee](#the-accuracy-guarantee)
+- [Setup](#setup)
+- [A-to-Z quick start for a real user](#a-to-z-quick-start-for-a-real-user)
+- [Deployment and hosting](#deployment-and-hosting)
+- [What your resume needs (A to Z)](#what-your-resume-needs-a-to-z)
+- [The visual flow console](#the-visual-flow-console)
+- [Commands](#commands)
+- [Configuration reference](#configuration-reference)
+- [Tests](#tests)
+- [Known limitations](#known-limitations)
 
 ## How it works, in short
 
@@ -41,6 +50,85 @@ implementation-verified detail — every component, the orchestrator's exact
 control flow, the database schema, and what's real vs. still a stub — is in
 [`docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md`](docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md)
 ([quick reference](docs/JOB_AGENT_ARCHITECTURE_QUICK_REFERENCE.md)).
+
+## See it in action
+
+Every screenshot below is the real dashboard, running the real pipeline end
+to end, against the bundled **fictional** demo resume and real, live public
+job postings — no fabricated data, no real candidate's information.
+
+### 1 · All seven phases, one run
+
+The flow console shows every phase as a node: what it reads, what it wrote,
+and a one-click way to re-run it. This run sourced 92 real listings from
+public ATS feeds, qualified 27 against the demo profile, tailored a PDF for
+each, logged them to the tracker, and drafted 27 interview-prep guides —
+entirely offline (`DEFAULT_LLM_PROVIDER=none`), using the deterministic
+fallback every phase has.
+
+![Seven-phase flow graph with live counts](docs/images/dashboard-flow-graph.png)
+
+### 2 · The job shortlist
+
+Every sourced and scored job, filterable by fit score, work mode, and
+whether a hiring contact was found — with a direct link to the tailored
+resume, cover letter, and interview-prep guide for each one.
+
+![Job shortlist with fit scores and tailored documents](docs/images/dashboard-jobs-shortlist.png)
+
+### 3 · Outcome analytics
+
+A live funnel from sourced → qualified → tailored → applied → replied, so
+you can see exactly where the pipeline is converting (or where to loosen a
+filter).
+
+![Application funnel analytics](docs/images/dashboard-analytics.png)
+
+### 4 · Mobile
+
+The same console, responsive down to a phone screen, for checking a run
+from your pocket.
+
+<img src="docs/images/dashboard-mobile.png" alt="Mobile view of the flow console" width="320">
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    A["Resume PDF"] -->|"intake"| B["Sealed profile.json\n(SHA-256 fact hash)"]
+    B --> C["evaluate"]
+    D["Job boards + ATS feeds"] -->|"source"| C
+    C -->|"fit >= threshold"| E["tailor"]
+    E -->|"tailored PDF"| F["apply\n(the one real agent)"]
+    F --> G["track"]
+    E --> G
+    C --> H["prep"]
+    H --> G
+    G --> I["Excel tracker +\nZIP application pack"]
+```
+
+One orchestrator (`PipelineRunner`), one real agent (`AutoApplyAgent`, a
+bounded DOM loop with no LLM inside it), and four anti-hallucination gates
+enforcing the one rule everything else serves — a full breakdown, verified
+against the current source, is in
+[`docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md`](docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md).
+
+## Documentation map
+
+This file covers day-to-day use end to end. Everything else lives in
+[`docs/`](docs/):
+
+| Doc | What it's for |
+| --- | --- |
+| [`docs/START_HERE.md`](docs/START_HERE.md) | The shortest path from a fresh checkout to your first download |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, Postgres, the hosted API scaffold, and reaching the dashboard remotely over Tailscale |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | File-by-file map of the codebase, for anyone (human or AI) changing the code |
+| [`docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md`](docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md) | Full implementation-verified architecture: every component, the one real agent, the orchestrator, DB schema, diagrams, current-vs-planned, gaps |
+| [`docs/JOB_AGENT_ARCHITECTURE_QUICK_REFERENCE.md`](docs/JOB_AGENT_ARCHITECTURE_QUICK_REFERENCE.md) | One-page version of the above |
+| [`docs/AGENT_DESIGN.md`](docs/AGENT_DESIGN.md) | How this maps onto the Perceive/Reason/Memory/Plan/Act/Observe agent loop, and every guardrail, with file references |
+| [`docs/VALIDATION.md`](docs/VALIDATION.md) | What's been verified against live data and how to reproduce it |
+| [`docs/ROADMAP_IMPLEMENTATION.md`](docs/ROADMAP_IMPLEMENTATION.md) | Status and limits of each shipped feature |
+| [`docs/IMPROVEMENT_ROADMAP.md`](docs/IMPROVEMENT_ROADMAP.md) | Historical: the original feature proposals, now implemented |
 
 ## Job shortlist and portable downloads
 
@@ -65,6 +153,8 @@ actually is (not what it aspires to be):
 | Hosted per-user API keys | `python main.py hosted-key --user X` / `--revoke KEY_ID` | N/A — hosted control-plane, not the local dashboard |
 | CI | `.github/workflows/ci.yml` | — |
 | Score explanation | automatic in Phase 3 evaluation output | Yes — already part of the existing job detail view |
+
+![The job shortlist filtered to ready-for-review listings, with fit score, work mode, hiring-contact status, and direct links to the resume/cover letter/interview guide per job](docs/images/dashboard-jobs-shortlist.png)
 
 Reply tracking, warm contacts and Workday assist are real, tested capabilities,
 but they're CLI-first: you run the command, and the dashboard only reflects
@@ -465,6 +555,12 @@ node graph, in the style of n8n. Each phase is a node that reports its own statu
 and the connectors between them carry the counts handed downstream, so you can see
 exactly where the funnel narrows.
 
+![All seven phase nodes with live status and counts](docs/images/dashboard-flow-graph.png)
+
+It's also fully responsive, down to a phone screen:
+
+<img src="docs/images/dashboard-mobile.png" alt="The flow console on a phone-width screen" width="300">
+
 ### Old results and "Start fresh"
 
 When you open the dashboard it shows what is on disk: the results of your
@@ -538,6 +634,8 @@ What you can do from it:
   score, job source and role, and median time to first reply. It only counts a
   real submission as "applied" — dry runs and unsent drafts never inflate the
   numbers — and reply-stage data is empty until you've run `sync-inbox`.
+
+![The Analytics tab's conversion funnel from sourced through to offer](docs/images/dashboard-analytics.png)
 
 The console drives the same code the subcommands do, so the two are
 interchangeable: run a phase in the terminal and the dashboard reflects it on its
