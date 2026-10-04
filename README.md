@@ -16,10 +16,31 @@ This file covers day-to-day use end to end. Everything else lives in
 | [`docs/START_HERE.md`](docs/START_HERE.md) | The shortest path from a fresh checkout to your first download |
 | [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | Docker, Postgres, the hosted API scaffold, and reaching the dashboard remotely over Tailscale |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | File-by-file map of the codebase, for anyone (human or AI) changing the code |
+| [`docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md`](docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md) | Full implementation-verified architecture: every component, the one real agent, the orchestrator, DB schema, diagrams, current-vs-planned, gaps |
+| [`docs/JOB_AGENT_ARCHITECTURE_QUICK_REFERENCE.md`](docs/JOB_AGENT_ARCHITECTURE_QUICK_REFERENCE.md) | One-page version of the above |
 | [`docs/AGENT_DESIGN.md`](docs/AGENT_DESIGN.md) | How this maps onto the Perceive/Reason/Memory/Plan/Act/Observe agent loop, and every guardrail, with file references |
 | [`docs/VALIDATION.md`](docs/VALIDATION.md) | What's been verified against live data and how to reproduce it |
 | [`docs/ROADMAP_IMPLEMENTATION.md`](docs/ROADMAP_IMPLEMENTATION.md) | Status and limits of each shipped feature |
 | [`docs/IMPROVEMENT_ROADMAP.md`](docs/IMPROVEMENT_ROADMAP.md) | Historical: the original feature proposals, now implemented |
+
+## How it works, in short
+
+This is a **local Python CLI pipeline**, not a web app with a separate
+backend. `python main.py <command>` runs one of seven fixed phases, always
+in the same order: **intake → source → evaluate → tailor → apply → track →
+prep**. An optional local dashboard (`python main.py ui`) is just a second
+way to trigger the exact same engine — `PipelineRunner`
+(`src/job_agent/web/runner.py`) is the one orchestrator both surfaces share.
+There is **one** real AI agent in the codebase — `AutoApplyAgent`
+(`src/job_agent/automation/agent.py`), a bounded, LLM-free browser loop that
+fills real application forms — everything else (job scoring, resume
+tailoring, interview prep) is a single LLM call with a deterministic,
+offline fallback. No LangChain, no LangGraph, no REST API framework, no ORM:
+raw SQL against SQLite (or Postgres via `DATABASE_URL`). Full,
+implementation-verified detail — every component, the orchestrator's exact
+control flow, the database schema, and what's real vs. still a stub — is in
+[`docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md`](docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md)
+([quick reference](docs/JOB_AGENT_ARCHITECTURE_QUICK_REFERENCE.md)).
 
 ## Job shortlist and portable downloads
 
