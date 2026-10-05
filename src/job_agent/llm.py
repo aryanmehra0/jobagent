@@ -1,8 +1,10 @@
 """Groq transport with bounded failover and secret-free errors.
 
-Rate limits are organization-wide. A 429 pauses the whole pool instead of
-cycling keys to bypass that limit. Invalid keys and transient server failures
-can fail over to another configured key, at most once per key per call.
+Each configured key is treated as its own account with its own rate limit and
+its own daily quota — a 429 (per-minute or daily) on one key rotates to the
+next configured key, exactly like an invalid key or a transient server error,
+at most once per key per call. Only once every key is rate-limited does a
+call wait (bounded) or fail, using whichever key's cooldown clears soonest.
 """
 from __future__ import annotations
 
@@ -55,7 +57,8 @@ class GroqClient:
         self._keys = tuple(dict.fromkeys(keys))
         self.model = model
         self.fallback_model = fallback_model if fallback_model and fallback_model != model else ""
-        # Models whose daily allowance ran out in this process.
+        # (key index, model) pairs whose daily allowance ran out in this process.
+        # Per-key, not global: each key is its own account with its own daily cap.
         self._exhausted = set()
         self.last_model = None
         self.timeout = timeout
@@ -63,7 +66,8 @@ class GroqClient:
         self._lock = threading.RLock()
         self._invalid = set()
         self._next = 0
-        self._retry_at = 0.0
+        # Per-key per-minute rate-limit cooldown: key index -> monotonic deadline.
+        self._key_cooldown_until = {}
         # What Groq last reported about the per-minute token budget, so the next
         # call can wait exactly as long as needed instead of colliding with a 429.
         self._tokens_remaining = None
@@ -117,130 +121,158 @@ class GroqClient:
                 return 60.0
 
     def _active_model(self):
-        if self.model in self._exhausted and self.fallback_model and self.fallback_model not in self._exhausted:
+        """Best-effort label for logging/pacing before a real per-key attempt.
+
+        A key only falls back to `fallback_model` once every configured key has
+        exhausted the primary model's daily quota.
+        """
+        if (self.fallback_model and self._keys
+                and all((index, self.model) in self._exhausted for index in range(len(self._keys)))):
             return self.fallback_model
         return self.model
 
+    def _model_for_key(self, index):
+        """The model this specific key should use, or None if this key has no
+        usable model left (every model it could use is daily-exhausted for it)."""
+        if (index, self.model) not in self._exhausted:
+            return self.model
+        if self.fallback_model and (index, self.fallback_model) not in self._exhausted:
+            return self.fallback_model
+        return None
+
     def complete(self, messages, *, json_mode=False, tools=None, max_tokens=4096, temperature=0.1, _retried=0, _waited=0):
         """Returns the reply text, or, when `tools` are offered and the model calls one,
-        the raw assistant message dict (with a `tool_calls` list) instead of text."""
+        the raw assistant message dict (with a `tool_calls` list) instead of text.
+
+        Each key is tried at most once per call, using whichever model (primary or
+        fallback) that key itself still has quota for. Only once every key is either
+        invalid, daily-exhausted, or currently per-minute rate-limited does this wait
+        (bounded, using the soonest cooldown across all keys) or raise.
+        """
         with self._lock:
-            if time.monotonic() < self._retry_at:
-                seconds = int(self._retry_at - time.monotonic()) + 1
-                raise LLMError(f"Groq rate limit: retry in {seconds}s; organization quota is shared across keys.")
-            model = self._active_model()
             wait = self._pace_seconds(messages, max_tokens)
             if wait > 0.5:
                 time.sleep(min(wait, 65.0))
-            payload = dict(model=model, messages=messages, temperature=temperature,
-                           max_completion_tokens=max_tokens)
+            payload_base = dict(messages=messages, temperature=temperature, max_completion_tokens=max_tokens)
             if json_mode:
-                payload["response_format"] = {"type": "json_object"}
+                payload_base["response_format"] = {"type": "json_object"}
             if tools:
-                payload["tools"] = tools
-                payload["tool_choice"] = "auto"
+                payload_base["tools"] = tools
+                payload_base["tool_choice"] = "auto"
             last_error = "Groq has no usable API keys configured."
+            soonest_cooldown = None
+            now = time.monotonic()
             for offset in range(len(self._keys)):
                 index = (self._next + offset) % len(self._keys)
                 if index in self._invalid:
                     continue
-                try:
-                    response = self._session.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {self._keys[index]}"},
-                        json=payload, timeout=(10, self.timeout), allow_redirects=False,
-                    )
-                except requests.RequestException:
-                    last_error = "Groq connection failed or timed out. Check network connectivity."
+                remaining = self._key_cooldown_until.get(index, 0.0) - now
+                if remaining > 0:
+                    soonest_cooldown = remaining if soonest_cooldown is None else min(soonest_cooldown, remaining)
+                    last_error = f"Groq rate limit (HTTP 429): this key is still cooling down for {remaining:.0f}s."
                     continue
-                with response:
-                    status = response.status_code
-                    if status == 401:
-                        self._invalid.add(index)
-                        last_error = "Groq rejected the configured API keys (HTTP 401)."
-                        continue
-                    if status == 429:
-                        daily = _daily_limit(response)
-                        if daily:
-                            kind, limit, used = daily
-                            self._exhausted.add(model)
-                            if self._active_model() not in self._exhausted:
+                # Retry THIS key with its own fallback model (if any) before moving
+                # on to the next key — a key that is daily-exhausted on the primary
+                # model may still have quota left on the fallback model.
+                while True:
+                    model = self._model_for_key(index)
+                    if model is None:
+                        break  # this key has no usable model left; try the next key
+                    payload = dict(payload_base, model=model)
+                    try:
+                        response = self._session.post(
+                            "https://api.groq.com/openai/v1/chat/completions",
+                            headers={"Authorization": f"Bearer {self._keys[index]}"},
+                            json=payload, timeout=(10, self.timeout), allow_redirects=False,
+                        )
+                    except requests.RequestException:
+                        last_error = "Groq connection failed or timed out. Check network connectivity."
+                        break
+                    with response:
+                        status = response.status_code
+                        if status == 401:
+                            self._invalid.add(index)
+                            last_error = "Groq rejected the configured API keys (HTTP 401)."
+                            break
+                        if status == 429:
+                            daily = _daily_limit(response)
+                            if daily:
+                                kind, limit, used = daily
+                                self._exhausted.add((index, model))
+                                key_note = f" (key {index + 1}/{len(self._keys)})" if len(self._keys) > 1 else ""
+                                last_error = (
+                                    f"Groq daily {kind} limit reached for {model}: {used:,} of {limit:,} used in the "
+                                    f"last 24 hours.{key_note}"
+                                )
+                                continue  # try this same key's fallback model, if it has one left
+                            seconds = self._retry_seconds(response.headers)
+                            self._key_cooldown_until[index] = time.monotonic() + seconds
+                            soonest_cooldown = seconds if soonest_cooldown is None else min(soonest_cooldown, seconds)
+                            last_error = f"Groq rate limit (HTTP 429) on one of the configured keys: retry after {seconds:g}s."
+                            break
+                        if status >= 500:
+                            last_error = f"Groq service unavailable (HTTP {status})."
+                            break
+                        if status == 400 and json_mode and _retried < 2 and _error_code(response) == "json_validate_failed":
+                            # The model produced malformed JSON; Groq rejects it rather
+                            # than returning it. A fresh sample usually succeeds.
+                            return self.complete(messages, json_mode=json_mode, tools=tools, max_tokens=max_tokens,
+                                                 temperature=temperature, _retried=_retried + 1, _waited=_waited)
+                        if status == 413:
+                            # Groq counts the prompt PLUS the reserved output allowance
+                            # against a per-request token limit, so a generous
+                            # max_tokens can reject a short prompt. Halve the
+                            # allowance and retry before giving up; the output a
+                            # structured extraction needs is far below the ceiling.
+                            if max_tokens > 1500 and _retried < 3:
+                                smaller = max(1500, max_tokens // 2)
                                 from rich.console import Console
                                 Console().print(
-                                    f"[yellow]Groq daily {kind} limit reached for {model} ({used:,}/{limit:,}). "
-                                    f"Continuing on {self.fallback_model}.[/yellow]"
-                                )
-                                return self.complete(messages, json_mode=json_mode, max_tokens=max_tokens,
-                                                     temperature=temperature, _retried=_retried, _waited=_waited)
-                            hint = ("" if self.fallback_model else
-                                    " Set GROQ_FALLBACK_MODEL=openai/gpt-oss-20b in .env to continue on a second model,")
+                                    f"[yellow]Groq says the request is too large for {model}'s per-request limit; "
+                                    f"retrying with a smaller output allowance ({smaller} tokens).[/yellow]")
+                                return self.complete(messages, json_mode=json_mode, tools=tools, max_tokens=smaller,
+                                                     temperature=temperature, _retried=_retried + 1, _waited=_waited)
                             raise LLMError(
-                                f"Groq daily {kind} limit reached for {model}: {used:,} of {limit:,} used in the "
-                                f"last 24 hours. It frees up gradually over the day.{hint} or upgrade the Groq "
-                                "plan. Progress so far is saved; re-run to resume."
-                            )
-                        seconds = self._retry_seconds(response.headers)
-                        self._retry_at = time.monotonic() + seconds
-                        # Per-minute windows reset within a minute; the per-day cap is handled above.
-                        if seconds <= 65 and _retried < 3 and _waited + seconds <= 180:
-                            from rich.console import Console
-                            Console().print(f"[yellow]Groq requested a {seconds:g}s cooldown; retry {_retried + 1}/3 after it expires.[/yellow]")
-                            time.sleep(seconds)
-                            self._retry_at = 0
-                            return self.complete(messages, json_mode=json_mode, max_tokens=max_tokens,
-                                                 temperature=temperature, _retried=_retried + 1,
-                                                 _waited=_waited + seconds)
-                        raise LLMError(f"Groq rate limit (HTTP 429): retry after {seconds:g}s.")
-                    if status >= 500:
-                        last_error = f"Groq service unavailable (HTTP {status})."
-                        continue
-                    if status == 400 and json_mode and _retried < 2 and _error_code(response) == "json_validate_failed":
-                        # The model produced malformed JSON; Groq rejects it rather
-                        # than returning it. A fresh sample usually succeeds.
-                        return self.complete(messages, json_mode=json_mode, max_tokens=max_tokens,
-                                             temperature=temperature, _retried=_retried + 1, _waited=_waited)
-                    if status == 413:
-                        # Groq counts the prompt PLUS the reserved output allowance
-                        # against a per-request token limit, so a generous
-                        # max_tokens can reject a short prompt. Halve the
-                        # allowance and retry before giving up; the output a
-                        # structured extraction needs is far below the ceiling.
-                        if max_tokens > 1500 and _retried < 3:
-                            smaller = max(1500, max_tokens // 2)
-                            from rich.console import Console
-                            Console().print(
-                                f"[yellow]Groq says the request is too large for {model}'s per-request limit; "
-                                f"retrying with a smaller output allowance ({smaller} tokens).[/yellow]")
-                            return self.complete(messages, json_mode=json_mode, max_tokens=smaller,
-                                                 temperature=temperature, _retried=_retried + 1, _waited=_waited)
-                        raise LLMError(
-                            f"Groq request too large (HTTP 413) for {model}: the prompt plus the output allowance "
-                            "exceeds its per-request token limit. Shorten the input, or set GROQ_MODEL to a model "
-                            "with a larger limit.")
-                    if status != 200:
-                        raise LLMError(f"Groq request rejected (HTTP {status}); check model access and configuration.")
-                    try:
-                        choice = response.json()["choices"][0]
-                        message = choice["message"]
-                        content = message.get("content")
-                        finish_reason = choice.get("finish_reason")
-                        if tools and finish_reason == "tool_calls":
-                            if not message.get("tool_calls"):
-                                raise ValueError("tool_calls finish reason without tool_calls")
-                            self._next = index
-                            self.last_model = model
-                            self._note_limits(response.headers)
-                            return message
-                        if finish_reason != "stop" or not isinstance(content, str) or not content.strip():
-                            raise ValueError("incomplete response")
-                        if json_mode and not isinstance(json.loads(content), dict):
-                            raise ValueError("expected JSON object")
-                    except (ValueError, KeyError, IndexError, TypeError):
-                        raise LLMError("Groq returned an incomplete or invalid response; nothing was accepted.") from None
-                    self._next = index
-                    self.last_model = model
-                    self._note_limits(response.headers)
-                    return content.strip()
+                                f"Groq request too large (HTTP 413) for {model}: the prompt plus the output allowance "
+                                "exceeds its per-request token limit. Shorten the input, or set GROQ_MODEL to a model "
+                                "with a larger limit.")
+                        if status != 200:
+                            raise LLMError(f"Groq request rejected (HTTP {status}); check model access and configuration.")
+                        try:
+                            choice = response.json()["choices"][0]
+                            message = choice["message"]
+                            content = message.get("content")
+                            finish_reason = choice.get("finish_reason")
+                            if tools and finish_reason == "tool_calls":
+                                if not message.get("tool_calls"):
+                                    raise ValueError("tool_calls finish reason without tool_calls")
+                                self._next = index
+                                self.last_model = model
+                                self._note_limits(response.headers)
+                                return message
+                            if finish_reason != "stop" or not isinstance(content, str) or not content.strip():
+                                raise ValueError("incomplete response")
+                            if json_mode and not isinstance(json.loads(content), dict):
+                                raise ValueError("expected JSON object")
+                        except (ValueError, KeyError, IndexError, TypeError):
+                            raise LLMError("Groq returned an incomplete or invalid response; nothing was accepted.") from None
+                        self._next = index
+                        self.last_model = model
+                        self._note_limits(response.headers)
+                        return content.strip()
+                # Inner while ended via break: this key is done for this call (invalid,
+                # daily-exhausted on every model, rate-limited, or unreachable).
+            # Every key was invalid, daily-exhausted, or currently cooling down.
+            if soonest_cooldown is not None and soonest_cooldown <= 65 and _retried < 3 and _waited + soonest_cooldown <= 180:
+                from rich.console import Console
+                Console().print(
+                    f"[yellow]All usable Groq keys are rate-limited; retrying in {soonest_cooldown:g}s "
+                    f"({_retried + 1}/3).[/yellow]")
+                time.sleep(soonest_cooldown)
+                return self.complete(messages, json_mode=json_mode, tools=tools, max_tokens=max_tokens,
+                                     temperature=temperature, _retried=_retried + 1, _waited=_waited + soonest_cooldown)
+            if "daily" in last_error and not self.fallback_model:
+                last_error += " Set GROQ_FALLBACK_MODEL=openai/gpt-oss-20b in .env to continue on a second model."
             raise LLMError(last_error)
 
 

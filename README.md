@@ -362,6 +362,16 @@ applicant data externally.
    GROQ_API_KEYS=gsk_first,gsk_second,gsk_third
    ```
 
+   `GROQ_API_KEYS` can hold any number of comma-separated keys, including keys
+   from **separate Groq accounts**. Each one is treated as its own account
+   with its own rate limit and its own daily quota: if one key gets
+   rate-limited mid-run or hits its daily cap, the client automatically
+   rotates to the next configured key — still using the same model, not a
+   downgraded one — so a long run doesn't stop just because one account ran
+   out of room. `GROQ_FALLBACK_MODEL` is a separate, smaller safety net for
+   when *every* configured key has exhausted the primary model's daily quota.
+   See `src/job_agent/llm.py`'s `GroqClient` for the exact failover order.
+
 5. Check the machine:
 
    ```powershell

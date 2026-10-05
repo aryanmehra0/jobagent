@@ -30,15 +30,29 @@ def test_invalid_key_fails_over_without_disclosing_secrets():
     assert session.post.call_args.kwargs["allow_redirects"] is False
 
 
-def test_organization_rate_limit_stops_rotation_and_cools_down():
+def test_rate_limit_on_one_key_rotates_to_the_next_key_instead_of_blocking_everything():
+    """Each configured key is its own account, so a 429 on key one must not stop
+    key two from being tried in the very same call."""
     session = Mock()
-    session.post.return_value = response(429, headers={"retry-after": "120"})
+    session.post.side_effect = [response(429, headers={"retry-after": "120"}), response()]
     client = GroqClient(["one", "two"], "test", session=session)
-    with pytest.raises(LLMError, match="120s"):
+    assert client.complete([], json_mode=True) == '{"ok":true}'
+    assert session.post.call_count == 2
+    assert session.post.call_args.kwargs["headers"]["Authorization"] == "Bearer two"
+    # Key "one" is still cooling down; the next call should skip straight to "two" again.
+    session.post.side_effect = [response()]
+    assert client.complete([], json_mode=True) == '{"ok":true}'
+    assert session.post.call_args.kwargs["headers"]["Authorization"] == "Bearer two"
+
+
+def test_all_keys_rate_limited_raises_naming_the_soonest_cooldown():
+    session = Mock()
+    session.post.side_effect = [response(429, headers={"retry-after": "120"}),
+                                 response(429, headers={"retry-after": "90"})]
+    client = GroqClient(["one", "two"], "test", session=session)
+    with pytest.raises(LLMError, match="retry after 90s"):
         client.complete([])
-    with pytest.raises(LLMError, match="organization quota"):
-        client.complete([])
-    assert session.post.call_count == 1
+    assert session.post.call_count == 2
 
 
 @pytest.mark.parametrize("reply", [response(content="not json"), response(finish="length"),
@@ -105,6 +119,19 @@ def test_daily_token_limit_without_a_fallback_says_what_happened():
         client.complete([])
     assert "GROQ_FALLBACK_MODEL" in str(error.value)
     assert "org_x" not in str(error.value)
+
+
+def test_daily_limit_on_one_account_rotates_to_a_different_account_same_model():
+    """The headline case: keys from separate Groq accounts, so one account's daily
+    cap must not force a weaker fallback model when another account still has
+    full quota on the primary model."""
+    session = Mock()
+    session.post.side_effect = [daily_limit_response("test", used=199999), response()]
+    client = GroqClient(["one", "two"], "test", session=session)
+    assert client.complete([], json_mode=True) == '{"ok":true}'
+    assert session.post.call_count == 2
+    assert session.post.call_args.kwargs["json"]["model"] == "test"
+    assert session.post.call_args.kwargs["headers"]["Authorization"] == "Bearer two"
 
 
 def test_both_models_exhausted_stops_cleanly():
