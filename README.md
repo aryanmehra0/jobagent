@@ -22,6 +22,7 @@ fact about you that isn't in your resume.**
 - [Documentation map](#documentation-map)
 - [Job shortlist and portable downloads](#job-shortlist-and-portable-downloads)
 - [The accuracy guarantee](#the-accuracy-guarantee)
+- [Real LLM tool-calling (Phase 7)](#real-llm-tool-calling-phase-7)
 - [Setup](#setup)
 - [A-to-Z quick start for a real user](#a-to-z-quick-start-for-a-real-user)
 - [Deployment and hosting](#deployment-and-hosting)
@@ -42,9 +43,12 @@ way to trigger the exact same engine — `PipelineRunner`
 (`src/job_agent/web/runner.py`) is the one orchestrator both surfaces share.
 There is **one** real AI agent in the codebase — `AutoApplyAgent`
 (`src/job_agent/automation/agent.py`), a bounded, LLM-free browser loop that
-fills real application forms — everything else (job scoring, resume
-tailoring, interview prep) is a single LLM call with a deterministic,
-offline fallback. No LangChain, no LangGraph, no ORM: raw SQL against SQLite
+fills real application forms. Most other LLM-backed stages (job scoring,
+resume tailoring) are a single LLM call with a deterministic, offline
+fallback. Interview prep (Phase 7) is the one exception: when Groq is the
+active provider, it hands the model a real function-calling tool instead of
+a plain prompt — see [Real LLM tool-calling](#real-llm-tool-calling-phase-7)
+below. No LangChain, no LangGraph, no ORM: raw SQL against SQLite
 (or Postgres via `DATABASE_URL`). The local dashboard is stdlib HTTP; the
 separate hosted control plane uses FastAPI. Full,
 implementation-verified detail — every component, the orchestrator's exact
@@ -272,6 +276,45 @@ Three gates enforce it, and each is covered by tests in
 The profile is sealed with a SHA-256 hash over its locked facts.
 `python main.py verify` detects any edit, and stages 4 and 5 refuse to run
 against a profile whose seal does not verify.
+
+---
+
+## Real LLM tool-calling (Phase 7)
+
+Interview prep (`python main.py prep`) needs to pick which of your resume's
+achievements best support each question it drafts. Most LLM-backed stages in
+this project solve a problem like that with a single prompt and a
+deterministic fallback — but here, when Groq is your active provider, the
+model doesn't just answer in text. It's given a real function-calling tool,
+**`get_profile_evidence(query, max_results)`**, declared with the standard
+OpenAI/Groq `tools` schema, and it has to call that tool to see any resume
+text at all. This is genuine wire-level tool-calling (`tools=`, `tool_choice`,
+`finish_reason: "tool_calls"` on the actual HTTP request/response), not a
+"return JSON with an `indices` field" prompt trick — which is what this
+stage used to do before this change.
+
+Why a tool instead of a bigger prompt: the tool's executor
+(`generation._evidence_tool_dispatcher`) can only rank and return entries
+that are **already copied verbatim** from your sealed, SHA-256-hashed
+profile. It cannot author new text, paraphrase, or invent an achievement —
+so handing evidence selection to the model via a tool call reinforces this
+project's one invariant (no stage may assert a fact about you that isn't in
+your resume) instead of needing a second gate to clean up after it.
+
+```powershell
+python main.py prep --limit 1          # Runs the real tool-calling path when Groq is active
+python main.py db events --phase llm   # Shows the resulting groq_tool_call event(s)
+```
+
+A `groq_tool_call` event records which tool was called, how many times, and
+the call's latency — never the prompt or your resume text. Any other
+provider falls back to the prior JSON-index selection; no provider at all
+(or a failed/empty tool call) falls back to the deterministic
+relevance-sorted order, so Phase 7 still works with zero API keys. See
+[`llm.groq_complete_with_tools`](src/job_agent/llm.py) and
+[`generation.evidence_for`](src/job_agent/generation.py) for the
+implementation, and `docs/ARCHITECTURE.md`'s Phase 7 section for the
+file-by-file detail.
 
 ---
 
@@ -984,6 +1027,10 @@ labelled a hypothesis, not confirmed company information. Guides are linked
 from the dashboard's Interview prep node and included in the ZIP export; a
 guide is hidden again if you re-seal the profile with different content, so
 you're never handed a guide written for an outdated version of yourself.
+
+With Groq as your active provider, evidence selection for the STAR answers
+runs through real function-calling rather than a prompt — see
+[Real LLM tool-calling](#real-llm-tool-calling-phase-7) above.
 
 ### Reply tracking (opt-in, CLI only)
 
