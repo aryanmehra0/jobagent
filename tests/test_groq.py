@@ -169,6 +169,102 @@ def test_a_score_is_labelled_with_the_model_that_actually_judged_it(monkeypatch,
     assert LLMReranker.evaluate_job(reranker, candidate_profile, job, 0.5).scored_by.startswith("groq:")
 
 
+def tool_call_response(tool_name, arguments, call_id="call_1"):
+    result = requests.Response()
+    result.status_code = 200
+    result._content = json.dumps({"choices": [{
+        "finish_reason": "tool_calls",
+        "message": {
+            "role": "assistant", "content": None,
+            "tool_calls": [{"id": call_id, "type": "function",
+                            "function": {"name": tool_name, "arguments": json.dumps(arguments)}}],
+        },
+    }]}).encode()
+    result._content_consumed = True
+    return result
+
+
+def test_groq_client_returns_the_tool_call_message_when_the_model_calls_a_tool():
+    session = Mock()
+    session.post.return_value = tool_call_response("get_profile_evidence", {"query": "python"})
+    client = GroqClient(["secret"], "test-model", session=session)
+    message = client.complete([], tools=[{"type": "function", "function": {"name": "get_profile_evidence"}}])
+    assert message["tool_calls"][0]["function"]["name"] == "get_profile_evidence"
+    assert json.loads(message["tool_calls"][0]["function"]["arguments"]) == {"query": "python"}
+    assert session.post.call_args.kwargs["json"]["tool_choice"] == "auto"
+
+
+def test_groq_complete_with_tools_executes_the_dispatcher_and_records_an_event(monkeypatch, tmp_path):
+    from job_agent import llm
+    from job_agent.config.settings import settings
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path)
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "groq_api_key", Settings(_env_file=None).groq_api_key)
+    monkeypatch.setattr(settings, "groq_api_keys", Settings(_env_file=None, GROQ_API_KEYS="one").groq_api_keys)
+    monkeypatch.setattr(settings, "groq_model", "test-model")
+    monkeypatch.setattr(settings, "groq_timeout", 45)
+    monkeypatch.setattr(settings, "groq_fallback_model", "")
+    session = Mock()
+    session.post.side_effect = [
+        tool_call_response("get_profile_evidence", {"query": "python", "max_results": 2}),
+        response(content="done"),
+    ]
+    monkeypatch.setattr(llm, "_client", GroqClient(["one"], "test-model", session=session))
+    monkeypatch.setattr(llm, "_configuration", (("one",), "test-model", 45, ""))
+
+    captured = []
+
+    def dispatch(name, arguments):
+        captured.append((name, arguments))
+        return {"results": [{"statement": "Shipped a thing"}]}
+
+    text, calls = llm.groq_complete_with_tools(
+        "system", "prompt", tools=[{"type": "function", "function": {"name": "get_profile_evidence"}}],
+        dispatch=dispatch)
+
+    assert text == "done"
+    assert calls == [("get_profile_evidence", {"query": "python", "max_results": 2},
+                      {"results": [{"statement": "Shipped a thing"}]})]
+    assert captured == [("get_profile_evidence", {"query": "python", "max_results": 2})]
+    assert session.post.call_count == 2
+    second_messages = session.post.call_args_list[1].kwargs["json"]["messages"]
+    assert second_messages[-1]["role"] == "tool"
+    assert json.loads(second_messages[-1]["content"]) == {"results": [{"statement": "Shipped a thing"}]}
+
+    event = JobsDatabase().run_events(phase="llm", limit=1)[0]
+    assert event["event_type"] == "groq_tool_call"
+    assert event["success"] is True
+    assert event["metadata"]["tool_calls"] == 1
+    assert event["metadata"]["tool_names"] == ["get_profile_evidence"]
+
+
+def test_groq_complete_with_tools_stops_after_max_rounds_without_a_final_answer(monkeypatch, tmp_path):
+    from job_agent import llm
+    from job_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path)
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "groq_api_key", Settings(_env_file=None).groq_api_key)
+    monkeypatch.setattr(settings, "groq_api_keys", Settings(_env_file=None, GROQ_API_KEYS="one").groq_api_keys)
+    monkeypatch.setattr(settings, "groq_model", "test-model")
+    monkeypatch.setattr(settings, "groq_timeout", 45)
+    monkeypatch.setattr(settings, "groq_fallback_model", "")
+    session = Mock()
+    session.post.return_value = tool_call_response("get_profile_evidence", {"query": "python"})
+    monkeypatch.setattr(llm, "_client", GroqClient(["one"], "test-model", session=session))
+    monkeypatch.setattr(llm, "_configuration", (("one",), "test-model", 45, ""))
+
+    text, calls = llm.groq_complete_with_tools(
+        "system", "prompt", tools=[{"type": "function", "function": {"name": "get_profile_evidence"}}],
+        dispatch=lambda name, args: {"results": []}, max_rounds=2)
+
+    assert text is None
+    assert len(calls) == 2
+    assert session.post.call_count == 2
+
+
 def test_groq_complete_records_safe_llm_metadata(monkeypatch, tmp_path):
     from job_agent import llm
     from job_agent.config.settings import settings
