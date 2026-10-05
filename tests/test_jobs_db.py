@@ -5,6 +5,8 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -12,11 +14,15 @@ import pytest
 from job_agent.config.schema import (
     CandidateProfile,
     ContactInfo,
+    EvaluatedJob,
+    EvaluationScore,
     JobPosting,
     SkillSet,
     WorkAuthorization,
 )
 from job_agent.storage.jobs_db import JobsDatabase
+from job_agent.storage.jobs_db import _UPSERT_JOB as _UPSERT_FOR_TEST
+from job_agent.tracking.records import JobRecord
 from job_agent.tracking.export import JOBS_CSV_NAME
 
 
@@ -52,6 +58,18 @@ def _db(tmp_path) -> JobsDatabase:
     return JobsDatabase(db_path=tmp_path / "jobs.db")
 
 
+def _job_upsert_values(now: str):
+    job = _job()
+    return (
+        job.id, job.fingerprint(), job.title, job.company, job.location,
+        1 if job.is_remote else 0, job.work_mode, job.job_type, job.source,
+        job.date_posted, job.discovered_at, job.salary_min, job.salary_max,
+        job.salary_currency, job.job_url, job.apply_url, None, 0, None,
+        job.company_website, job.description, "active", 1, job.discovered_at or now,
+        now, None, None, None, None, None, None, now,
+    )
+
+
 def test_a_fetched_job_is_stored_with_its_emails_and_apply_route(outputs, tmp_path):
     job = _job(contacts=[
         {"email": "careers@osfin.ai", "kind": "hiring", "source": "job_post"},
@@ -71,6 +89,26 @@ def test_a_fetched_job_is_stored_with_its_emails_and_apply_route(outputs, tmp_pa
     # LinkedIn needs a login, so the row says so rather than claiming a form.
     assert row["apply_method"] == "login_required" and row["auto_apply"] == 0
     assert row["status"] == "found"
+
+
+def test_production_mode_refuses_implicit_sqlite_fallback(tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.sourcing.delta_store import DeltaStore
+    from job_agent.hosted.queue import HostedQueue
+
+    monkeypatch.setattr(settings, "app_environment", "production")
+    monkeypatch.setattr(settings, "require_database_url", False)
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path)
+
+    with pytest.raises(RuntimeError, match="DATABASE_URL is required"):
+        JobsDatabase()
+    with pytest.raises(RuntimeError, match="DATABASE_URL is required"):
+        DeltaStore()
+    with pytest.raises(RuntimeError, match="DATABASE_URL is required"):
+        HostedQueue()
+
+    assert JobsDatabase(db_path=tmp_path / "jobs.db").backend == "sqlite"
 
 
 def test_scores_resumes_and_outcomes_reach_the_database(outputs, tmp_path):
@@ -215,6 +253,7 @@ def test_schema_migrations_are_visible_and_applied(tmp_path):
     assert all(row["applied"] for row in migrations)
     assert {row["name"] for row in migrations} >= {
         "legacy_candidate_columns", "canonical_job_work_mode", "normalized_candidate_job_state",
+        "interview_prep_artifacts", "cover_letter_artifacts",
     }
     with database._connect() as conn:
         assert conn.execute("SELECT COUNT(*) AS n FROM schema_migrations").fetchone()["n"] == len(migrations)
@@ -432,6 +471,342 @@ def test_apply_loader_can_rebuild_manifest_from_resume_artifacts(outputs, tmp_pa
     assert entries[0]["pdf_path"] == str(pdf.resolve())
     assert entries[0]["pdf_sha256"]
     assert entries[0]["score"] == pytest.approx(8.2)
+
+
+def test_tailoring_manifest_sync_refreshes_resume_artifacts(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.tailoring.pipeline import ResumeTailoringPipeline
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n")
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    job = _job()
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": [], "scored_by": "heuristic",
+    }
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+        qualified=[{"job": job.model_dump(), "evaluation": evaluation}],
+        manifest=[{"job_id": "j1", "title": job.title, "company": job.company, "score": 8.2,
+                   "pdf_path": str(pdf), "profile_hash": "profile-v1",
+                   "pdf_sha256": digest, "validation_passed": True, "validation_summary": "ok"}],
+    )
+
+    ResumeTailoringPipeline._sync_database(outputs)
+
+    entries = JobsDatabase().tailored_resumes(limit=10)
+    assert entries[0]["job_id"] == "j1"
+    assert entries[0]["pdf_sha256"] == digest
+
+
+def test_apply_results_writer_refreshes_application_state(outputs, tmp_path, monkeypatch):
+    from job_agent.automation.pipeline import AutoApplyPipeline
+    from job_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    job = _job()
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": [], "scored_by": "heuristic",
+    }
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+        qualified=[{"job": job.model_dump(), "evaluation": evaluation}],
+    )
+
+    AutoApplyPipeline._write_results(
+        outputs / "application_results.json",
+        [{"job_id": "j1", "title": job.title, "company": job.company,
+          "job_url": job.job_url, "status": "dry_run", "channel": "company_site"}],
+        [],
+    )
+
+    with JobsDatabase()._connect() as conn:
+        row = dict(conn.execute("SELECT job_id, current_status FROM applications").fetchone())
+    assert row == {"job_id": "j1", "current_status": "dry_run"}
+
+
+def test_tracking_sync_refreshes_outreach_state(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.tracking import outreach
+    from job_agent.tracking.pipeline import FallbackTrackingPipeline
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    job = _job()
+    _write_artifacts(outputs, [job])
+    outreach.save_drafts({
+        "j1": {
+            "to": "hiring@example.com",
+            "status": "ready",
+            "note": "Ready to send",
+            "subject": "Product role",
+            "body": "Hello",
+            "eml": str(outputs / "outreach" / "j1.eml"),
+        }
+    })
+
+    FallbackTrackingPipeline._sync_database(outputs)
+
+    with JobsDatabase()._connect() as conn:
+        row = dict(conn.execute("SELECT job_id, recipient, status FROM job_outreach").fetchone())
+    assert row == {"job_id": "j1", "recipient": "hiring@example.com", "status": "ready"}
+
+
+def test_interview_prep_artifacts_are_database_backed(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.interview.pipeline import InterviewPrepPipeline
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    job = _job()
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": [], "scored_by": "heuristic",
+    }
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+        qualified=[{"job": job.model_dump(), "evaluation": evaluation}],
+    )
+    folder = outputs / "interview_prep"
+    folder.mkdir()
+    guide = folder / "j1.md"
+    guide.write_text("# Interview prep\n", encoding="utf-8")
+    digest = hashlib.sha256(guide.read_bytes()).hexdigest()
+    (folder / "j1.json").write_text(json.dumps({"job_id": "j1"}), encoding="utf-8")
+    (folder / "manifest.json").write_text(json.dumps([
+        {"job_id": "j1", "profile_hash": profile.profile_hash, "path": str(guide),
+         "sha256": digest, "questions": 9}
+    ]), encoding="utf-8")
+
+    InterviewPrepPipeline._sync_database()
+
+    rows = JobsDatabase().interview_prep_artifacts()
+    assert len(rows) == 1
+    assert rows[0]["job_id"] == "j1"
+    assert rows[0]["sha256"] == digest
+    assert rows[0]["questions"] == 9
+    artifact_report = JobsDatabase().artifact_integrity_report()
+    assert artifact_report["ok"] is True
+    assert artifact_report["counts"]["checked"] == 1
+
+
+def test_document_links_fall_back_to_database_interview_prep(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.interview.pipeline import InterviewPrepPipeline
+    from job_agent.tracking.supplements import document_links
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    job = _job()
+    evaluation = {
+        "embedding_similarity": 0.61, "fit_score": 8.2, "technical_score": 8.0,
+        "seniority_score": 7.5, "threshold_used": 7.0, "passed_threshold": True,
+        "reasoning": "Strong product overlap.", "matching_skills": ["Python"],
+        "missing_skills": [], "scored_by": "heuristic",
+    }
+    _write_artifacts(
+        outputs,
+        [job],
+        evaluated=[{"job": job.model_dump(), "evaluation": evaluation}],
+        qualified=[{"job": job.model_dump(), "evaluation": evaluation}],
+    )
+    folder = outputs / "interview_prep"
+    folder.mkdir()
+    guide = folder / "j1.md"
+    guide.write_text("# Interview prep\n", encoding="utf-8")
+    digest = hashlib.sha256(guide.read_bytes()).hexdigest()
+    manifest = folder / "manifest.json"
+    manifest.write_text(json.dumps([
+        {"job_id": "j1", "profile_hash": profile.profile_hash, "path": str(guide),
+         "sha256": digest, "questions": 9}
+    ]), encoding="utf-8")
+    InterviewPrepPipeline._sync_database()
+    manifest.unlink()
+
+    links = document_links(outputs, profile.profile_hash)
+
+    assert links["j1"]["Interview Prep"] == str(guide.resolve())
+
+
+def test_artifact_integrity_report_flags_interview_prep_hash_mismatch(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.interview.pipeline import InterviewPrepPipeline
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    job = _job()
+    _write_artifacts(outputs, [job])
+    folder = outputs / "interview_prep"
+    folder.mkdir()
+    guide = folder / "j1.md"
+    guide.write_text("# Interview prep\n", encoding="utf-8")
+    digest = hashlib.sha256(guide.read_bytes()).hexdigest()
+    (folder / "manifest.json").write_text(json.dumps([
+        {"job_id": "j1", "profile_hash": profile.profile_hash, "path": str(guide),
+         "sha256": digest, "questions": 9}
+    ]), encoding="utf-8")
+    InterviewPrepPipeline._sync_database()
+    guide.write_text("# Changed\n", encoding="utf-8")
+
+    report = JobsDatabase().artifact_integrity_report()
+
+    assert report["ok"] is False
+    assert report["counts"]["hash_mismatch"] == 1
+    assert report["failures"][0]["artifact_id"].startswith("prep_")
+
+
+def test_cover_letter_artifacts_are_database_backed(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    job = _job()
+    _write_artifacts(outputs, [job])
+    folder = outputs / "cover_letters"
+    folder.mkdir()
+    letter = folder / "cover_j1.pdf"
+    letter.write_bytes(b"%PDF-1.4\ncover\n%%EOF")
+    digest = hashlib.sha256(letter.read_bytes()).hexdigest()
+    (folder / "manifest.json").write_text(json.dumps([
+        {"job_id": "j1", "profile_hash": profile.profile_hash, "path": str(letter),
+         "sha256": digest, "validated": True}
+    ]), encoding="utf-8")
+    database = JobsDatabase()
+    database.sync(outputs)
+
+    assert database.store_cover_letter_artifacts(outputs) == 1
+    rows = database.cover_letter_artifacts()
+    assert len(rows) == 1
+    assert rows[0]["job_id"] == "j1"
+    assert rows[0]["sha256"] == digest
+    assert rows[0]["validated"] is True
+    artifact_report = database.artifact_integrity_report()
+    assert artifact_report["ok"] is True
+    assert artifact_report["counts"]["checked"] == 1
+
+
+def test_document_links_fall_back_to_database_cover_letters(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.tracking.supplements import document_links
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    job = _job()
+    _write_artifacts(outputs, [job])
+    folder = outputs / "cover_letters"
+    folder.mkdir()
+    letter = folder / "cover_j1.pdf"
+    letter.write_bytes(b"%PDF-1.4\ncover\n%%EOF")
+    digest = hashlib.sha256(letter.read_bytes()).hexdigest()
+    manifest = folder / "manifest.json"
+    manifest.write_text(json.dumps([
+        {"job_id": "j1", "profile_hash": profile.profile_hash, "path": str(letter),
+         "sha256": digest, "validated": True}
+    ]), encoding="utf-8")
+    database = JobsDatabase()
+    database.sync(outputs)
+    database.store_cover_letter_artifacts(outputs)
+    manifest.unlink()
+
+    links = document_links(outputs, profile.profile_hash)
+
+    assert links["j1"]["Cover Letter"] == str(letter.resolve())
+
+
+def test_artifact_integrity_report_flags_cover_letter_hash_mismatch(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+
+    profile = CandidateProfile(
+        contact=ContactInfo(full_name="Asha Verma", email="asha@example.org"),
+        summary="Product manager.",
+        work_authorization=WorkAuthorization(current_country="India", authorized_countries=["India"]),
+        skills=SkillSet(languages=["Python"]),
+        years_of_experience=4.0,
+    ).seal_profile()
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(profile.model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+    job = _job()
+    _write_artifacts(outputs, [job])
+    folder = outputs / "cover_letters"
+    folder.mkdir()
+    letter = folder / "cover_j1.pdf"
+    letter.write_bytes(b"%PDF-1.4\ncover\n%%EOF")
+    digest = hashlib.sha256(letter.read_bytes()).hexdigest()
+    (folder / "manifest.json").write_text(json.dumps([
+        {"job_id": "j1", "profile_hash": profile.profile_hash, "path": str(letter),
+         "sha256": digest, "validated": True}
+    ]), encoding="utf-8")
+    database = JobsDatabase()
+    database.sync(outputs)
+    database.store_cover_letter_artifacts(outputs)
+    letter.write_bytes(b"%PDF-1.4\nchanged\n%%EOF")
+
+    report = database.artifact_integrity_report()
+
+    assert report["ok"] is False
+    assert report["counts"]["hash_mismatch"] == 1
+    assert report["failures"][0]["artifact_id"].startswith("letter_")
 
 
 def test_application_pack_includes_resume_artifacts_when_manifest_is_missing(outputs, tmp_path, monkeypatch):
@@ -793,6 +1168,8 @@ def test_normalized_candidate_job_state_is_queryable_without_overwriting_history
         artifact = dict(conn.execute("SELECT * FROM resume_artifacts WHERE job_id = 'j1'").fetchone())
 
     assert global_job == {"work_mode": "hybrid", "employment_type": "fulltime"}
+    with database._connect() as conn:
+        assert conn.execute("SELECT status FROM jobs WHERE job_id = 'j1'").fetchone()["status"] == "active"
     assert match["fit_score"] == pytest.approx(7.9)
     assert match["state"] == "applied" and match["profile_hash"] == "profile-v1"
     assert database.jobs()[0]["fit_score"] == pytest.approx(7.9)
@@ -804,7 +1181,259 @@ def test_normalized_candidate_job_state_is_queryable_without_overwriting_history
     assert application["current_status"] == "applied"
     assert any(event["event_type"] == "submitted" for event in events)
     assert source["source"] == "linkedin" and "Associate Product Manager" in source["raw_payload"]
-    assert artifact["file_path"].endswith("resume_j1.pdf") and artifact["size_bytes"] > 0
+    assert artifact["storage_backend"] == "local"
+    assert artifact["object_key"].endswith(".pdf")
+    assert artifact["mime_type"] == "application/pdf"
+    assert artifact["file_path"].endswith(".pdf") and artifact["size_bytes"] > 0
+    assert Path(artifact["file_path"]).exists()
+    artifact_report = database.artifact_integrity_report()
+    assert artifact_report["ok"] is True
+    assert artifact_report["counts"]["checked"] == 1
+
+
+def test_artifact_integrity_report_flags_missing_objects(outputs, tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps({
+        "contact": {"full_name": "Asha Verma", "email": "asha@example.org"},
+        "summary": "Product manager.",
+        "skills": {"languages": ["Python"]},
+        "profile_hash": "profile-v1",
+    }), encoding="utf-8")
+    monkeypatch.setattr(settings, "profile_path", profile_path)
+
+    job = _job()
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    _write_artifacts(
+        outputs,
+        [job],
+        manifest=[{"job_id": "j1", "pdf_path": str(pdf), "validation_summary": "ok"}],
+    )
+    database = _db(tmp_path)
+    database.sync(outputs)
+    with database._connect() as conn:
+        conn.execute(database._sql(
+            "UPDATE resume_artifacts SET object_key = ?, file_path = ? WHERE job_id = ?"
+        ), ("missing/resume.pdf", str(outputs / "missing.pdf"), "j1"))
+
+    report = database.artifact_integrity_report()
+
+    assert report["ok"] is False
+    assert report["counts"]["missing"] == 1
+    assert report["failures"][0]["kind"] == "missing"
+
+
+def test_s3_artifact_store_put_and_get_with_prefix(monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.storage.artifacts import S3ArtifactStore
+
+    objects = {}
+    closed = {"value": False}
+
+    class FakeBody:
+        def __init__(self, data: bytes):
+            self.data = data
+
+        def read(self) -> bytes:
+            return self.data
+
+        def close(self) -> None:
+            closed["value"] = True
+
+    class FakeS3Client:
+        def put_object(self, **kwargs):
+            objects[(kwargs["Bucket"], kwargs["Key"])] = {
+                "Body": kwargs["Body"],
+                "ContentType": kwargs["ContentType"],
+            }
+
+        def get_object(self, **kwargs):
+            stored = objects[(kwargs["Bucket"], kwargs["Key"])]
+            return {"Body": FakeBody(stored["Body"])}
+
+    fake_boto3 = types.SimpleNamespace(client=lambda service, endpoint_url=None: FakeS3Client())
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(settings, "artifact_s3_bucket", "bucket")
+    monkeypatch.setattr(settings, "artifact_s3_prefix", "prefix")
+    monkeypatch.setattr(settings, "artifact_s3_endpoint_url", "https://s3.example.test")
+
+    store = S3ArtifactStore()
+    stored = store.put_bytes("candidate/resume.pdf", b"pdf-bytes", mime_type="application/pdf")
+
+    assert stored.backend == "s3"
+    assert stored.object_key == "prefix/candidate/resume.pdf"
+    assert stored.path is None
+    assert objects[("bucket", "prefix/candidate/resume.pdf")]["ContentType"] == "application/pdf"
+    assert store.get_bytes(stored.object_key) == b"pdf-bytes"
+    assert closed["value"] is True
+
+
+def test_s3_artifact_store_maps_missing_object_to_file_not_found(monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.storage.artifacts import S3ArtifactStore
+
+    class MissingObject(Exception):
+        response = {"Error": {"Code": "NoSuchKey"}}
+
+    class FakeS3Client:
+        def get_object(self, **kwargs):
+            raise MissingObject()
+
+    fake_boto3 = types.SimpleNamespace(client=lambda service, endpoint_url=None: FakeS3Client())
+    monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+    monkeypatch.setattr(settings, "artifact_s3_bucket", "bucket")
+    monkeypatch.setattr(settings, "artifact_s3_prefix", "")
+
+    store = S3ArtifactStore()
+
+    with pytest.raises(FileNotFoundError):
+        store.get_bytes("missing.pdf")
+
+
+def test_db_artifacts_verify_command(outputs, tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from job_agent.cli import cli
+    from job_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    monkeypatch.setattr(settings, "profile_path", tmp_path / "profile.json")
+    settings.profile_path.write_text(json.dumps({
+        "contact": {"full_name": "Asha Verma", "email": "asha@example.org"},
+        "summary": "Product manager.",
+        "skills": {"languages": ["Python"]},
+        "profile_hash": "profile-v1",
+    }), encoding="utf-8")
+    job = _job()
+    pdf = outputs / "tailored_resumes" / "resume_j1.pdf"
+    pdf.write_bytes(b"%PDF-1.4\nfixture\n%%EOF")
+    _write_artifacts(outputs, [job], manifest=[{"job_id": "j1", "pdf_path": str(pdf)}])
+    JobsDatabase().sync(outputs)
+
+    result = CliRunner().invoke(cli, ["db", "artifacts", "verify"])
+
+    assert result.exit_code == 0, result.output
+    assert "Artifact verification" in result.output
+    assert "Checked" in result.output
+
+
+def test_global_jobs_keep_lifecycle_separate_from_candidate_state(outputs, tmp_path):
+    job = _job()
+    evaluation = {"job": job.model_dump(), "evaluation": {"fit_score": 8.25}}
+    _write_artifacts(
+        outputs, [job], evaluated=[evaluation], qualified=[evaluation],
+        results={"successful": [], "failed": [{"job_id": "j1", "status": "skipped"}]},
+    )
+    database = _db(tmp_path)
+    database.sync(outputs)
+
+    with database._connect() as conn:
+        job_row = dict(conn.execute("SELECT status, is_active FROM jobs WHERE job_id = 'j1'").fetchone())
+        match_row = dict(conn.execute("SELECT state FROM job_matches WHERE job_id = 'j1'").fetchone())
+        app_row = dict(conn.execute("SELECT current_status FROM applications WHERE job_id = 'j1'").fetchone())
+
+    assert job_row == {"status": "active", "is_active": 1}
+    assert match_row["state"] == "manual_apply"
+    assert app_row["current_status"] == "manual_apply"
+    assert database.jobs()[0]["status"] == "manual_apply"
+    assert database.integrity_report()["checks"]["candidate_states_in_jobs_status"] == 0
+
+
+def test_multi_user_matches_and_applications_are_independent(tmp_path):
+    database = _db(tmp_path)
+    now = "2026-09-18T10:00:00Z"
+    with database._connect() as conn:
+        for email, score in (("asha@example.org", 9.1), ("nithya@example.org", 6.3)):
+            profile = {
+                "contact": {"full_name": email.split("@")[0].title(), "email": email},
+                "profile_hash": f"profile-{email}",
+            }
+            database._store_profile(conn, now, profile, email)
+        conn.execute(database._sql(_UPSERT_FOR_TEST), _job_upsert_values(now))
+        first = JobRecord(job=_job(), status="qualified", fit_score=9.1,
+                          evaluation={"fit_score": 9.1, "scoring_version": "v1", "profile_hash": "profile-asha"})
+        second = JobRecord(job=_job(), status="evaluated_rejected", fit_score=6.3,
+                           evaluation={"fit_score": 6.3, "scoring_version": "v1", "profile_hash": "profile-nithya"})
+        database._store_match(conn, first, "asha@example.org", now)
+        database._store_match(conn, second, "nithya@example.org", now)
+        database._store_application_current(conn, "asha@example.org", "j1", "applied",
+                                            {"channel": "greenhouse"}, now)
+        database._store_application_current(conn, "nithya@example.org", "j1", "manual_apply",
+                                            {"channel": "manual"}, now)
+        rows = [dict(row) for row in conn.execute(
+            "SELECT candidate_id, fit_score, state FROM job_matches ORDER BY candidate_id"
+        ).fetchall()]
+        apps = [dict(row) for row in conn.execute(
+            "SELECT candidate_id, current_status FROM applications ORDER BY candidate_id"
+        ).fetchall()]
+
+    assert rows == [
+        {"candidate_id": "asha@example.org", "fit_score": pytest.approx(9.1), "state": "qualified"},
+        {"candidate_id": "nithya@example.org", "fit_score": pytest.approx(6.3), "state": "evaluated_rejected"},
+    ]
+    assert apps == [
+        {"candidate_id": "asha@example.org", "current_status": "applied"},
+        {"candidate_id": "nithya@example.org", "current_status": "manual_apply"},
+    ]
+    assert database.jobs(candidate="asha@example.org")[0]["status"] == "applied"
+    assert database.jobs(candidate="asha@example.org")[0]["fit_score"] == pytest.approx(9.1)
+    assert database.jobs(candidate="nithya@example.org")[0]["status"] == "manual_apply"
+    assert database.jobs(candidate="nithya@example.org")[0]["fit_score"] == pytest.approx(6.3)
+
+
+def test_hosted_user_context_scopes_candidate_identity_for_same_email(tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+
+    database = _db(tmp_path)
+    now = "2026-09-18T10:00:00Z"
+    profile = {
+        "contact": {"full_name": "Shared Candidate", "email": "shared@example.org"},
+        "profile_hash": "profile-shared",
+    }
+    with database._connect() as conn:
+        monkeypatch.setattr(settings, "hosted_user_id", "host-a")
+        database._store_profile(conn, now, profile)
+        monkeypatch.setattr(settings, "hosted_user_id", "host-b")
+        database._store_profile(conn, now, profile)
+        rows = [dict(row) for row in conn.execute(
+            "SELECT candidate_id, user_id, email FROM candidate_profiles ORDER BY user_id"
+        ).fetchall()]
+        users = [dict(row) for row in conn.execute(
+            "SELECT user_id, email FROM users ORDER BY user_id"
+        ).fetchall()]
+
+    assert rows == [
+        {"candidate_id": "host-a__shared@example.org", "user_id": "host-a", "email": "shared@example.org"},
+        {"candidate_id": "host-b__shared@example.org", "user_id": "host-b", "email": "shared@example.org"},
+    ]
+    assert users == [
+        {"user_id": "host-a", "email": "shared@example.org"},
+        {"user_id": "host-b", "email": "shared@example.org"},
+    ]
+
+
+def test_application_status_changes_append_events(tmp_path):
+    database = _db(tmp_path)
+    now = "2026-09-18T10:00:00Z"
+    with database._connect() as conn:
+        database._store_profile(conn, now, {"contact": {"email": "asha@example.org"}}, "asha@example.org")
+        conn.execute(database._sql(_UPSERT_FOR_TEST), _job_upsert_values(now))
+        database._store_application_current(conn, "asha@example.org", "j1", "applied", {}, now)
+        database._store_application_current(conn, "asha@example.org", "j1", "interview", {},
+                                            "2026-09-19T10:00:00Z")
+        database._store_application_current(conn, "asha@example.org", "j1", "offer", {},
+                                            "2026-09-20T10:00:00Z")
+        app = dict(conn.execute("SELECT current_status FROM applications").fetchone())
+        events = [dict(row) for row in conn.execute(
+            "SELECT event_type, from_status, to_status FROM application_events ORDER BY created_at"
+        ).fetchall()]
+
+    assert app["current_status"] == "offer"
+    assert [event["to_status"] for event in events] == ["applied", "interview", "offer"]
+    assert events[1]["from_status"] == "applied"
 
 
 def test_the_run_history_is_recorded_phase_by_phase(tmp_path):
@@ -821,6 +1450,64 @@ def test_the_run_history_is_recorded_phase_by_phase(tmp_path):
     assert rows[0]["status"] == "ok" and rows[0]["duration_seconds"] == pytest.approx(720.5)
     assert json.loads(rows[0]["summary"])["found"] == 379
     assert rows[1]["status"] == "cancelled" and rows[1]["run_id"] == "r1"
+    events = database.run_events(run_id="r1")
+    assert {event["event_type"] for event in events} == {"phase_ok", "phase_cancelled"}
+    source = next(event for event in events if event["phase"] == "source")
+    assert source["success"] is True
+    assert source["latency_ms"] == 720500
+    assert source["metadata"]["summary"] == {"found": 379}
+
+
+def test_structured_run_events_are_append_only_and_queryable(tmp_path):
+    database = _db(tmp_path)
+    event_id = database.record_run_event(
+        run_id="r1",
+        candidate_id="asha@example.org",
+        job_id="j1",
+        phase="llm",
+        event_type="groq_complete",
+        success=True,
+        latency_ms=123,
+        metadata={"provider": "groq", "prompt_hash": "abc"},
+    )
+
+    rows = database.run_events(run_id="r1", phase="llm")
+
+    assert rows[0]["event_id"] == event_id
+    assert rows[0]["success"] is True
+    assert rows[0]["metadata"] == {"provider": "groq", "prompt_hash": "abc"}
+
+
+def test_db_runs_command_reads_database_run_history(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from job_agent.cli import cli
+    from job_agent.config.settings import settings
+
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path)
+    database = JobsDatabase()
+    database.save_run({
+        "run_id": "run-1",
+        "started_at": "2026-09-18T10:00:00Z",
+        "finished_at": "2026-09-18T10:05:00Z",
+        "status": "ok",
+        "candidate_name": "Asha Verma",
+        "candidate_key": "asha",
+        "dry_run": True,
+        "started_from": "cli",
+    })
+    database.link_run_jobs("run-1", ["j1", "j2"])
+    json_out = tmp_path / "runs.json"
+
+    result = CliRunner().invoke(cli, ["db", "runs", "--candidate", "asha", "--json-out", str(json_out)])
+
+    assert result.exit_code == 0, result.output
+    assert "run-1" in result.output
+    assert "ok" in result.output
+    exported = json.loads(json_out.read_text(encoding="utf-8"))
+    assert exported[0]["run_id"] == "run-1"
+    assert exported[0]["job_count"] == 2
 
 
 def test_a_cli_phase_records_itself_in_the_run_history(tmp_path, monkeypatch, outputs):
@@ -926,6 +1613,37 @@ def test_evaluate_cli_allows_database_fallback_when_scraped_artifact_is_missing(
     assert result.exit_code == 0, result.output
     assert called["jobs_path"] == outputs / "scraped_jobs.json"
     assert not called["jobs_path"].exists()
+
+
+def test_evaluation_output_writer_refreshes_database_state(monkeypatch, outputs):
+    from job_agent.config.settings import settings
+    from job_agent.evaluation.pipeline import SemanticEvaluationPipeline
+
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "outputs_dir", outputs)
+    job = _job()
+    _write_artifacts(outputs, [job])
+    evaluated = EvaluatedJob(
+        job=job,
+        evaluation=EvaluationScore(
+            embedding_similarity=0.72,
+            fit_score=8.4,
+            technical_score=8.0,
+            seniority_score=7.5,
+            threshold_used=7.0,
+            reasoning="Strong match.",
+            matching_skills=["product"],
+            missing_skills=[],
+            scored_by="heuristic",
+        ),
+    )
+
+    SemanticEvaluationPipeline._write_outputs(outputs, [evaluated], [evaluated])
+
+    rows = JobsDatabase().evaluated_jobs()
+    assert len(rows) == 1
+    assert rows[0].job.id == job.id
+    assert rows[0].evaluation.fit_score == pytest.approx(8.4)
 
 
 def test_status_cli_reports_database_sourced_jobs_when_scraped_artifact_is_missing(monkeypatch, outputs):

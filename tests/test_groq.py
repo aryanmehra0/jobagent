@@ -167,3 +167,32 @@ def test_a_score_is_labelled_with_the_model_that_actually_judged_it(monkeypatch,
     assert LLMReranker.evaluate_job(reranker, candidate_profile, job, 0.5).scored_by == "groq:openai/gpt-oss-20b"
     monkeypatch.setattr(llm, "_client", None)
     assert LLMReranker.evaluate_job(reranker, candidate_profile, job, 0.5).scored_by.startswith("groq:")
+
+
+def test_groq_complete_records_safe_llm_metadata(monkeypatch, tmp_path):
+    from job_agent import llm
+    from job_agent.config.settings import settings
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path)
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "groq_api_key", Settings(_env_file=None).groq_api_key)
+    monkeypatch.setattr(settings, "groq_api_keys", Settings(_env_file=None, GROQ_API_KEYS="one").groq_api_keys)
+    monkeypatch.setattr(settings, "groq_model", "test-model")
+    monkeypatch.setattr(settings, "groq_timeout", 45)
+    monkeypatch.setattr(settings, "groq_fallback_model", "")
+    session = Mock()
+    session.post.return_value = response(content='{"ok": true}')
+    monkeypatch.setattr(llm, "_client", GroqClient(["one"], "test-model", session=session))
+    monkeypatch.setattr(llm, "_configuration", (("one",), "test-model", 45, ""))
+
+    assert llm.groq_complete("System secret", "Candidate private prompt") == {"ok": True}
+
+    event = JobsDatabase().run_events(phase="llm", limit=1)[0]
+    assert event["event_type"] == "groq_complete"
+    assert event["success"] is True
+    assert event["metadata"]["provider"] == "groq"
+    assert event["metadata"]["model"] == "test-model"
+    assert "prompt_hash" in event["metadata"]
+    assert "response_hash" in event["metadata"]
+    assert "Candidate private prompt" not in json.dumps(event["metadata"])

@@ -226,12 +226,34 @@ def test_same_role_on_two_boards_is_kept_once_with_both_boards_contacts(tmp_path
     assert {c.email for c in kept[0].contacts} == {"talent@acme.com", "info@acme.com"}
 
 
+def test_same_title_company_in_different_cities_is_not_silently_merged(tmp_path):
+    scraper = _scraper(tmp_path)
+    london = _job(id="uk", location="London, England, United Kingdom", is_remote=False,
+                  job_url="https://careers.acme.com/jobs/pm-london")
+    bengaluru = _job(id="in", location="Bengaluru, Karnataka, India", is_remote=False,
+                     job_url="https://careers.acme.com/jobs/pm-bengaluru")
+
+    kept, duplicates = scraper._deduplicate([london, bengaluru])
+
+    assert duplicates == 0
+    assert {job.id for job in kept} == {"uk", "in"}
+
+
 def test_a_role_seen_in_an_earlier_run_is_not_new_on_another_board(tmp_path):
     store = DeltaStore(tmp_path / "d.db")
     store.mark_many_seen([_job(id="li")])
     repost = _job(id="in", job_url="https://in.indeed.com/viewjob?jk=9", source="indeed")
     other = _job(id="x", title="Data Analyst", job_url="https://in.indeed.com/viewjob?jk=10")
     assert [job.id for job in store.filter_unseen([repost, other])] == ["x"]
+
+
+def test_seen_same_title_company_in_different_city_is_still_new(tmp_path):
+    store = DeltaStore(tmp_path / "d.db")
+    store.mark_many_seen([_job(id="uk", location="London, England, United Kingdom", is_remote=False)])
+    bengaluru = _job(id="in", location="Bengaluru, Karnataka, India", is_remote=False,
+                     job_url="https://in.indeed.com/viewjob?jk=99")
+
+    assert [job.id for job in store.filter_unseen([bengaluru])] == ["in"]
 
 
 def test_older_databases_are_migrated_with_fingerprints(tmp_path):

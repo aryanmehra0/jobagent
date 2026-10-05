@@ -90,7 +90,24 @@ class Settings(BaseSettings):
     hunter_api_key: SecretStr = Field(default=SecretStr(""), validation_alias="HUNTER_API_KEY", repr=False)
 
     # --- Hosted / database configuration ---
+    app_environment: str = Field(default="local", validation_alias="JOB_AGENT_ENVIRONMENT")
+    require_database_url: bool = Field(default=False, validation_alias="JOB_AGENT_REQUIRE_DATABASE_URL")
     database_url: Optional[str] = Field(default=None, validation_alias="DATABASE_URL")
+    artifact_storage_backend: str = Field(default="local", validation_alias="ARTIFACT_STORAGE_BACKEND")
+    artifact_storage_dir: Path = Field(default=BASE_DIR / "data" / "artifacts", validation_alias="ARTIFACT_STORAGE_DIR")
+    artifact_s3_bucket: Optional[str] = Field(default=None, validation_alias="ARTIFACT_S3_BUCKET")
+    artifact_s3_prefix: str = Field(default="job-agent", validation_alias="ARTIFACT_S3_PREFIX")
+    artifact_s3_endpoint_url: Optional[str] = Field(default=None, validation_alias="ARTIFACT_S3_ENDPOINT_URL")
+    hosted_api_allowed_origins: Optional[str] = Field(default=None, validation_alias="HOSTED_API_ALLOWED_ORIGINS")
+    hosted_api_rate_limit_per_minute: int = Field(
+        default=120, ge=1, le=10_000, validation_alias="HOSTED_API_RATE_LIMIT_PER_MINUTE"
+    )
+    hosted_user_id: Optional[str] = Field(default=None, validation_alias="JOB_AGENT_HOSTED_USER_ID")
+    hosted_worker_isolation_mode: str = Field(
+        default="workspace",
+        validation_alias="HOSTED_WORKER_ISOLATION_MODE",
+        description="Hosted worker isolation boundary: workspace for local smoke tests, container for public live apply.",
+    )
 
     # --- Semantic evaluation ---
     semantic_embedding_model: str = Field(
@@ -131,20 +148,27 @@ class Settings(BaseSettings):
 
     # --- Core directories and paths ---
     base_dir: Path = BASE_DIR
-    data_dir: Path = BASE_DIR / "data"
-    raw_resumes_dir: Path = BASE_DIR / "data" / "raw_resumes"
-    profiles_dir: Path = BASE_DIR / "data" / "profiles"
-    browser_profile_dir: Path = BASE_DIR / "data" / "browser_profile"
-    outputs_dir: Path = BASE_DIR / "data" / "outputs"
-    templates_dir: Path = BASE_DIR / "templates"
+    data_dir: Path = Field(default=BASE_DIR / "data", validation_alias="JOB_AGENT_DATA_DIR")
+    raw_resumes_dir: Path = Field(default=BASE_DIR / "data" / "raw_resumes", validation_alias="JOB_AGENT_RAW_RESUMES_DIR")
+    profiles_dir: Path = Field(default=BASE_DIR / "data" / "profiles", validation_alias="JOB_AGENT_PROFILES_DIR")
+    browser_profile_dir: Path = Field(
+        default=BASE_DIR / "data" / "browser_profile", validation_alias="JOB_AGENT_BROWSER_PROFILE_DIR"
+    )
+    outputs_dir: Path = Field(default=BASE_DIR / "data" / "outputs", validation_alias="JOB_AGENT_OUTPUTS_DIR")
+    templates_dir: Path = Field(default=BASE_DIR / "templates", validation_alias="JOB_AGENT_TEMPLATES_DIR")
 
-    profile_path: Path = BASE_DIR / "data" / "profiles" / "profile.json"
+    profile_path: Path = Field(
+        default=BASE_DIR / "data" / "profiles" / "profile.json", validation_alias="JOB_AGENT_PROFILE_PATH"
+    )
     searches_path: Path = (
         BASE_DIR / "config" / "searches.yaml"
         if (BASE_DIR / "config" / "searches.yaml").exists()
         else BASE_DIR / "searches.yaml"
     )
-    tracker_path: Path = BASE_DIR / "data" / "outputs" / "applications_tracker.xlsx"
+    tracker_path: Path = Field(
+        default=BASE_DIR / "data" / "outputs" / "applications_tracker.xlsx",
+        validation_alias="JOB_AGENT_TRACKER_PATH",
+    )
 
     @field_validator("default_llm_provider", mode="before")
     @classmethod
@@ -197,6 +221,36 @@ class Settings(BaseSettings):
         text = str(value or "").strip()
         return text or None
 
+    @field_validator("hosted_api_allowed_origins", mode="before")
+    @classmethod
+    def _blank_empty_origins(cls, value: object) -> Optional[str]:
+        text = str(value or "").strip()
+        return text or None
+
+    @field_validator("app_environment", mode="before")
+    @classmethod
+    def _validate_environment(cls, value: object) -> str:
+        env = str(value or "local").strip().lower()
+        if env not in {"local", "test", "staging", "production"}:
+            raise ValueError("JOB_AGENT_ENVIRONMENT must be local, test, staging, or production.")
+        return env
+
+    @field_validator("artifact_storage_backend", mode="before")
+    @classmethod
+    def _validate_artifact_backend(cls, value: object) -> str:
+        backend = str(value or "local").strip().lower()
+        if backend not in {"local", "s3"}:
+            raise ValueError("ARTIFACT_STORAGE_BACKEND must be 'local' or 's3'.")
+        return backend
+
+    @field_validator("hosted_worker_isolation_mode", mode="before")
+    @classmethod
+    def _validate_hosted_worker_isolation(cls, value: object) -> str:
+        mode = str(value or "workspace").strip().lower()
+        if mode not in {"workspace", "container"}:
+            raise ValueError("HOSTED_WORKER_ISOLATION_MODE must be 'workspace' or 'container'.")
+        return mode
+
     @field_validator("openai_compatible_base_url", mode="before")
     @classmethod
     def _blank_empty_base_url(cls, value: object) -> Optional[str]:
@@ -241,6 +295,16 @@ class Settings(BaseSettings):
             return "openai_compatible"
         return "none"
 
+    @property
+    def postgres_required(self) -> bool:
+        return self.require_database_url or self.app_environment in {"staging", "production"}
+
+    @property
+    def hosted_allowed_origins(self) -> set[str]:
+        if not self.hosted_api_allowed_origins:
+            return set()
+        return {origin.strip().rstrip("/") for origin in self.hosted_api_allowed_origins.split(",") if origin.strip()}
+
     def ensure_directories(self) -> None:
         """Create the directories the pipeline writes into."""
         for path in (
@@ -249,6 +313,7 @@ class Settings(BaseSettings):
             self.profiles_dir,
             self.browser_profile_dir,
             self.outputs_dir,
+            self.artifact_storage_dir,
             self.templates_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)

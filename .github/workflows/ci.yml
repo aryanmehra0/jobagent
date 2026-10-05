@@ -21,6 +21,22 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: job_agent
+          POSTGRES_PASSWORD: job_agent_test
+          POSTGRES_DB: job_agent_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U job_agent -d job_agent_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      JOB_AGENT_POSTGRES_TEST_URL: postgresql://job_agent:job_agent_test@localhost:5432/job_agent_test
     steps:
       - uses: actions/checkout@v6
         with:

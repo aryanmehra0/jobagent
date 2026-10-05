@@ -44,6 +44,23 @@ def test_repeat_search_keeps_latest_csv_without_repeating_processing(monkeypatch
     assert json.loads((out / "source_coverage.json").read_text())["previously_seen"] == 1
 
 
+def test_sourcing_pipeline_refreshes_database_state(monkeypatch, tmp_path):
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    out = settings.outputs_dir
+    scraper = OmnichannelScraper(SearchParameters(target_domains=["AI Engineer"], job_boards=["indeed"],
+                                                find_contacts=False), delta_store=DeltaStore(tmp_path / "delta.db"))
+    monkeypatch.setattr(scraper, "scrape_job_boards", lambda: [posting()])
+
+    sourced = scraper.run_sourcing_pipeline(include_ats_direct=False)
+
+    assert [job.id for job in sourced] == ["fresh"]
+    jobs = JobsDatabase().source_jobs()
+    assert len(jobs) == 1
+    assert jobs[0].id == "fresh"
+    assert (out / "scraped_jobs.json").is_file()
+
+
 def test_all_sources_blocked_does_not_report_success(monkeypatch, tmp_path):
     scraper = OmnichannelScraper(SearchParameters(target_domains=["AI Engineer"], job_boards=["indeed"],
                                                 find_contacts=False), delta_store=DeltaStore(tmp_path / "delta.db"))
@@ -355,6 +372,81 @@ def test_cli_performance_reports_slow_phases(tmp_path):
     report = json.loads((settings.outputs_dir / "performance_report.json").read_text(encoding="utf-8"))
     evaluate = next(item for item in report["phase_stats"] if item["phase"] == "evaluate")
     assert evaluate["slow"] is True
+
+
+def test_production_check_reports_database_and_storage_state(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+    from job_agent.cli import cli
+
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path / "outputs")
+    monkeypatch.setattr(settings, "profile_path", tmp_path / "profiles" / "profile.json")
+    monkeypatch.setattr(settings, "searches_path", tmp_path / "searches.yaml")
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "app_environment", "local")
+
+    result = CliRunner().invoke(cli, ["production-check"])
+
+    assert result.exit_code == 1
+    assert "DB migrations" in result.output
+    assert "DB integrity" in result.output
+    assert "Hosted queue" in result.output
+    assert "Artifact storage" in result.output
+    assert "Postgres CI" in result.output
+
+
+def test_production_check_flags_missing_postgres_for_production(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+    from job_agent.cli import cli
+
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path / "outputs")
+    monkeypatch.setattr(settings, "profile_path", tmp_path / "profiles" / "profile.json")
+    monkeypatch.setattr(settings, "searches_path", tmp_path / "searches.yaml")
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "app_environment", "production")
+
+    result = CliRunner().invoke(cli, ["production-check"])
+
+    assert result.exit_code == 1
+    assert "Postgres required" in result.output
+    assert "Database" in result.output
+
+
+def test_production_check_flags_live_apply_without_container_isolation(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+    from job_agent.cli import cli
+
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path / "outputs")
+    monkeypatch.setattr(settings, "profile_path", tmp_path / "profiles" / "profile.json")
+    monkeypatch.setattr(settings, "searches_path", tmp_path / "searches.yaml")
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "app_environment", "production")
+    monkeypatch.setattr(settings, "hosted_worker_isolation_mode", "workspace")
+    monkeypatch.setenv("HOSTED_WORKER_ALLOW_LIVE_APPLY", "1")
+
+    result = CliRunner().invoke(cli, ["production-check"])
+
+    assert result.exit_code == 1
+    assert "live_apply=on" in result.output
+    assert "isolation=workspace" in result.output
+
+
+def test_production_check_flags_local_artifacts_in_production(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+    from job_agent.cli import cli
+
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path / "outputs")
+    monkeypatch.setattr(settings, "profile_path", tmp_path / "profiles" / "profile.json")
+    monkeypatch.setattr(settings, "searches_path", tmp_path / "searches.yaml")
+    monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "app_environment", "production")
+    monkeypatch.setattr(settings, "artifact_storage_backend", "local")
+    monkeypatch.setattr(settings, "artifact_storage_dir", tmp_path / "artifacts")
+
+    result = CliRunner().invoke(cli, ["production-check"])
+
+    assert result.exit_code == 1
+    assert "local:" in result.output
+    assert "ARTIFACT_STORAGE_BACKEND=s3" in result.output
 
 
 def test_cli_repair_enriches_saved_descriptions_and_reruns_downstream(monkeypatch, tmp_path, candidate_profile):

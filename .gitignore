@@ -6,6 +6,7 @@ data/outputs/
 data/*.log
 data/profiles/
 data/browser_profile/
+data/hosted_workspaces/
 data/proxies.txt
 
 # Candidate documents (personal data; do not commit)

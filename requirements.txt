@@ -30,6 +30,8 @@ python-jobspy>=1.1.50
 pandas>=2.0.0                   # JobSpy returns DataFrames; used directly by the normalizer
 requests>=2.31.0
 beautifulsoup4>=4.12.0         # Public listing descriptions after deduplication
+fastapi>=0.115.0               # Production hosted API framework with OpenAPI schemas
+uvicorn>=0.30.0                # ASGI server for the hosted API
 psycopg[binary]>=3.2.0               # Optional Postgres backend for hosted queue deployments
 psycopg-pool>=3.2.0                  # Reuses Postgres connections for the jobs DB/backend
 
@@ -51,4 +53,5 @@ openpyxl>=3.1.2
 
 # --- Testing ---
 pytest>=8.2.0
+httpx>=0.27.0                   # FastAPI TestClient transport
 reportlab>=4.1.0                # Generates the sample resume PDF used by the tests

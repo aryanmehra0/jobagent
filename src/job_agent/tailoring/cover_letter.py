@@ -50,4 +50,16 @@ def generate(profile, job, *, country=None, use_llm=True):
                 if i.get('profile_hash') == profile.profile_hash}
     manifest[job.id] = record
     write_json(folder/'manifest.json', list(manifest.values()))
+    try:
+        from job_agent.storage.jobs_db import JobsDatabase
+
+        database = JobsDatabase()
+        database.sync(settings.outputs_dir)
+        database.store_cover_letter_artifacts(settings.outputs_dir)
+    except Exception as exc:
+        # The generated letter is still usable; production checks will surface
+        # any database sync problem.
+        from rich.console import Console
+
+        Console().print(f"[yellow]Cover letter was saved, but database sync failed: {exc}[/yellow]")
     return record

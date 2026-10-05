@@ -526,6 +526,7 @@ class OmnichannelScraper:
         then the fuller description — with the others' emails merged into it.
         """
         from job_agent.automation.routing import route_application
+        from job_agent.sourcing.delta_store import DeltaStore
 
         def usefulness(job: JobPosting):
             return (route_application(job).automatable, bool(job.contacts), len(job.description))
@@ -533,7 +534,7 @@ class OmnichannelScraper:
         groups: Dict[str, List[JobPosting]] = {}
         key_of: Dict[str, str] = {}
         for job in jobs:
-            key = key_of.get(job.id) or job.fingerprint()
+            key = key_of.get(job.id) or DeltaStore.processing_fingerprint(job)
             key_of[job.id] = key
             groups.setdefault(key, []).append(job)
 
@@ -727,6 +728,12 @@ class OmnichannelScraper:
         (target_output.parent / "source_coverage.json").write_text(json.dumps(coverage, indent=2), encoding="utf-8")
         if unseen or backlog:
             invalidate_after("source", target_output.parent)
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            JobsDatabase().sync(target_output.parent)
+        except Exception as exc:
+            console.print(f"[yellow]Sourcing artifacts were saved, but database sync failed: {exc}[/yellow]")
         console.print(f"[bold green]Sourced jobs written to:[/bold green] [yellow]{target_output}[/yellow]\n")
 
         return unseen + backlog

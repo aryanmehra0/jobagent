@@ -23,6 +23,16 @@ def isolate_llm_settings(monkeypatch, tmp_path):
     # a configured DATABASE_URL would send tests to the operator's real database, and a
     # tuned MIN_MATCH_SCORE / TIER1_THRESHOLD / TAILORING_MODE changes what "qualifies".
     monkeypatch.setattr(settings, "database_url", None)
+    monkeypatch.setattr(settings, "app_environment", "local")
+    monkeypatch.setattr(settings, "require_database_url", False)
+    monkeypatch.setattr(settings, "artifact_storage_backend", "local")
+    monkeypatch.setattr(settings, "artifact_storage_dir", tmp_path / "artifacts")
+    monkeypatch.setattr(settings, "artifact_s3_bucket", None)
+    monkeypatch.setattr(settings, "artifact_s3_prefix", "job-agent")
+    monkeypatch.setattr(settings, "artifact_s3_endpoint_url", None)
+    monkeypatch.setattr(settings, "hosted_api_allowed_origins", None)
+    monkeypatch.setattr(settings, "hosted_api_rate_limit_per_minute", 120)
+    monkeypatch.setattr(settings, "hosted_user_id", None)
     monkeypatch.setattr(settings, "min_match_score", 7.0)
     monkeypatch.setattr(settings, "tier1_threshold", None)
     monkeypatch.setattr(settings, "tailoring_mode", "auto")

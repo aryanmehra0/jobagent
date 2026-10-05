@@ -8,6 +8,7 @@ chained together with `run-pipeline`.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 # Ensure UTF-8 console output on Windows before anything prints.
@@ -193,6 +194,145 @@ def db_audit_command(json_out) -> None:
     )
     if not report["ok"]:
         _fail("Audit found mismatches.", f"Review {target}")
+
+
+@db_group.command("integrity")
+@click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Optional path to write the integrity JSON.")
+def db_integrity_command(json_out) -> None:
+    """Run read-only database integrity checks for staging/operations."""
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    try:
+        report = JobsDatabase().integrity_report()
+    except Exception as exc:
+        _fail(f"Database integrity check failed: {exc}")
+    if json_out:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    console.print(f"[bold cyan]Database integrity[/bold cyan] ({report['backend']}): {report['location']}\n")
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Check", style="cyan")
+    table.add_column("Count", justify="right")
+    for name, count in report["checks"].items():
+        style = "green" if count == 0 else "red"
+        table.add_row(name.replace("_", " ").title(), f"[{style}]{count}[/{style}]")
+    console.print(table)
+    if not report["ok"]:
+        _fail("Database integrity checks failed.")
+
+
+@db_group.command("events")
+@click.option("--run-id", help="Only events for this run id.")
+@click.option("--phase", help="Only events for this phase, e.g. llm or evaluate.")
+@click.option("--limit", "-n", type=click.IntRange(1), default=25)
+def db_events_command(run_id, phase, limit) -> None:
+    """Show recent structured run/LLM events."""
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    try:
+        rows = JobsDatabase().run_events(run_id=run_id, phase=phase, limit=limit)
+    except Exception as exc:
+        _fail(f"Could not read run events: {exc}")
+    if not rows:
+        console.print("[yellow]No run events matched.[/yellow]")
+        return
+    table = Table(show_header=True, header_style="bold magenta")
+    for column in ("Time", "Phase", "Event", "OK", "Latency", "Error"):
+        table.add_column(column, overflow="fold")
+    for row in rows:
+        table.add_row(
+            str(row.get("created_at") or ""),
+            str(row.get("phase") or ""),
+            str(row.get("event_type") or ""),
+            "-" if row.get("success") is None else ("yes" if row["success"] else "no"),
+            "-" if row.get("latency_ms") is None else f"{row['latency_ms']} ms",
+            str(row.get("error_code") or ""),
+        )
+    console.print(table)
+
+
+@db_group.command("runs")
+@click.option("--candidate", help="Only runs for this candidate key/name.")
+@click.option("--limit", "-n", type=click.IntRange(1), default=25)
+@click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Optional path to write the run history JSON.")
+def db_runs_command(candidate, limit, json_out) -> None:
+    """Show database-backed pipeline run history."""
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    try:
+        rows = JobsDatabase().list_runs(limit=limit, candidate=candidate)
+    except Exception as exc:
+        _fail(f"Could not read run history: {exc}")
+    if json_out:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(json.dumps(rows, indent=2, default=str), encoding="utf-8")
+    if not rows:
+        console.print("[yellow]No runs matched.[/yellow]")
+        return
+    table = Table(show_header=True, header_style="bold magenta")
+    for column in ("Run", "Status", "Started", "Finished", "Source", "Dry Run", "Jobs"):
+        table.add_column(column, overflow="fold")
+    for row in rows:
+        table.add_row(
+            str(row.get("run_id") or ""),
+            str(row.get("status") or ""),
+            str(row.get("started_at") or ""),
+            str(row.get("finished_at") or ""),
+            str(row.get("started_from") or ""),
+            "-" if row.get("dry_run") is None else ("yes" if row["dry_run"] else "no"),
+            str(row.get("job_count") or 0),
+        )
+    console.print(table)
+
+
+@db_group.group("artifacts")
+def db_artifacts_group() -> None:
+    """Verify stored artifact metadata and bytes."""
+
+
+@db_artifacts_group.command("verify")
+@click.option("--limit", "-n", type=click.IntRange(1), default=None,
+              help="Only verify the newest N artifact rows.")
+@click.option("--json-out", type=click.Path(dir_okay=False, path_type=Path), default=None,
+              help="Optional path to write the verification JSON.")
+def db_artifacts_verify_command(limit, json_out) -> None:
+    """Check resume artifact object existence, size, and SHA-256 hashes."""
+    from job_agent.storage.jobs_db import JobsDatabase
+
+    try:
+        report = JobsDatabase().artifact_integrity_report(limit=limit)
+    except Exception as exc:
+        _fail(f"Artifact verification failed: {exc}")
+    if json_out:
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        json_out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    console.print(f"[bold cyan]Artifact verification[/bold cyan] ({report['backend']}): {report['location']}\n")
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Check", style="cyan")
+    table.add_column("Count", justify="right")
+    for name, count in report["counts"].items():
+        style = "green" if name == "checked" or count == 0 else "red"
+        table.add_row(name.replace("_", " ").title(), f"[{style}]{count}[/{style}]")
+    console.print(table)
+    if report["failures"]:
+        failures = Table(title="Artifact failures", show_header=True, header_style="bold red")
+        for column in ("Artifact", "Candidate", "Job", "Kind", "Detail"):
+            failures.add_column(column, overflow="fold")
+        for failure in report["failures"]:
+            failures.add_row(
+                str(failure.get("artifact_id") or ""),
+                str(failure.get("candidate_id") or ""),
+                str(failure.get("job_id") or ""),
+                str(failure.get("kind") or ""),
+                str(failure.get("detail") or ""),
+            )
+        console.print(failures)
+    if not report["ok"]:
+        _fail("Artifact verification checks failed.")
 
 
 @db_group.command("jobs")
@@ -1269,6 +1409,64 @@ def production_check_command() -> None:
 
     add("LLM provider", settings.active_provider != "none", settings.active_provider,
         "Optional: set DEFAULT_LLM_PROVIDER=groq and GROQ_API_KEYS for better scoring and emails.")
+    add("Environment", settings.app_environment in {"local", "test", "staging", "production"},
+        settings.app_environment, "Set JOB_AGENT_ENVIRONMENT to local, test, staging, or production.")
+    if settings.postgres_required:
+        add("Postgres required", bool(settings.database_url), _mask_database_url(settings.database_url or ""),
+            "Set DATABASE_URL for staging/production.")
+    if settings.database_url:
+        add("Postgres configured", True, _mask_database_url(settings.database_url), "")
+    else:
+        add("Local SQLite mode", not settings.postgres_required, "DATABASE_URL unset",
+            "Set DATABASE_URL before staging/production use.")
+    try:
+        from job_agent.storage.jobs_db import JobsDatabase
+
+        database = JobsDatabase()
+        migrations = database.migrations()
+        add("DB migrations", all(row["applied"] for row in migrations),
+            f"{sum(1 for row in migrations if row['applied'])}/{len(migrations)} applied",
+            "Run: python main.py db migrations")
+        integrity = database.integrity_report()
+        bad = {key: value for key, value in integrity["checks"].items() if value}
+        add("DB integrity", integrity["ok"],
+            "all counts 0" if integrity["ok"] else ", ".join(f"{k}={v}" for k, v in bad.items()),
+            "Run: python main.py db integrity")
+    except Exception as exc:
+        add("Database", False, str(exc), "Fix DATABASE_URL or run: python main.py db migrations")
+    try:
+        from job_agent.hosted.queue import HostedQueue
+
+        queue = HostedQueue()
+        counts = queue.counts()
+        add("Hosted queue", True, f"{queue.backend}: " + (", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "empty"), "")
+    except Exception as exc:
+        add("Hosted queue", False, str(exc), "Run: python main.py db-check")
+    if settings.artifact_storage_backend == "s3":
+        add("Artifact storage", bool(settings.artifact_s3_bucket),
+            f"s3 bucket={settings.artifact_s3_bucket or 'missing'}",
+            "Set ARTIFACT_S3_BUCKET and object-storage credentials.")
+    else:
+        durable_local_ok = settings.app_environment not in {"staging", "production"}
+        add("Artifact storage", durable_local_ok, f"local: {settings.artifact_storage_dir}",
+            "Set ARTIFACT_STORAGE_BACKEND=s3 and ARTIFACT_S3_BUCKET for staging/production.")
+    try:
+        from job_agent.storage.jobs_db import JobsDatabase
+
+        artifact_report = JobsDatabase().artifact_integrity_report(limit=10)
+        checked = artifact_report["counts"]["checked"]
+        add("Artifact verification", artifact_report["ok"],
+            f"checked={checked}" if artifact_report["ok"] else str(artifact_report["counts"]),
+            "Run: python main.py db artifacts verify")
+    except Exception as exc:
+        add("Artifact verification", False, str(exc), "Run: python main.py db artifacts verify")
+    ci = settings.base_dir / ".github" / "workflows" / "ci.yml"
+    try:
+        ci_text = ci.read_text(encoding="utf-8")
+    except OSError:
+        ci_text = ""
+    add("Postgres CI", "JOB_AGENT_POSTGRES_TEST_URL" in ci_text and "postgres:" in ci_text,
+        str(ci), "Keep a Postgres service in CI so integration tests do not skip.")
     add("Typst", shutil.which("typst") is not None or _module_exists("typst"), "Needed for ATS PDFs.",
         "Install requirements, or install the Typst binary.")
     add("Chromium", _chromium_installed(), "Needed for browser apply mode.",
@@ -1277,10 +1475,36 @@ def production_check_command() -> None:
         "Keep Dockerfile in the repository.")
     add("Local compose", (settings.base_dir / "docker-compose.yml").exists(), "Personal CLI deployment.",
         "Keep docker-compose.yml in the repository.")
-    add("Hosted compose", (settings.base_dir / "docker-compose.hosted.yml").exists(), "API + worker reference deployment.",
+    hosted_compose = settings.base_dir / "docker-compose.hosted.yml"
+    try:
+        hosted_compose_text = hosted_compose.read_text(encoding="utf-8")
+    except OSError:
+        hosted_compose_text = ""
+    add("Hosted compose", hosted_compose.exists(), "API + worker reference deployment.",
         "Keep docker-compose.hosted.yml in the repository.")
-    add("Hosted env example", (settings.base_dir / "config" / "hosted.example.env").exists(),
+    add("Hosted API framework", _module_exists("fastapi") and "job_agent.hosted.fastapi_app:app" in hosted_compose_text,
+        "FastAPI/uvicorn public control plane.",
+        "Install FastAPI and run hosted compose with job_agent.hosted.fastapi_app:app.")
+    hosted_env = settings.base_dir / "config" / "hosted.example.env"
+    try:
+        hosted_env_text = hosted_env.read_text(encoding="utf-8")
+    except OSError:
+        hosted_env_text = ""
+    add("Hosted env example", hosted_env.exists(),
         "Documented hosted environment variables.", "Keep config/hosted.example.env in the repository.")
+    add("Hosted worker isolation", "HOSTED_WORKER_WORKSPACE_DIR" in hosted_env_text and "HOSTED_WORKER_ALLOW_LIVE_APPLY" in hosted_env_text,
+        "Per-user worker workspace and live-apply gate documented.",
+        "Document HOSTED_WORKER_WORKSPACE_DIR and HOSTED_WORKER_ALLOW_LIVE_APPLY.")
+    live_apply_enabled = os.environ.get("HOSTED_WORKER_ALLOW_LIVE_APPLY") == "1"
+    isolation_mode = settings.hosted_worker_isolation_mode
+    live_apply_ok = (
+        not live_apply_enabled
+        or settings.app_environment not in {"staging", "production"}
+        or isolation_mode == "container"
+    )
+    add("Live apply isolation", live_apply_ok,
+        f"live_apply={'on' if live_apply_enabled else 'off'}, isolation={isolation_mode}",
+        "Set HOSTED_WORKER_ISOLATION_MODE=container before production live apply.")
     add("Deployment guide", (settings.base_dir / "docs" / "DEPLOYMENT.md").exists(), "Hosting and scale instructions.",
         "Keep docs/DEPLOYMENT.md in the repository.")
 
@@ -1296,7 +1520,11 @@ def production_check_command() -> None:
             item["detail"],
             "" if item["ok"] else item["fix"],
         )
-    console.print(table)
+    # A narrow/non-tty console (CI runners, test harnesses) makes Rich truncate
+    # Detail/Next step cells with an ellipsis, silently dropping the actionable
+    # text (e.g. "ARTIFACT_STORAGE_BACKEND=s3"). This is a diagnostic report,
+    # not an interactive view, so render it wide regardless of terminal size.
+    Console(width=200).print(table)
 
     blockers = [item for item in checks if not item["ok"] and item["name"] not in {"LLM provider"}]
     if blockers:
@@ -1326,6 +1554,61 @@ def db_check_command() -> None:
         table.add_row("Table", "hosted_runs")
     table.add_row("Queue counts", ", ".join(f"{k}: {v}" for k, v in sorted(counts.items())) or "empty")
     console.print(table)
+
+
+@cli.group("queue")
+def queue_group() -> None:
+    """Inspect and recover hosted background work."""
+
+
+@queue_group.command("status")
+@click.option("--status", "status_filter", help="Only show this queue status.")
+@click.option("--limit", "-n", type=click.IntRange(1), default=20)
+def queue_status_command(status_filter, limit) -> None:
+    """Show queue counts and recent hosted runs."""
+    from job_agent.hosted.queue import HostedQueue
+
+    try:
+        queue = HostedQueue()
+        counts = queue.counts()
+        runs = queue.list_runs(status=status_filter, limit=limit)
+    except Exception as exc:
+        _fail(f"Queue status failed: {exc}")
+
+    console.print(f"[bold cyan]Hosted queue[/bold cyan] ({queue.backend})")
+    console.print(", ".join(f"{key}: {value}" for key, value in sorted(counts.items())) or "empty")
+    if not runs:
+        console.print("[yellow]No queued runs matched.[/yellow]")
+        return
+    table = Table(show_header=True, header_style="bold magenta")
+    for column in ("ID", "User", "Status", "Attempts", "Heartbeat", "Updated", "Error"):
+        table.add_column(column, overflow="fold")
+    for run in runs:
+        table.add_row(
+            str(run.id),
+            run.user_id,
+            run.status,
+            f"{run.attempts}/{run.max_attempts}",
+            run.heartbeat_at or "-",
+            run.updated_at,
+            (run.error or "")[:80],
+        )
+    console.print(table)
+
+
+@queue_group.command("recover-stale")
+@click.option("--older-than", type=click.FloatRange(min=1.0), default=300.0, show_default=True,
+              help="Recover running jobs whose heartbeat is older than this many seconds.")
+def queue_recover_stale_command(older_than) -> None:
+    """Move abandoned running queue rows to retryable/failed."""
+    from job_agent.hosted.queue import HostedQueue
+
+    try:
+        queue = HostedQueue()
+        recovered = queue.recover_stale(older_than_seconds=older_than)
+    except Exception as exc:
+        _fail(f"Queue recovery failed: {exc}")
+    console.print(f"[bold green]Recovered[/bold green] {recovered} stale hosted run(s).")
 
 
 @cli.command("status")

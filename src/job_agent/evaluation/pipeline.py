@@ -344,7 +344,7 @@ class SemanticEvaluationPipeline:
         evaluated_all: List[EvaluatedJob],
         qualified: List[EvaluatedJob],
     ) -> None:
-        """Persist the full evaluation and the qualified subset."""
+        """Persist evaluation outputs and immediately refresh normalized DB state."""
         out_dir.mkdir(parents=True, exist_ok=True)
         invalidate_after("evaluate", out_dir)
         (out_dir / "evaluated_jobs.json").write_text(
@@ -353,6 +353,13 @@ class SemanticEvaluationPipeline:
         (out_dir / "qualified_jobs.json").write_text(
             json.dumps([item.model_dump() for item in qualified], indent=2), encoding="utf-8"
         )
+        if evaluated_all:
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                JobsDatabase().sync(out_dir)
+            except Exception as exc:
+                console.print(f"[yellow]Evaluation artifacts were saved, but database sync failed: {exc}[/yellow]")
 
     @staticmethod
     def _render_summary(

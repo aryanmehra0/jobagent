@@ -105,7 +105,7 @@ the dashboard. **No LangChain. No LangGraph.** A failed phase ends the run
 | Browser automation | Playwright |
 | PDF generation | Typst |
 | Scheduling | None in-process; external (Windows Task Scheduler) for `daily` |
-| Background worker | `hosted/worker.py` exists but is a stub, not wired in |
+| Background worker | `hosted/worker.py` claims queue rows; validation is default, subprocess execution is opt-in |
 
 ## Important DB tables (`jobs.db`)
 
@@ -120,18 +120,18 @@ plus legacy `job_resumes`/`job_evaluations`/`job_applications`. View:
 Not a public REST API — a loopback-only dashboard server
 (`web/server.py`): `/api/state`, `/api/events` (SSE), `/api/run`,
 `/api/jobs`, `/api/runs`, `/api/analytics`, plus upload/config POST routes.
-A separate, **unwired** hosted scaffold (`hosted/api.py`) exists for a
-possible future multi-tenant deployment: `/health`, `/jobs`, `POST /runs`
-(enqueue only — the paired `hosted/worker.py` doesn't actually execute runs
-yet).
+A separate hosted FastAPI control plane (`hosted/fastapi_app.py`) exists for
+the multi-user path: `/health`, `/ready`, `/openapi.json`, `/v1/jobs`, and
+`POST /v1/runs` (enqueue plus worker execution when
+`HOSTED_WORKER_EXECUTE=1`; live apply still has a separate worker-only gate).
 
 ## What's real vs. not
 
 | | |
 | --- | --- |
 | **Real, tested** | 7-phase pipeline, 4 anti-hallucination gates, 1 bounded agent, dashboard, DB sync, Excel/ZIP export, opt-in IMAP reply tracking, deterministic warm-contact discovery |
-| **Stub / not wired in** | `hosted/worker.py` (queue consumer that doesn't execute), production-grade queue (Redis et al. — named as a future option, not in use) |
-| **Not present at all** | Frontend framework, REST API framework, LangChain, LangGraph, ORM, in-process scheduler, general-purpose cache, notification service |
+| **Still constrained** | Hosted live browser execution still needs per-user containers/object storage; production-grade queue alternatives (Redis et al.) are named as future options, not in use |
+| **Not present at all** | Frontend framework, LangChain, LangGraph, ORM, in-process scheduler, general-purpose cache, notification service |
 
 Full detail, caveats, and the items explicitly marked "not fully verified":
 see [`JOB_AGENT_COMPLETE_ARCHITECTURE.md`](JOB_AGENT_COMPLETE_ARCHITECTURE.md).

@@ -18,6 +18,9 @@ artifact-driven phases in one migration.
 from __future__ import annotations
 
 import sqlite3
+import atexit
+import os
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
@@ -27,6 +30,19 @@ from job_agent.storage.migrations import latest_version, migration_status, run_m
 from job_agent.tracking.records import JobRecord, collect_records, promote_status
 
 JOBS_DB_NAME = "jobs.db"
+
+GLOBAL_JOB_STATUSES = ("active", "inactive", "expired", "closed", "archived", "unknown")
+MATCH_STATES = (
+    "found", "discovered", "scraped", "evaluated", "qualified", "evaluated_rejected",
+    "prefilter_rejected", "saved", "skipped", "tailored", "manual_apply", "dry_run",
+    "failed", "applied", "replied_rejection", "replied_interview", "replied_offer",
+    "replied_other",
+)
+APPLICATION_STATUSES = (
+    "draft", "ready", "submitting", "submitted", "applied", "acknowledged", "interview",
+    "rejected", "offer", "withdrawn", "failed", "manual_apply", "dry_run", "skipped",
+)
+CANDIDATE_JOB_STATUSES = tuple(dict.fromkeys(MATCH_STATES + APPLICATION_STATUSES))
 
 # Written once per backend. SQLite and Postgres differ only in the placeholder
 # style and the timestamp default, which `_sql` rewrites.
@@ -55,6 +71,11 @@ _SCHEMA = (
         company_website TEXT,
         description TEXT,
         status TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
+        first_seen_at TEXT,
+        last_seen_at TEXT,
+        closed_at TEXT,
+        archived_at TEXT,
         fit_score DOUBLE PRECISION,
         tailored_resume TEXT,
         resume_check TEXT,
@@ -231,6 +252,10 @@ _SCHEMA = (
         job_id TEXT NOT NULL REFERENCES jobs(job_id),
         file_name TEXT NOT NULL,
         file_path TEXT NOT NULL,
+        storage_backend TEXT NOT NULL DEFAULT 'local',
+        object_key TEXT,
+        mime_type TEXT,
+        version INTEGER NOT NULL DEFAULT 1,
         sha256 TEXT NOT NULL,
         size_bytes INTEGER NOT NULL,
         resume_check TEXT,
@@ -238,6 +263,37 @@ _SCHEMA = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_resume_artifacts_candidate_job ON resume_artifacts(candidate_id, job_id)",
+    """
+    CREATE TABLE IF NOT EXISTS interview_prep_artifacts (
+        prep_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL REFERENCES candidate_profiles(candidate_id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id),
+        file_name TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        json_path TEXT,
+        sha256 TEXT NOT NULL,
+        questions INTEGER,
+        profile_hash TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_interview_prep_candidate_job ON interview_prep_artifacts(candidate_id, job_id)",
+    """
+    CREATE TABLE IF NOT EXISTS cover_letter_artifacts (
+        letter_id TEXT PRIMARY KEY,
+        candidate_id TEXT NOT NULL REFERENCES candidate_profiles(candidate_id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(job_id),
+        file_name TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        sha256 TEXT NOT NULL,
+        validated INTEGER,
+        profile_hash TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_cover_letter_candidate_job ON cover_letter_artifacts(candidate_id, job_id)",
     """
     CREATE TABLE IF NOT EXISTS job_contacts (
         job_id TEXT NOT NULL,
@@ -371,6 +427,23 @@ _SCHEMA = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS run_events (
+        event_id TEXT PRIMARY KEY,
+        run_id TEXT,
+        candidate_id TEXT,
+        job_id TEXT,
+        phase TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        success INTEGER,
+        latency_ms INTEGER,
+        error_code TEXT,
+        metadata TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_run_events_run_time ON run_events(run_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_run_events_phase_time ON run_events(phase, created_at)",
+    """
     CREATE TABLE IF NOT EXISTS job_outreach (
         job_id TEXT PRIMARY KEY,
         recipient TEXT,
@@ -421,6 +494,19 @@ _PREPARED_FILES: Dict[str, Optional[int]] = {}
 _PG_POOLS: Dict[str, Any] = {}
 
 
+def close_postgres_pools() -> None:
+    """Close shared psycopg pools explicitly before interpreter shutdown."""
+    while _PG_POOLS:
+        _, pool = _PG_POOLS.popitem()
+        try:
+            pool.close()
+        except Exception:
+            pass
+
+
+atexit.register(close_postgres_pools)
+
+
 class JobsDatabase:
     """Stores fetched jobs in Postgres (with `DATABASE_URL`) or SQLite."""
 
@@ -428,6 +514,8 @@ class JobsDatabase:
         self.database_url = (database_url if database_url is not None
                              else (settings.database_url if db_path is None else None))
         self.db_path = Path(db_path or settings.outputs_dir / JOBS_DB_NAME)
+        if not self.database_url and db_path is None and settings.postgres_required:
+            raise RuntimeError("DATABASE_URL is required when JOB_AGENT_ENVIRONMENT is staging/production.")
         if not self.database_url:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -528,6 +616,8 @@ class JobsDatabase:
         with self._connect() as conn:
             if not self.database_url:
                 conn.execute("PRAGMA journal_mode=WAL")
+            else:
+                conn.execute("SELECT pg_advisory_xact_lock(hashtext('job_agent_schema_init'))")
             for statement in _SCHEMA:
                 conn.execute(self._sql(statement))
             self._migrate(conn)
@@ -542,11 +632,24 @@ class JobsDatabase:
 
     def _migrate(self, conn) -> None:
         """Add columns introduced after a database was created."""
-        added = {"resume_check": "TEXT", "work_mode": "TEXT", "employment_type": "TEXT"}
+        added = {
+            "resume_check": "TEXT",
+            "work_mode": "TEXT",
+            "employment_type": "TEXT",
+            "is_active": "INTEGER NOT NULL DEFAULT 1",
+            "first_seen_at": "TEXT",
+            "last_seen_at": "TEXT",
+            "closed_at": "TEXT",
+            "archived_at": "TEXT",
+        }
         if self.database_url:
             for column, kind in added.items():
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN IF NOT EXISTS {column} {kind}")
             conn.execute("ALTER TABLE runs ADD COLUMN IF NOT EXISTS candidate_key TEXT")
+            conn.execute("ALTER TABLE resume_artifacts ADD COLUMN IF NOT EXISTS storage_backend TEXT NOT NULL DEFAULT 'local'")
+            conn.execute("ALTER TABLE resume_artifacts ADD COLUMN IF NOT EXISTS object_key TEXT")
+            conn.execute("ALTER TABLE resume_artifacts ADD COLUMN IF NOT EXISTS mime_type TEXT")
+            conn.execute("ALTER TABLE resume_artifacts ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1")
             # A view's columns cannot be changed in place on Postgres.
             conn.execute("DROP VIEW IF EXISTS job_overview")
             return
@@ -558,8 +661,26 @@ class JobsDatabase:
         run_columns = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
         if "candidate_key" not in run_columns:
             conn.execute("ALTER TABLE runs ADD COLUMN candidate_key TEXT")
+        artifact_columns = {row[1] for row in conn.execute("PRAGMA table_info(resume_artifacts)").fetchall()}
+        artifact_added = {
+            "storage_backend": "TEXT NOT NULL DEFAULT 'local'",
+            "object_key": "TEXT",
+            "mime_type": "TEXT",
+            "version": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for column, kind in artifact_added.items():
+            if column not in artifact_columns:
+                conn.execute(f"ALTER TABLE resume_artifacts ADD COLUMN {column} {kind}")
         # The overview view predates the column; rebuild it to include it.
         conn.execute("DROP VIEW IF EXISTS job_overview")
+
+    @staticmethod
+    def _global_job_status(record: JobRecord) -> str:
+        """Global job lifecycle only; candidate/application stages live elsewhere."""
+        status = (record.status or "").strip()
+        if status in GLOBAL_JOB_STATUSES:
+            return status
+        return "active"
 
     def migrations(self) -> List[Dict[str, Any]]:
         """Applied/pending schema migrations for diagnostics."""
@@ -606,7 +727,9 @@ class JobsDatabase:
                     job.salary_currency if (job.salary_min or job.salary_max) else None,
                     job.job_url, record.apply_url or route.url, route.channel,
                     1 if route.automatable else 0, route.reason, job.company_website,
-                    job.description, status, record.fit_score, record.tailored_resume,
+                    job.description, self._global_job_status(record), 1,
+                    job.discovered_at or now, now, None, None,
+                    record.fit_score, record.tailored_resume,
                     record.resume_check, record.notes, now,
                 ))
                 self._store_source_listing(conn, record, now)
@@ -675,7 +798,32 @@ class JobsDatabase:
         contact = profile.get("contact") or {}
         email = (contact.get("email") or "").casefold()
         profile_hash = profile.get("profile_hash") or ""
-        return email or profile_hash or "local-candidate"
+        base = email or profile_hash or "local-candidate"
+        hosted_user = self._hosted_user_id()
+        return f"{self._safe_identity_part(hosted_user)}__{self._safe_identity_part(base)}" if hosted_user else base
+
+    @staticmethod
+    def _safe_identity_part(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.@-]+", "_", value).strip("._") or "id"
+
+    def _hosted_user_id(self) -> Optional[str]:
+        """Hosted account owner for worker subprocesses; unset in local mode."""
+        user_id = (getattr(settings, "hosted_user_id", None) or os.environ.get("JOB_AGENT_HOSTED_USER_ID") or "").strip()
+        return user_id or None
+
+    def _user_id(self, profile: Dict[str, Any], candidate_id: str) -> str:
+        hosted_user = self._hosted_user_id()
+        if hosted_user:
+            return hosted_user
+        contact = profile.get("contact") or {}
+        return (contact.get("email") or candidate_id or "local-user").casefold()
+
+    def _default_candidate_scope(self, candidate: Optional[str] = None) -> Optional[str]:
+        if candidate:
+            return candidate
+        if not self._hosted_user_id():
+            return None
+        return self._candidate_id(self._profile_snapshot())
 
     def _split_model(self, scored_by: Optional[str]) -> Dict[str, Optional[str]]:
         if not scored_by:
@@ -956,7 +1104,7 @@ class JobsDatabase:
             data.get("desired_salary"), data.get("desired_salary_max"), data.get("salary_currency"),
             self._as_text(flat), data.get("source_document"), data.get("profile_hash"), now,
         ))
-        user_id = (contact.get("email") or candidate_id or "local-user").casefold()
+        user_id = self._user_id(data, candidate_id)
         conn.execute(self._sql("""
             INSERT INTO users (user_id, email, full_name, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?)
@@ -1058,6 +1206,16 @@ class JobsDatabase:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """), (run_id, phase, status, started_at, finished_at, duration_seconds,
                     json_module.dumps(summary, default=str) if summary else None, started_from))
+            self._store_run_event(
+                conn,
+                run_id=run_id,
+                phase=phase,
+                event_type=f"phase_{status}",
+                success=0 if status in {"error", "failed", "cancelled"} else 1,
+                latency_ms=int(duration_seconds * 1000) if duration_seconds is not None else None,
+                metadata={"summary": summary or {}, "started_from": started_from,
+                          "started_at": started_at, "finished_at": finished_at},
+            )
 
     # --- Run history ----------------------------------------------------------
 
@@ -1154,13 +1312,346 @@ class JobsDatabase:
             return [row["job_id"] for row in conn.execute(
                 self._sql("SELECT job_id FROM run_jobs WHERE run_id = ?"), (run_id,)).fetchall()]
 
+    def record_run_event(self, *, phase: str, event_type: str, run_id: Optional[str] = None,
+                         candidate_id: Optional[str] = None, job_id: Optional[str] = None,
+                         success: Optional[bool] = None, latency_ms: Optional[int] = None,
+                         error_code: Optional[str] = None,
+                         metadata: Optional[Dict[str, Any]] = None) -> str:
+        """Append one structured, privacy-safe event for operations/debugging."""
+        with self._connect() as conn:
+            return self._store_run_event(
+                conn,
+                phase=phase,
+                event_type=event_type,
+                run_id=run_id,
+                candidate_id=candidate_id,
+                job_id=job_id,
+                success=None if success is None else int(bool(success)),
+                latency_ms=latency_ms,
+                error_code=error_code,
+                metadata=metadata,
+            )
+
+    def _store_run_event(self, conn, *, phase: str, event_type: str, run_id: Optional[str] = None,
+                         candidate_id: Optional[str] = None, job_id: Optional[str] = None,
+                         success: Optional[int] = None, latency_ms: Optional[int] = None,
+                         error_code: Optional[str] = None,
+                         metadata: Optional[Dict[str, Any]] = None) -> str:
+        import json as json_module
+        from datetime import datetime, timezone
+
+        created_at = datetime.now(timezone.utc).isoformat()
+        event_id = self._hash_id(run_id, candidate_id, job_id, phase, event_type, created_at, prefix="runevt_")
+        conn.execute(self._sql("""
+            INSERT INTO run_events (event_id, run_id, candidate_id, job_id, phase, event_type,
+                                    success, latency_ms, error_code, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """), (
+            event_id, run_id, candidate_id, job_id, phase, event_type, success, latency_ms,
+            error_code, json_module.dumps(metadata or {}, default=str), created_at,
+        ))
+        return event_id
+
+    def run_events(self, *, run_id: Optional[str] = None, phase: Optional[str] = None,
+                   limit: int = 100) -> List[Dict[str, Any]]:
+        import json as json_module
+
+        where: List[str] = []
+        args: List[Any] = []
+        if run_id:
+            where.append("run_id = ?")
+            args.append(run_id)
+        if phase:
+            where.append("phase = ?")
+            args.append(phase)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        args.append(int(limit))
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(self._sql(
+                f"SELECT * FROM run_events {clause} ORDER BY created_at DESC LIMIT ?"
+            ), args).fetchall()]
+        for row in rows:
+            try:
+                row["metadata"] = json_module.loads(row["metadata"] or "{}")
+            except ValueError:
+                row["metadata"] = {}
+            row["success"] = None if row.get("success") is None else bool(row["success"])
+        return rows
+
+    def integrity_report(self) -> Dict[str, Any]:
+        """Read-only database integrity checks safe for staging/operations."""
+        score_clause = "fit_score < 0 OR fit_score > 10"
+        checks = {
+            "orphan_job_matches": """
+                SELECT COUNT(*) AS n FROM job_matches m
+                LEFT JOIN jobs j ON j.job_id = m.job_id
+                LEFT JOIN candidate_profiles c ON c.candidate_id = m.candidate_id
+                WHERE j.job_id IS NULL OR c.candidate_id IS NULL
+            """,
+            "orphan_evaluation_history": """
+                SELECT COUNT(*) AS n FROM job_evaluation_history e
+                LEFT JOIN jobs j ON j.job_id = e.job_id
+                LEFT JOIN candidate_profiles c ON c.candidate_id = e.candidate_id
+                WHERE j.job_id IS NULL OR c.candidate_id IS NULL
+            """,
+            "orphan_applications": """
+                SELECT COUNT(*) AS n FROM applications a
+                LEFT JOIN jobs j ON j.job_id = a.job_id
+                LEFT JOIN candidate_profiles c ON c.candidate_id = a.candidate_id
+                WHERE j.job_id IS NULL OR c.candidate_id IS NULL
+            """,
+            "orphan_application_events": """
+                SELECT COUNT(*) AS n FROM application_events e
+                LEFT JOIN applications a ON a.application_id = e.application_id
+                WHERE a.application_id IS NULL
+            """,
+            "orphan_source_listings": """
+                SELECT COUNT(*) AS n FROM job_source_listings l
+                LEFT JOIN jobs j ON j.job_id = l.job_id
+                WHERE j.job_id IS NULL
+            """,
+            "orphan_resume_artifacts": """
+                SELECT COUNT(*) AS n FROM resume_artifacts r
+                LEFT JOIN jobs j ON j.job_id = r.job_id
+                LEFT JOIN candidate_profiles c ON c.candidate_id = r.candidate_id
+                WHERE j.job_id IS NULL OR c.candidate_id IS NULL
+            """,
+            "orphan_interview_prep_artifacts": """
+                SELECT COUNT(*) AS n FROM interview_prep_artifacts p
+                LEFT JOIN jobs j ON j.job_id = p.job_id
+                LEFT JOIN candidate_profiles c ON c.candidate_id = p.candidate_id
+                WHERE j.job_id IS NULL OR c.candidate_id IS NULL
+            """,
+            "orphan_cover_letter_artifacts": """
+                SELECT COUNT(*) AS n FROM cover_letter_artifacts l
+                LEFT JOIN jobs j ON j.job_id = l.job_id
+                LEFT JOIN candidate_profiles c ON c.candidate_id = l.candidate_id
+                WHERE j.job_id IS NULL OR c.candidate_id IS NULL
+            """,
+            "duplicate_source_identity": """
+                SELECT COUNT(*) AS n FROM (
+                    SELECT source, source_job_id
+                    FROM job_source_listings
+                    WHERE source_job_id IS NOT NULL
+                    GROUP BY source, source_job_id
+                    HAVING COUNT(*) > 1
+                ) x
+            """,
+            "duplicate_candidate_applications": """
+                SELECT COUNT(*) AS n FROM (
+                    SELECT candidate_id, job_id
+                    FROM applications
+                    GROUP BY candidate_id, job_id
+                    HAVING COUNT(*) > 1
+                ) x
+            """,
+            "null_candidate_ownership": """
+                SELECT
+                    (SELECT COUNT(*) FROM job_matches WHERE candidate_id IS NULL OR candidate_id = '') +
+                    (SELECT COUNT(*) FROM job_evaluation_history WHERE candidate_id IS NULL OR candidate_id = '') +
+                    (SELECT COUNT(*) FROM applications WHERE candidate_id IS NULL OR candidate_id = '') +
+                    (SELECT COUNT(*) FROM resume_artifacts WHERE candidate_id IS NULL OR candidate_id = '') +
+                    (SELECT COUNT(*) FROM interview_prep_artifacts WHERE candidate_id IS NULL OR candidate_id = '') +
+                    (SELECT COUNT(*) FROM cover_letter_artifacts WHERE candidate_id IS NULL OR candidate_id = '') AS n
+            """,
+            "candidate_states_in_jobs_status": f"""
+                SELECT COUNT(*) AS n FROM jobs
+                WHERE status IN ({','.join('?' for _ in CANDIDATE_JOB_STATUSES)})
+            """,
+            "invalid_job_lifecycle": f"""
+                SELECT COUNT(*) AS n FROM jobs
+                WHERE status NOT IN ({','.join('?' for _ in GLOBAL_JOB_STATUSES)})
+                   OR is_active NOT IN (0, 1)
+            """,
+            "invalid_match_state": f"""
+                SELECT COUNT(*) AS n FROM job_matches
+                WHERE state NOT IN ({','.join('?' for _ in MATCH_STATES)})
+            """,
+            "invalid_application_status": f"""
+                SELECT COUNT(*) AS n FROM applications
+                WHERE current_status NOT IN ({','.join('?' for _ in APPLICATION_STATUSES)})
+            """,
+            "invalid_work_mode": """
+                SELECT COUNT(*) AS n FROM jobs
+                WHERE work_mode IS NOT NULL
+                  AND work_mode NOT IN ('remote', 'hybrid', 'onsite', 'unknown')
+            """,
+            "invalid_score_values": f"""
+                SELECT
+                    (SELECT COUNT(*) FROM job_matches WHERE {score_clause}) +
+                    (SELECT COUNT(*) FROM job_evaluation_history WHERE {score_clause}) AS n
+            """,
+            "salary_min_gt_max": """
+                SELECT COUNT(*) AS n FROM jobs
+                WHERE salary_min IS NOT NULL AND salary_max IS NOT NULL AND salary_min > salary_max
+            """,
+        }
+        params = {
+            "candidate_states_in_jobs_status": CANDIDATE_JOB_STATUSES,
+            "invalid_job_lifecycle": GLOBAL_JOB_STATUSES,
+            "invalid_match_state": MATCH_STATES,
+            "invalid_application_status": APPLICATION_STATUSES,
+        }
+        with self._connect() as conn:
+            results: Dict[str, int] = {}
+            for name, query in checks.items():
+                row = conn.execute(self._sql(query), tuple(params.get(name, ())) ).fetchone()
+                results[name] = int(dict(row)["n"] if row else 0)
+        return {
+            "ok": all(value == 0 for value in results.values()),
+            "backend": self.backend,
+            "location": self.location,
+            "checks": results,
+        }
+
+    def artifact_integrity_report(self, *, limit: Optional[int] = None) -> Dict[str, Any]:
+        """Read-only artifact byte/hash checks safe for restore validation."""
+        import hashlib as hashlib_module
+
+        from job_agent.storage.artifacts import LocalArtifactStore, S3ArtifactStore
+
+        query = """
+            SELECT artifact_id, candidate_id, job_id, file_path, storage_backend,
+                   object_key, sha256, size_bytes
+            FROM resume_artifacts
+            ORDER BY created_at DESC, artifact_id
+        """
+        args: list[Any] = []
+        if limit:
+            query += " LIMIT ?"
+            args.append(int(limit))
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(self._sql(query), args).fetchall()]
+
+        local_store = LocalArtifactStore(settings.outputs_dir / "artifacts")
+        s3_store = None
+        counts = {
+            "checked": 0,
+            "missing": 0,
+            "hash_mismatch": 0,
+            "size_mismatch": 0,
+            "unsupported_backend": 0,
+            "errors": 0,
+        }
+        failures: list[dict[str, Any]] = []
+
+        def add_failure(row: dict[str, Any], kind: str, detail: str) -> None:
+            counts[kind] = counts.get(kind, 0) + 1
+            if len(failures) < 50:
+                failures.append({
+                    "artifact_id": row.get("artifact_id"),
+                    "candidate_id": row.get("candidate_id"),
+                    "job_id": row.get("job_id"),
+                    "kind": kind,
+                    "detail": detail,
+                })
+
+        for row in rows:
+            counts["checked"] += 1
+            backend = row.get("storage_backend") or "local"
+            key = row.get("object_key") or row.get("file_path") or ""
+            try:
+                if backend == "local":
+                    try:
+                        data = local_store.get_bytes(str(key))
+                    except (FileNotFoundError, ValueError):
+                        path = Path(str(row.get("file_path") or ""))
+                        if not path.is_file():
+                            add_failure(row, "missing", str(key or row.get("file_path") or ""))
+                            continue
+                        data = path.read_bytes()
+                elif backend == "s3":
+                    if s3_store is None:
+                        s3_store = S3ArtifactStore()
+                    data = s3_store.get_bytes(str(key))
+                else:
+                    add_failure(row, "unsupported_backend", str(backend))
+                    continue
+            except FileNotFoundError:
+                add_failure(row, "missing", str(key))
+                continue
+            except Exception as exc:  # noqa: BLE001 - operator report should capture backend errors.
+                add_failure(row, "errors", str(exc))
+                continue
+
+            digest = hashlib_module.sha256(data).hexdigest()
+            if digest != row.get("sha256"):
+                add_failure(row, "hash_mismatch", f"expected {row.get('sha256')}, got {digest}")
+            if row.get("size_bytes") is not None and int(row["size_bytes"]) != len(data):
+                add_failure(row, "size_mismatch", f"expected {row.get('size_bytes')}, got {len(data)}")
+
+        prep_query = """
+            SELECT prep_id AS artifact_id, candidate_id, job_id, file_path, sha256,
+                   NULL AS storage_backend, NULL AS object_key, NULL AS size_bytes
+            FROM interview_prep_artifacts
+            ORDER BY updated_at DESC, prep_id
+        """
+        prep_args: list[Any] = []
+        if limit:
+            prep_query += " LIMIT ?"
+            prep_args.append(int(limit))
+        with self._connect() as conn:
+            prep_rows = [dict(row) for row in conn.execute(self._sql(prep_query), prep_args).fetchall()]
+        for row in prep_rows:
+            counts["checked"] += 1
+            path = Path(str(row.get("file_path") or ""))
+            if not path.is_file():
+                add_failure(row, "missing", str(path))
+                continue
+            try:
+                data = path.read_bytes()
+            except Exception as exc:  # noqa: BLE001 - operator report should capture filesystem errors.
+                add_failure(row, "errors", str(exc))
+                continue
+            digest = hashlib_module.sha256(data).hexdigest()
+            if digest != row.get("sha256"):
+                add_failure(row, "hash_mismatch", f"expected {row.get('sha256')}, got {digest}")
+
+        letter_query = """
+            SELECT letter_id AS artifact_id, candidate_id, job_id, file_path, sha256,
+                   NULL AS storage_backend, NULL AS object_key, NULL AS size_bytes
+            FROM cover_letter_artifacts
+            ORDER BY updated_at DESC, letter_id
+        """
+        letter_args: list[Any] = []
+        if limit:
+            letter_query += " LIMIT ?"
+            letter_args.append(int(limit))
+        with self._connect() as conn:
+            letter_rows = [dict(row) for row in conn.execute(self._sql(letter_query), letter_args).fetchall()]
+        for row in letter_rows:
+            counts["checked"] += 1
+            path = Path(str(row.get("file_path") or ""))
+            if not path.is_file():
+                add_failure(row, "missing", str(path))
+                continue
+            try:
+                data = path.read_bytes()
+            except Exception as exc:  # noqa: BLE001 - operator report should capture filesystem errors.
+                add_failure(row, "errors", str(exc))
+                continue
+            digest = hashlib_module.sha256(data).hexdigest()
+            if digest != row.get("sha256"):
+                add_failure(row, "hash_mismatch", f"expected {row.get('sha256')}, got {digest}")
+
+        return {
+            "ok": all(value == 0 for key, value in counts.items() if key != "checked"),
+            "backend": self.backend,
+            "location": self.location,
+            "counts": counts,
+            "failures": failures,
+        }
+
     def _store_resumes(self, conn, outputs_dir: Optional[Path], now: str, candidate_id: str) -> int:
         """Keep legacy PDF bytes and normalized file metadata beside each job."""
         import hashlib
         import json as json_module
 
+        from job_agent.storage.artifacts import artifact_store
+
         out = Path(outputs_dir) if outputs_dir else settings.outputs_dir
         folder = out / "tailored_resumes"
+        store = artifact_store(local_root=out / "artifacts")
         checks: Dict[str, Optional[str]] = {}
         try:
             for entry in json_module.loads((folder / "manifest.json").read_text(encoding="utf-8")):
@@ -1189,22 +1680,28 @@ class JobsDatabase:
                 conn.execute(self._sql(_UPSERT_JOB), (
                     job_id, None, entry.get("title") or "", entry.get("company") or "", None, 0, None, None,
                     None, None, entry.get("tailored_at"), None, None, None, None, None, None, 0, None, None, None,
-                    "tailored", entry.get("score"), pdf.name, entry.get("validation_summary"), None, now,
+                    "active", 1, entry.get("tailored_at") or now, now, None, None,
+                    entry.get("score"), pdf.name, entry.get("validation_summary"), None, now,
                 ))
                 known_jobs.add(job_id)
             data = pdf.read_bytes()
             digest = hashlib.sha256(data).hexdigest()
             artifact_id = self._hash_id(candidate_id, job_id, digest, prefix="artifact_")
+            object_key = f"candidates/{candidate_id}/resumes/{job_id}/{digest}.pdf"
+            stored_artifact = store.put_bytes(object_key, data, mime_type="application/pdf")
             conn.execute(self._sql("""
                 INSERT INTO resume_artifacts (artifact_id, candidate_id, job_id, file_name, file_path,
+                                              storage_backend, object_key, mime_type, version,
                                               sha256, size_bytes, resume_check, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (artifact_id) DO UPDATE SET
-                    file_path = excluded.file_path, size_bytes = excluded.size_bytes,
-                    resume_check = excluded.resume_check
+                    file_path = excluded.file_path, storage_backend = excluded.storage_backend,
+                    object_key = excluded.object_key, mime_type = excluded.mime_type,
+                    size_bytes = excluded.size_bytes, resume_check = excluded.resume_check
             """), (
-                artifact_id, candidate_id, job_id, pdf.name, str(pdf.resolve()), digest,
-                len(data), checks.get(job_id), now,
+                artifact_id, candidate_id, job_id, pdf.name, str(pdf.resolve()),
+                stored_artifact.backend, stored_artifact.object_key, stored_artifact.mime_type, 1,
+                digest, stored_artifact.size_bytes, checks.get(job_id), now,
             ))
             if existing.get(job_id) == digest:
                 continue
@@ -1230,6 +1727,168 @@ class JobsDatabase:
         row = dict(row)
         row["pdf"] = bytes(row["pdf"])
         return row
+
+    def store_interview_prep_artifacts(self, outputs_dir: Optional[Path] = None) -> int:
+        """Store generated interview prep guide metadata for database-backed discovery."""
+        import hashlib
+        import json as json_module
+        from datetime import datetime, timezone
+
+        out = Path(outputs_dir) if outputs_dir else settings.outputs_dir
+        folder = out / "interview_prep"
+        manifest = folder / "manifest.json"
+        try:
+            entries = json_module.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(entries, list):
+            return 0
+
+        now = datetime.now(timezone.utc).isoformat()
+        profile = self._profile_snapshot()
+        candidate_id = self._candidate_id(profile)
+        stored = 0
+        with self._connect() as conn:
+            self._store_profile(conn, now, profile, candidate_id)
+            known_jobs = {row["job_id"] for row in conn.execute(self._sql("SELECT job_id FROM jobs")).fetchall()}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                job_id = str(entry.get("job_id") or "")
+                raw_path = entry.get("path") or ""
+                if not job_id or job_id not in known_jobs:
+                    continue
+                path = Path(str(raw_path))
+                if not path.is_absolute():
+                    path = (folder / path).resolve()
+                if not path.is_file():
+                    continue
+                data = path.read_bytes()
+                digest = hashlib.sha256(data).hexdigest()
+                json_path = path.with_suffix(".json")
+                prep_id = self._hash_id(candidate_id, job_id, entry.get("profile_hash"), digest, prefix="prep_")
+                conn.execute(self._sql("""
+                    INSERT INTO interview_prep_artifacts (
+                        prep_id, candidate_id, job_id, file_name, file_path, json_path,
+                        sha256, questions, profile_hash, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (prep_id) DO UPDATE SET
+                        file_path = excluded.file_path,
+                        json_path = excluded.json_path,
+                        sha256 = excluded.sha256,
+                        questions = excluded.questions,
+                        profile_hash = excluded.profile_hash,
+                        updated_at = excluded.updated_at
+                """), (
+                    prep_id, candidate_id, job_id, path.name, str(path.resolve()),
+                    str(json_path.resolve()) if json_path.is_file() else None,
+                    digest, int(entry.get("questions") or 0), entry.get("profile_hash"),
+                    now, now,
+                ))
+                stored += 1
+        return stored
+
+    def interview_prep_artifacts(self, *, candidate: Optional[str] = None,
+                                 limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Generated interview prep guides, newest first."""
+        query = """
+            SELECT prep_id, candidate_id, job_id, file_name, file_path, json_path,
+                   sha256, questions, profile_hash, created_at, updated_at
+            FROM interview_prep_artifacts
+        """
+        args: list[Any] = []
+        candidate = self._default_candidate_scope(candidate)
+        if candidate:
+            query += " WHERE candidate_id = ?"
+            args.append(candidate)
+        query += " ORDER BY updated_at DESC, created_at DESC"
+        if limit:
+            query += " LIMIT ?"
+            args.append(int(limit))
+        with self._connect() as conn:
+            return [dict(row) for row in conn.execute(self._sql(query), args).fetchall()]
+
+    def store_cover_letter_artifacts(self, outputs_dir: Optional[Path] = None) -> int:
+        """Store generated cover letter metadata for database-backed discovery."""
+        import hashlib
+        import json as json_module
+        from datetime import datetime, timezone
+
+        out = Path(outputs_dir) if outputs_dir else settings.outputs_dir
+        folder = out / "cover_letters"
+        manifest = folder / "manifest.json"
+        try:
+            entries = json_module.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return 0
+        if not isinstance(entries, list):
+            return 0
+
+        now = datetime.now(timezone.utc).isoformat()
+        profile = self._profile_snapshot()
+        candidate_id = self._candidate_id(profile)
+        stored = 0
+        with self._connect() as conn:
+            self._store_profile(conn, now, profile, candidate_id)
+            known_jobs = {row["job_id"] for row in conn.execute(self._sql("SELECT job_id FROM jobs")).fetchall()}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                job_id = str(entry.get("job_id") or "")
+                raw_path = entry.get("path") or ""
+                if not job_id or job_id not in known_jobs:
+                    continue
+                path = Path(str(raw_path))
+                if not path.is_absolute():
+                    path = (folder / path).resolve()
+                if not path.is_file():
+                    continue
+                data = path.read_bytes()
+                digest = hashlib.sha256(data).hexdigest()
+                letter_id = self._hash_id(candidate_id, job_id, entry.get("profile_hash"), digest, prefix="letter_")
+                conn.execute(self._sql("""
+                    INSERT INTO cover_letter_artifacts (
+                        letter_id, candidate_id, job_id, file_name, file_path,
+                        sha256, validated, profile_hash, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (letter_id) DO UPDATE SET
+                        file_path = excluded.file_path,
+                        sha256 = excluded.sha256,
+                        validated = excluded.validated,
+                        profile_hash = excluded.profile_hash,
+                        updated_at = excluded.updated_at
+                """), (
+                    letter_id, candidate_id, job_id, path.name, str(path.resolve()),
+                    digest, None if entry.get("validated") is None else int(bool(entry.get("validated"))),
+                    entry.get("profile_hash"), now, now,
+                ))
+                stored += 1
+        return stored
+
+    def cover_letter_artifacts(self, *, candidate: Optional[str] = None,
+                               limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Generated cover letters, newest first."""
+        query = """
+            SELECT letter_id, candidate_id, job_id, file_name, file_path,
+                   sha256, validated, profile_hash, created_at, updated_at
+            FROM cover_letter_artifacts
+        """
+        args: list[Any] = []
+        candidate = self._default_candidate_scope(candidate)
+        if candidate:
+            query += " WHERE candidate_id = ?"
+            args.append(candidate)
+        query += " ORDER BY updated_at DESC, created_at DESC"
+        if limit:
+            query += " LIMIT ?"
+            args.append(int(limit))
+        with self._connect() as conn:
+            rows = [dict(row) for row in conn.execute(self._sql(query), args).fetchall()]
+        for row in rows:
+            row["validated"] = None if row.get("validated") is None else bool(row["validated"])
+        return rows
 
     def _backfill_from_csv(self, conn, present: set, now: str, stats: Dict[str, int],
                            outputs_dir: Optional[Path], candidate_id: str) -> None:
@@ -1269,7 +1928,8 @@ class JobsDatabase:
                 row.get("Currency") or None, row.get("Job URL"), row.get("Apply URL") or None,
                 (row.get("Apply Method") or "").replace(" ", "_") or None, 1 if auto else 0,
                 row.get("Auto-apply Possible"), row.get("Company Website") or None, None,
-                row.get("Status") or "found", float(score) if score else None,
+                "active", 1, row.get("Date Found") or now, now, None, None,
+                float(score) if score else None,
                 row.get("Tailored Resume") or None, row.get("Resume Check") or None,
                 row.get("Notes") or None, now,
             ))
@@ -1309,9 +1969,11 @@ class JobsDatabase:
     # --- Reading --------------------------------------------------------------
 
     def jobs(self, *, limit: int = 50, status: Optional[str] = None, company: Optional[str] = None,
-             with_email: bool = False, min_score: Optional[float] = None) -> List[Dict[str, Any]]:
+             with_email: bool = False, min_score: Optional[float] = None,
+             candidate: Optional[str] = None) -> List[Dict[str, Any]]:
         """Jobs from the overview, best fit first."""
         where, args = [], []
+        scoped_candidate = self._default_candidate_scope(candidate)
         if status:
             where.append("status = ?")
             args.append(status)
@@ -1324,8 +1986,53 @@ class JobsDatabase:
             where.append("fit_score >= ?")
             args.append(min_score)
         clause = f" WHERE {' AND '.join(where)}" if where else ""
-        query = (f"SELECT * FROM job_overview{clause} "
-                 "ORDER BY fit_score DESC NULLS LAST, company LIMIT ?")
+        if scoped_candidate:
+            query = f"""
+                SELECT j.job_id, j.title, j.company, j.location, j.work_mode, j.employment_type, j.source,
+                       COALESCE(a.current_status, m.state, j.status) AS status,
+                       COALESCE(m.fit_score, j.fit_score) AS fit_score,
+                       j.date_posted, j.salary_min, j.salary_max, j.salary_currency,
+                       c.email AS contact_email, c.kind AS contact_kind, c.source AS contact_source,
+                       j.apply_method, j.auto_apply, j.apply_url, j.job_url, j.tailored_resume, j.resume_check,
+                       COALESCE(ra.file_path, r.file_path) AS resume_file,
+                       COALESCE(ra.size_bytes, r.size_bytes) AS resume_bytes,
+                       o.recipient AS outreach_to, o.status AS outreach_status, o.subject AS outreach_subject
+                FROM jobs j
+                LEFT JOIN job_matches m
+                  ON m.match_id = (
+                      SELECT x.match_id FROM job_matches x
+                      WHERE x.job_id = j.job_id AND x.candidate_id = ?
+                      ORDER BY x.updated_at DESC, x.created_at DESC LIMIT 1
+                  )
+                LEFT JOIN applications a
+                  ON a.application_id = (
+                      SELECT x.application_id FROM applications x
+                      WHERE x.job_id = j.job_id AND x.candidate_id = ?
+                      ORDER BY x.updated_at DESC, x.created_at DESC LIMIT 1
+                  )
+                LEFT JOIN job_contacts c
+                  ON c.job_id = j.job_id
+                 AND c.email = (SELECT email FROM job_contacts x WHERE x.job_id = j.job_id
+                                ORDER BY CASE x.kind WHEN 'hiring' THEN 0 WHEN 'person' THEN 1
+                                                     WHEN 'general' THEN 2 ELSE 3 END, x.email LIMIT 1)
+                LEFT JOIN job_outreach o ON o.job_id = j.job_id
+                LEFT JOIN job_resumes r ON r.job_id = j.job_id
+                LEFT JOIN resume_artifacts ra
+                  ON ra.artifact_id = (
+                      SELECT x.artifact_id FROM resume_artifacts x
+                      WHERE x.job_id = j.job_id AND x.candidate_id = ?
+                      ORDER BY x.created_at DESC LIMIT 1
+                  )
+            """
+            args = [scoped_candidate, scoped_candidate, scoped_candidate] + args
+            where.append("(m.match_id IS NOT NULL OR a.application_id IS NOT NULL OR ra.artifact_id IS NOT NULL)")
+            clause = f" WHERE {' AND '.join(where)}"
+            query += clause + (
+                " ORDER BY COALESCE(m.fit_score, j.fit_score) DESC NULLS LAST, j.company LIMIT ?"
+            )
+        else:
+            query = (f"SELECT * FROM job_overview{clause} "
+                     "ORDER BY fit_score DESC NULLS LAST, company LIMIT ?")
         if not self.database_url:
             # SQLite sorts NULLs first on DESC and has no NULLS LAST.
             query = query.replace("fit_score DESC NULLS LAST", "fit_score IS NULL, fit_score DESC")
@@ -1340,6 +2047,7 @@ class JobsDatabase:
 
         where = ["m.fit_score IS NOT NULL"]
         args: List[Any] = []
+        candidate = self._default_candidate_scope(candidate)
         if qualified_only:
             where.append("m.fit_score >= ?")
             args.append(settings.min_match_score)
@@ -1529,6 +2237,7 @@ class JobsDatabase:
         """Application counts from normalized current application state."""
         query = "SELECT current_status, COUNT(*) AS n FROM applications"
         args: List[Any] = []
+        candidate = self._default_candidate_scope(candidate)
         if candidate:
             query += " WHERE candidate_id = ?"
             args.append(candidate)
@@ -1550,6 +2259,7 @@ class JobsDatabase:
         """Resume artifacts projected into the Phase 5 manifest shape."""
         where = []
         args: List[Any] = []
+        candidate = self._default_candidate_scope(candidate)
         if candidate:
             where.append("ra.candidate_id = ?")
             args.append(candidate)
@@ -1636,9 +2346,10 @@ _UPSERT_JOB = """
     INSERT INTO jobs (job_id, fingerprint, title, company, location, is_remote, work_mode,
                       employment_type, source, date_posted, discovered_at, salary_min, salary_max,
                       salary_currency, job_url, apply_url, apply_method, auto_apply, apply_note,
-                      company_website, description, status, fit_score, tailored_resume,
+                      company_website, description, status, is_active, first_seen_at, last_seen_at,
+                      closed_at, archived_at, fit_score, tailored_resume,
                       resume_check, notes, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT (job_id) DO UPDATE SET
         fingerprint = excluded.fingerprint, title = excluded.title, company = excluded.company,
         location = excluded.location, is_remote = excluded.is_remote,
@@ -1649,6 +2360,11 @@ _UPSERT_JOB = """
         apply_method = excluded.apply_method, auto_apply = excluded.auto_apply,
         apply_note = excluded.apply_note, company_website = excluded.company_website,
         description = excluded.description, status = excluded.status,
+        is_active = excluded.is_active,
+        first_seen_at = COALESCE(jobs.first_seen_at, excluded.first_seen_at),
+        last_seen_at = excluded.last_seen_at,
+        closed_at = excluded.closed_at,
+        archived_at = excluded.archived_at,
         fit_score = COALESCE(excluded.fit_score, jobs.fit_score),
         tailored_resume = COALESCE(excluded.tailored_resume, jobs.tailored_resume),
         resume_check = COALESCE(excluded.resume_check, jobs.resume_check),

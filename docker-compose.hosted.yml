@@ -12,7 +12,7 @@
       - ./config:/app/config
     ports:
       - "8080:8080"
-    command: ["python", "-m", "job_agent.hosted.api"]
+    command: ["uvicorn", "job_agent.hosted.fastapi_app:app", "--host", "0.0.0.0", "--port", "8080"]
     depends_on:
       postgres:
         condition: service_healthy

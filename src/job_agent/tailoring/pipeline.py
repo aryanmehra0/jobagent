@@ -113,6 +113,7 @@ class ResumeTailoringPipeline:
             manifest_path = self.compiler.output_dir / "manifest.json"
             manifest_path.parent.mkdir(parents=True, exist_ok=True)
             manifest_path.write_text("[]", encoding="utf-8")
+            self._sync_database(manifest_path.parent.parent)
             console.print("[yellow]No qualified jobs to tailor for. Run 'python main.py evaluate' first.[/yellow]")
             return []
 
@@ -205,6 +206,7 @@ class ResumeTailoringPipeline:
         manifest_path = self.compiler.output_dir / "manifest.json"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        self._sync_database(manifest_path.parent.parent)
         self._clear_checkpoint()
         self._archive_foreign_resumes(profile)
 
@@ -217,6 +219,16 @@ class ResumeTailoringPipeline:
                     check_cancelled()
                     generate(profile, evaluated.job, country=country)
         return results
+
+    @staticmethod
+    def _sync_database(outputs_dir: Path) -> None:
+        """Refresh normalized DB state after tailoring writes compatibility artifacts."""
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            JobsDatabase().sync(outputs_dir)
+        except Exception as exc:
+            console.print(f"[yellow]Tailoring artifacts were saved, but database sync failed: {exc}[/yellow]")
 
     # --- Faithful tailoring ----------------------------------------------------
 

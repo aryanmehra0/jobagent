@@ -1,6 +1,6 @@
 # Autonomous AI Job Search & Application Agent — Complete Architecture Reference
 
-> **Version**: 0.3.0 · **Last verified**: 2026-10-04 · **Tests**: 829 passed, 1 opt-in skipped in CI-style local run · **Phases**: 7 core + 2 opt-in (reply tracking, warm contacts)
+> **Version**: 0.3.0 · **Last verified**: 2026-10-05 · **Tests**: 885 passed, 1 opt-in skipped in CI-style local run · **Phases**: 7 core + 2 opt-in (reply tracking, warm contacts)
 
 This document is the **single source of truth** for any AI agent (Claude, Codex, Gemini, etc.) or developer working on this codebase. It maps every file, class, function, constant, data flow, and design invariant so you can make changes without reading all 78 source files.
 
@@ -117,13 +117,15 @@ job agent/
 │   │                        — extract.py, finder.py, warm.py
 │   ├── storage/            jobs_db.py + migrations.py — queryable jobs.db/Postgres
 │   │                        layer, schema ledger, normalized candidate/job state
-│   ├── hosted/             Separate control-plane scaffold — api.py, auth.py, queue.py,
-│   │                        worker.py (queue+auth storage is queue.py, there is no db.py)
+│   ├── hosted/             Separate control-plane scaffold — fastapi_app.py (production
+│   │                        ASGI API), api.py (compatibility smoke server), auth.py,
+│   │                        queue.py, worker.py (queue+auth storage is queue.py,
+│   │                        there is no db.py)
 │   └── web/                Flow console — runner.py, run_history.py (per-run persistence),
 │                            server.py, state.py, analytics.py,
 │                            static/{index.html,styles.css,app.js}
 │
-└── tests/                            # 43 test files; latest CI-style local run: 829 passed, 1 opt-in Postgres integration skipped
+└── tests/                            # latest CI-style local run: 885 passed, 1 opt-in Postgres integration skipped
 ```
 
 ---
@@ -159,8 +161,10 @@ flowchart LR
 `storage/jobs_db.py` still keeps legacy projection tables for compatibility, but
 new syncs also write normalized state into `users`, `candidate_profiles`,
 `candidate_preferences`, `job_matches`, `job_evaluation_history`,
-`applications`, `application_events`, `job_source_listings`, and
-`resume_artifacts`. `storage/migrations.py` records the schema ledger visible
+`applications`, `application_events`, `job_source_listings`,
+`resume_artifacts`, `interview_prep_artifacts`, and
+`cover_letter_artifacts`.
+`storage/migrations.py` records the schema ledger visible
 through `python main.py db migrations`. `job_overview` now prefers normalized
 match/application/artifact data and falls back to legacy columns only when the
 normalized rows are absent. CSV exports overlay DB state, dashboard summaries, CLI
@@ -171,7 +175,20 @@ database when JSON artifacts are missing, so CSV/XLSX/JSON are moving toward
 export/debug outputs rather than authoritative state. Run history also links
 jobs from DB source/evaluation/resume-artifact state when per-run JSON files
 are absent, and tracker resume checks can be refreshed from normalized resume
-artifacts when the tailoring manifest is missing.
+artifacts when the tailoring manifest is missing. Interview prep and cover
+letter links can also fall back to `interview_prep_artifacts` and
+`cover_letter_artifacts` when their manifests are absent.
+Phase 2 sourcing, Phase 3 evaluation, Phase 4 tailoring, Phase 5 apply, Phase
+6 tracking, and Phase 7 interview prep now refresh `JobsDatabase` immediately
+after writing their compatibility artifacts, so sourced jobs, evaluation
+history, resume artifacts, application state, outreach state, interview guide
+metadata, and cover-letter metadata are queryable from SQLite/Postgres before the final
+export/publish step runs.
+When a hosted worker subprocess runs, it passes `JOB_AGENT_HOSTED_USER_ID`;
+`JobsDatabase` uses that hosted account as `users.user_id` and prefixes
+candidate-owned normalized rows with a filesystem-safe hosted identity. Local
+single-user runs keep the historical candidate ID behavior, usually the resume
+email address.
 
 `sourcing/delta_store.py` follows the same local/hosted split: without
 `DATABASE_URL` it uses `data/outputs/delta_store.db`; with `DATABASE_URL` it
@@ -307,7 +324,12 @@ python main.py preferences                     # Set work modes & country prefer
 python main.py sync-inbox                      # Read IMAP folder for application outcomes
 python main.py workday-assist                  # Assistive browser fill for Workday portals
 python main.py db [QUERY]                      # Query relational jobs cache
+python main.py db integrity                    # Read-only normalized DB integrity checks
+python main.py db events [--phase llm]         # Structured run/LLM event history
+python main.py db artifacts verify             # Verify stored document bytes and hashes
 python main.py db-check                        # Verify hosted queue database
+python main.py queue status                    # Inspect hosted background work
+python main.py queue recover-stale             # Recover abandoned hosted work leases
 python main.py hosted-key                      # Generate/inspect hosted control plane tokens
 python main.py production-check               # Self-hosted production deployment audit
 python main.py doctor [--live]                 # Check dependencies, keys & browser
@@ -336,7 +358,7 @@ Configured via `.env` file (see `.env.example`):
 ## 17. Test Suite
 
 Run with `python -m pytest -v` or the CI-style command in `CLAUDE.md`:
-- **Current CI-style status**: 829 passed, 1 skipped on 2026-10-04; the skipped test is the real Postgres integration gated by `JOB_AGENT_POSTGRES_TEST_URL`.
+- **Current CI-style status**: 885 passed, 1 skipped on 2026-10-05; the skipped test is the real Postgres integration gated by `JOB_AGENT_POSTGRES_TEST_URL`.
 - **Test execution time**: ~3 minutes across 43 test files.
 - **Key test modules**:
   - `test_anti_hallucination.py`: Fact sealing, intake audit, tailoring gate, cold email verification.

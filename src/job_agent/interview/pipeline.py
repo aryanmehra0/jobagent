@@ -90,4 +90,19 @@ class InterviewPrepPipeline:
             records[prep.job_id] = record
             generated.append(record)
             write_json(folder/'manifest.json', list(records.values()))
+            self._sync_database()
         return generated
+
+    @staticmethod
+    def _sync_database():
+        """Refresh DB state after interview prep writes its manifest and guide files."""
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            database = JobsDatabase()
+            database.sync(settings.outputs_dir)
+            database.store_interview_prep_artifacts(settings.outputs_dir)
+        except Exception as exc:
+            from rich.console import Console
+
+            Console().print(f"[yellow]Interview prep artifacts were saved, but database sync failed: {exc}[/yellow]")

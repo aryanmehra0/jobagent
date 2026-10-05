@@ -97,8 +97,19 @@ class FallbackTrackingPipeline:
         finally:
             # Saved even when stopped part-way, so rows already logged are kept.
             self.tracker.save()
+            self._sync_database(settings.outputs_dir)
         self._render_summary(logged)
         return logged
+
+    @staticmethod
+    def _sync_database(outputs_dir: Path) -> None:
+        """Refresh normalized DB state after tracking writes outreach/tracker artifacts."""
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            JobsDatabase().sync(outputs_dir)
+        except Exception as exc:
+            console.print(f"[yellow]Tracking artifacts were saved, but database sync failed: {exc}[/yellow]")
 
     def _outreach(self, profile, job: JobPosting, score: float, pdf_path: Optional[str], drafts: dict) -> str:
         """Draft (or recall) this role's cold email, honouring the no-repeat ledger."""

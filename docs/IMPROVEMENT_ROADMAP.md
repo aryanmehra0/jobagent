@@ -332,20 +332,20 @@ specifies the target architecture (per-user Postgres tables, object storage
 for files, queue-based execution, isolated browser workers, secret storage,
 per-provider throttles, observability). Your job is to implement the first
 concrete slice of that checklist against the existing scaffold in
-src/job_agent/hosted/ (api.py, queue.py, worker.py) and
-docker-compose.hosted.yml, not to redesign it.
+src/job_agent/hosted/ (fastapi_app.py, compatibility api.py, auth.py,
+queue.py, worker.py) and docker-compose.hosted.yml, not to redesign it.
 
-Pick ONE slice to implement fully rather than partially touching all of them:
-recommended first slice is real per-user auth (replace the single
-HOSTED_API_TOKEN bearer check in hosted/api.py with per-user API keys or
-OAuth, add a users table to the Postgres schema referenced in DEPLOYMENT.md,
-scope /runs and job data by user_id which the API already accepts as a field
-today — check hosted/api.py's current request schema first).
+The first slice has been implemented: the shared HOSTED_API_TOKEN path was
+replaced by per-user API keys stored hashed at rest, `/v1/runs` and `/v1/jobs`
+are scoped by authenticated user, and compose now runs the FastAPI app under
+uvicorn. The worker slice now executes queued phases in a per-user subprocess
+workspace when `HOSTED_WORKER_EXECUTE=1`; the remaining hosted slice is
+container/browser isolation for real multi-user live apply, not auth.
 
-Keep the existing safety posture: HOSTED_WORKER_EXECUTE stays opt-in
-(DEPLOYMENT.md: "Keep the reference worker in validation mode until you have
-per-user storage and a per-user browser profile"), and don't wire real browser
-automation into the hosted worker as part of this slice — that's explicitly
+Keep the existing safety posture: HOSTED_WORKER_EXECUTE stays opt-in, and keep
+live apply behind both queued `allow_live_apply=true` and
+`HOSTED_WORKER_ALLOW_LIVE_APPLY=1`. Don't make browser automation public
+without a per-user container and browser profile — that's explicitly
 called out as needing isolated per-user containers first, which is a separate,
 later slice.
 

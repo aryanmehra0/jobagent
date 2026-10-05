@@ -269,26 +269,49 @@ hash is stored. Rotate by issuing a new key; revoke an old key with
 There is no public account-provisioning endpoint.
 
 The API derives ownership from this key. A supplied `user_id` must match;
-another user's run returns 404. `/jobs` and `/jobs/stats` read only the
+another user's run returns 404. `/v1/jobs` and `/v1/jobs/stats` read only the
 `hosted_user_jobs` partition for that owner. They never expose the shared personal
 jobs database. Existing personal jobs are not migrated automatically. The new
 `hosted_users`, `hosted_api_keys` and `hosted_user_jobs` tables are created on the
 configured Postgres database, or on SQLite for local tests.
+When creating runs from a client that may retry, send an `Idempotency-Key`
+header. The queue stores one run per authenticated user and key, so a repeated
+`POST /v1/runs` returns the original row instead of enqueueing duplicate work.
 
-This completes authentication and API data isolation, not public SaaS execution.
-The reference worker still only validates queue entries. Per-user workspaces,
-object storage, isolated browsers, rate limits and production observability remain
-required before executing real hosted jobs.
+This completes authentication, API data isolation, typed FastAPI/OpenAPI routes,
+trusted-origin CORS, request IDs, and in-process rate limiting. The reference
+worker defaults to validation mode, and can execute queued phases only when
+`HOSTED_WORKER_EXECUTE=1` is set. Execution happens in a subprocess with
+per-user data, output, artifact, and browser-profile directories under
+`HOSTED_WORKER_WORKSPACE_DIR`; the worker also passes
+`JOB_AGENT_HOSTED_USER_ID` so normalized `candidate_profiles` and downstream
+candidate-owned rows are scoped to the authenticated hosted account, not just
+the resume email. After a successful executed run, the worker reads the
+workspace/Postgres jobs DB and publishes those rows into `hosted_user_jobs`, so
+`/v1/jobs` exposes the completed run's results only to that hosted user. The
+worker writes structured lifecycle events to `run_events` with run IDs like
+`hosted:<id>` for validation, execution start, job publication, success, and
+failure. The hosted API exposes those events only to the authenticated owner via
+`/v1/runs/<id>/events`. Object storage, container isolation, and external
+alerting remain required before executing real hosted browser automation for
+many users.
 
-The repository now includes a hosted control-plane scaffold that is safe to put
+The repository now includes a FastAPI hosted control plane that is safe to put
 behind HTTPS because it does not expose the local dashboard and does not run
-browser automation in the request thread.
+browser automation in the request thread. The older standard-library module
+remains for compatibility smoke tests, but compose runs uvicorn against
+`job_agent.hosted.fastapi_app:app`.
 
 It has two services:
 
-- `hosted-api`: token-protected `/health`, `/ready`, `POST /runs`, and
-  `GET /runs/<id>` endpoints.
-- `hosted-worker`: claims queued runs and completes them in validation mode.
+- `hosted-api`: token-protected `/v1/jobs`, `/v1/jobs/stats`,
+  `POST /v1/runs`, `GET /v1/runs`, `GET /v1/runs/<id>`, and
+  `GET /v1/runs/<id>/events` endpoints, plus `/health`, `/ready`, and
+  `/openapi.json`. Run listing is scoped to the authenticated owner and accepts
+  `status` plus `limit` filters.
+- `hosted-worker`: claims queued runs, heartbeats while running, and either
+  completes validation rows or executes phases in a per-user subprocess when
+  `HOSTED_WORKER_EXECUTE=1`.
 
 Start it locally:
 
@@ -308,8 +331,8 @@ $body = @{
 
 Invoke-RestMethod `
   -Method Post `
-  -Uri "http://127.0.0.1:8080/runs" `
-  -Headers @{ Authorization = "Bearer $token" } `
+  -Uri "http://127.0.0.1:8080/v1/runs" `
+  -Headers @{ Authorization = "Bearer $token"; "Idempotency-Key" = "candidate-1-source-evaluate-tailor-track-001" } `
   -ContentType "application/json" `
   -Body $body
 ```
@@ -321,8 +344,12 @@ Invoke-RestMethod "http://127.0.0.1:8080/ready"
 ```
 
 For a real hosted product, store issued per-user keys securely and put the API
-behind TLS. Keep the reference worker in
-validation mode until you have per-user storage and a per-user browser profile.
+behind TLS. Keep live apply disabled unless the worker runs inside a per-user
+isolated browser container and the user has explicitly authorized submission:
+the queue requires `allow_live_apply=true`, and the worker additionally requires
+`HOSTED_WORKER_ALLOW_LIVE_APPLY=1`. In `staging` or `production`, the worker
+also refuses live apply unless `HOSTED_WORKER_ISOLATION_MODE=container`; the
+default `workspace` mode is only for local validation and smoke tests.
 
 ## What a public hosted version needs
 
@@ -349,10 +376,11 @@ services under the `saas` profile to show that final shape:
 docker compose -f docker-compose.hosted.yml --profile saas up --build
 ```
 
-The reference API still uses the local SQLite queue so the scaffold works on any
-developer machine. Before serving many real users, replace `HostedQueue` with
-Postgres or Redis-backed queue storage and run each claimed job inside an
-isolated worker container scoped to one user.
+The hosted path uses SQLite only when `DATABASE_URL` is absent so the scaffold
+works on any developer machine; with `DATABASE_URL`, `HostedQueue` uses
+Postgres and claims work with row locks. Before serving many real users, run
+each worker in an isolated container scoped to one user and point artifacts at
+S3-compatible storage.
 
 ## Database choices
 
@@ -397,6 +425,10 @@ Postgres, AWS RDS, Google Cloud SQL, and Azure Database for PostgreSQL.
 For a serious public deployment, put files such as resumes, PDFs, spreadsheets,
 and `.eml` drafts in object storage instead of the database. Good options are S3,
 Cloudflare R2, Google Cloud Storage, Azure Blob Storage, and Supabase Storage.
+`production-check` now treats local artifact storage as acceptable for local
+smoke tests only; in `staging` or `production`, configure
+`ARTIFACT_STORAGE_BACKEND=s3` plus `ARTIFACT_S3_BUCKET` before considering the
+deployment ready.
 
 The safe migration path is:
 
@@ -405,17 +437,93 @@ The safe migration path is:
 3. Set `DATABASE_URL` so `HostedQueue`, `JobsDatabase`, and `DeltaStore` use
    Postgres for queued runs, jobs, normalized candidate state, seen jobs,
    application attempts, and outreach ledgers.
-4. Run every queued job in a per-user worker container with its own mounted data
+4. Set `ARTIFACT_STORAGE_BACKEND=s3` and point `ARTIFACT_S3_BUCKET`/
+   `ARTIFACT_S3_PREFIX` at a durable per-environment bucket or prefix.
+5. Run every queued job in a per-user worker container with its own mounted data
    directory or object-storage prefix.
-5. Store API keys in a managed secret store, never in shared project files.
+6. Store API keys in a managed secret store, never in shared project files.
 
 To verify the Postgres path against a real database, point the opt-in
-integration test at a disposable database. It creates and drops its own schema:
+integration test at a disposable database. It creates and drops its own schema
+and covers the jobs DB, DeltaStore, artifact verification, run events, hosted
+queue, and hosted auth tables on the same Postgres database:
 
 ```powershell
 $env:JOB_AGENT_POSTGRES_TEST_URL='postgresql://user:pass@localhost:5432/job_agent_test'
 python -m pytest tests/test_postgres_integration.py -q
 ```
+
+## Operations
+
+### Queue inspection and recovery
+
+Hosted runs are durable rows. The worker claims with `FOR UPDATE SKIP LOCKED`
+on Postgres and records attempts plus heartbeat timestamps. Use these commands
+instead of manual SQL for routine checks:
+
+```powershell
+python main.py queue status
+python main.py queue status --status running
+python main.py queue recover-stale --older-than 300
+python main.py db runs
+python main.py db events --limit 50
+```
+
+`recover-stale` moves abandoned `running` rows back to `retryable` while attempts
+remain, or to `failed` after `max_attempts`.
+
+### Backup and restore
+
+For production, back up the Postgres database and the artifact/object-storage
+bucket together. The database contains metadata, hashes, application history,
+queue state, and run events; object storage contains the generated documents.
+
+Example Postgres backup:
+
+```powershell
+$env:PGPASSWORD = "your-password"
+pg_dump --format=custom --file job_agent_$(Get-Date -Format yyyyMMdd_HHmmss).dump `
+  --dbname "postgresql://job_agent@host:5432/job_agent"
+```
+
+Example restore validation into a disposable database:
+
+```powershell
+createdb job_agent_restore_check
+pg_restore --clean --if-exists --dbname job_agent_restore_check .\job_agent_YYYYMMDD_HHMMSS.dump
+$env:DATABASE_URL = "postgresql://job_agent@host:5432/job_agent_restore_check"
+python main.py db migrations
+python main.py db integrity
+python main.py db artifacts verify
+```
+
+For S3-compatible artifacts, enable versioning/lifecycle retention on the
+bucket and periodically run `python main.py db artifacts verify` in the
+restored environment. It checks every `resume_artifacts.object_key` it can read
+against stored `sha256` and size metadata, and checks local
+`interview_prep_artifacts.file_path` guide hashes plus
+`cover_letter_artifacts.file_path` PDF hashes. Do not treat an untested backup
+as valid.
+
+### Retention
+
+Preserve indefinitely unless the user explicitly asks to purge:
+
+- submitted applications
+- application events
+- interview/offer/rejection history
+- evaluation history tied to a candidate/profile hash
+- run events needed to explain production failures
+
+Safe to archive or expire by policy:
+
+- stale unqualified jobs with no candidate interaction
+- failed temporary runs after the operator has reviewed them
+- raw source payload caches after the retention window
+- temporary generated artifacts superseded by newer verified artifacts
+
+Keep retention windows configurable in deployment automation rather than
+hardcoding destructive deletion in the application.
 
 ## Email status
 

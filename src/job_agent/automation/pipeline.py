@@ -191,6 +191,12 @@ class AutoApplyPipeline:
             json.dumps({"successful": successful, "failed": failed}, indent=2), encoding="utf-8"
         )
         temporary.replace(results_file)
+        try:
+            from job_agent.storage.jobs_db import JobsDatabase
+
+            JobsDatabase().sync(results_file.parent)
+        except Exception as exc:
+            console.print(f"[yellow]Application results were saved, but database sync failed: {exc}[/yellow]")
 
     @staticmethod
     def _check_before_job() -> None:

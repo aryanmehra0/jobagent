@@ -13,9 +13,24 @@ def document_links(out=None, profile_hash=None):
     result = {}
     for folder, column, pattern in [('interview_prep', 'Interview Prep', '{}.md'),
                                      ('cover_letters', 'Cover Letter', 'cover_{}.pdf')]:
-        for item in _read_json(out/folder/'manifest.json', []):
+        manifest = _read_json(out/folder/'manifest.json', [])
+        if not manifest and folder == "interview_prep":
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                manifest = JobsDatabase().interview_prep_artifacts(limit=100_000)
+            except Exception:
+                manifest = []
+        if not manifest and folder == "cover_letters":
+            try:
+                from job_agent.storage.jobs_db import JobsDatabase
+
+                manifest = JobsDatabase().cover_letter_artifacts(limit=100_000)
+            except Exception:
+                manifest = []
+        for item in manifest:
             job_id = item.get('job_id', '')
-            path = (out/folder/pattern.format(job_id)).resolve()
+            path = Path(item.get("file_path") or item.get("path") or out/folder/pattern.format(job_id)).resolve()
             if (path.parent == out/folder and path.is_file() and profile_hash
                     and item.get('profile_hash') == profile_hash
                     and hashlib.sha256(path.read_bytes()).hexdigest() == item.get('sha256')):

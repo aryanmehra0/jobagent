@@ -44,8 +44,9 @@ There is **one** real AI agent in the codebase — `AutoApplyAgent`
 (`src/job_agent/automation/agent.py`), a bounded, LLM-free browser loop that
 fills real application forms — everything else (job scoring, resume
 tailoring, interview prep) is a single LLM call with a deterministic,
-offline fallback. No LangChain, no LangGraph, no REST API framework, no ORM:
-raw SQL against SQLite (or Postgres via `DATABASE_URL`). Full,
+offline fallback. No LangChain, no LangGraph, no ORM: raw SQL against SQLite
+(or Postgres via `DATABASE_URL`). The local dashboard is stdlib HTTP; the
+separate hosted control plane uses FastAPI. Full,
 implementation-verified detail — every component, the orchestrator's exact
 control flow, the database schema, and what's real vs. still a stub — is in
 [`docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md`](docs/JOB_AGENT_COMPLETE_ARCHITECTURE.md)
@@ -424,9 +425,16 @@ For a safe hosted smoke test, run the separate token-protected control plane:
 docker compose -f docker-compose.hosted.yml up --build
 ```
 
-It exposes `/health`, `/ready`, and a queued `POST /runs` API on port 8080. The
-reference worker completes queued runs in validation mode, which proves the API
-and queue are wired without sharing one browser profile across users.
+It exposes `/health`, `/ready`, `/openapi.json`, and a queued
+`POST /v1/runs` API on port 8080. Authenticated users can list only their own
+runs with `GET /v1/runs`, optionally filtered by status. The worker completes
+queued runs in validation mode by default; with `HOSTED_WORKER_EXECUTE=1`, it
+runs phases in a per-user subprocess workspace so browser profiles and
+generated files are not shared across users. After a successful executed run,
+the worker publishes that workspace's DB-backed job rows into the authenticated
+user's `/v1/jobs` partition. Worker validation/execution/publish/failure
+lifecycle events are also written to `run_events` under run IDs like
+`hosted:<id>` and exposed to the owning user at `/v1/runs/<id>/events`.
 
 For an open-source hosted product with many users, use this repository as the
 worker engine and put a multi-user web layer in front of it: authenticated web
@@ -758,6 +766,8 @@ python main.py db stats                      # What the database holds
 python main.py db jobs --with-email -n 20    # Fetched jobs and their emails
 python main.py db jobs --min-score 7 --status qualified
 python main.py db sync                       # Rebuild it from the artifacts
+python main.py db runs                       # Database-backed pipeline run history
+python main.py db events --limit 50          # Structured phase/LLM events
 python main.py db query "SELECT company, contact_email FROM job_overview WHERE fit_score >= 7"
 python main.py db query "SELECT * FROM job_overview" --csv data/outputs/db_export.csv
 ```
@@ -768,21 +778,30 @@ so it is safe to explore with. To browse the database in a GUI instead, open
 the SQLite Viewer extension in VS Code.
 
 Everything the agent fetches is also written to a database, so you can query it
-from a DB client or an admin UI instead of opening a spreadsheet. It uses
-Postgres when `DATABASE_URL` is set and SQLite (`data/outputs/jobs.db`)
-otherwise, with the same tables either way:
+from a DB client or an admin UI instead of opening a spreadsheet. Sourcing,
+evaluation, tailoring, apply, tracking, and interview prep refresh the database
+as part of the phase, while JSON/CSV/XLSX remain compatibility exports. It uses Postgres when
+`DATABASE_URL` is set and SQLite (`data/outputs/jobs.db`) otherwise, with the
+same tables either way:
 
 | Table | Holds |
 | --- | --- |
-| `jobs` | One row per job: title, company, location, salary, source, posting date, description, fit score, stage, apply URL and method, tailored resume |
-| `job_evaluations` | The score behind each job: fit, technical and seniority scores, the threshold, the reasoning, and matching and missing skills |
+| `jobs` | Global job rows: title, company, location, salary, source, posting date, description, apply URL and method |
+| `job_matches` / `job_evaluation_history` | Candidate-specific match state and score history |
+| `applications` / `application_events` | Current application status and immutable application timeline |
+| `job_source_listings` | Source provenance and raw listing payloads |
+| `resume_artifacts` | Generated document metadata, hashes, storage backend and object keys |
+| `interview_prep_artifacts` | Generated interview guide metadata, hashes and profile ownership |
+| `cover_letter_artifacts` | Generated cover-letter metadata, hashes and profile ownership |
+| `job_evaluations` | Legacy compatibility projection of scores for existing views/exports |
 | `job_contacts` | Every published email found for a job, with its kind (hiring, person, general) and the page it came from |
 | `job_outreach` | The cold email drafted for a job: recipient, subject, body, draft file and whether it may be sent |
-| `job_resumes` | The tailored PDF itself, with its checksum and check result |
-| `job_applications` | What the apply phase did: status, channel, apply URL, steps and any error |
+| `job_resumes` | Legacy compatibility projection for tailored document metadata |
+| `job_applications` | Legacy compatibility projection for apply outcomes |
 | `candidate_profile` | The sealed profile the run used: contact, experience, country, sponsorship, salary expectation, skills, source resume |
 | `search_parameters` | The search it ran: roles, locations, on-site countries, freshness window, boards, salary floor |
 | `phase_runs` | Run history: each phase, its status, duration and summary, and whether it came from the dashboard or the terminal |
+| `runs` / `run_jobs` / `run_events` | End-to-end run records, run-to-job links, and structured operational events |
 | `job_overview` (view) | One row per job with its best contact email, resume and outreach state, for browsing |
 
 ### Opening it in DBeaver
@@ -1028,15 +1047,19 @@ python main.py hosted-key --user alice
 python main.py hosted-key --revoke <key-id>
 ```
 
-Only relevant if you're running the separate hosted control-plane scaffold
+Only relevant if you're running the separate hosted FastAPI control plane
 (see Deployment below), not the local dashboard. Issues a per-user bearer
 token shown once; only its SHA-256 hash is ever stored, and lookups use a
-timing-safe comparison. `/runs` and `/runs/<id>` on the hosted API are now
-scoped to the authenticated user — one user's key cannot see or enumerate
-another's runs. This replaces the earlier single shared `HOSTED_API_TOKEN`.
-It authenticates and isolates hosted API requests; it does not by itself add
-a running multi-user worker — see [`DEPLOYMENT.md`](docs/DEPLOYMENT.md) for what's
-still needed before this is a real hosted product.
+timing-safe comparison. `/v1/runs`, `/v1/runs/<id>`, and `/v1/jobs` on the
+hosted API are scoped to the authenticated user — one user's key cannot see or
+enumerate another's runs or jobs. This replaces the earlier single shared
+`HOSTED_API_TOKEN`. Retry clients should send `Idempotency-Key` with
+`POST /v1/runs`; the queue returns the original run for the same user/key
+instead of creating duplicate work. It authenticates and isolates hosted API
+requests; it does not by itself add a deployed multi-user browser container
+fleet — see
+[`DEPLOYMENT.md`](docs/DEPLOYMENT.md) for what's still needed before this is a
+real hosted product.
 
 ### Everything at once
 
@@ -1137,8 +1160,11 @@ Tests cover the six stages and the console. The ones worth knowing about:
   to manual apply.
 - **Hosted per-user API keys authenticate and isolate requests to the hosted
   control-plane scaffold; they are not a running multi-tenant product.**
-  There is still no worker that executes queued per-user jobs in isolation —
-  see [`DEPLOYMENT.md`](docs/DEPLOYMENT.md).
+  The reference worker can execute queued phases in a per-user subprocess
+  workspace when `HOSTED_WORKER_EXECUTE=1`, and the child process scopes
+  normalized candidate rows with `JOB_AGENT_HOSTED_USER_ID`. Public multi-user
+  live apply still needs deployed per-user browser containers — see
+  [`DEPLOYMENT.md`](docs/DEPLOYMENT.md).
 - **CI runs only after this workflow is pushed.** The badge above reflects
   `.github/workflows/ci.yml`'s actual run history on GitHub, not a local
   guarantee.

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
+from job_agent.config.normalize import clean_text
 from job_agent.config.schema import JobPosting, job_fingerprint
 from job_agent.config.settings import settings
 
@@ -51,6 +52,8 @@ class DeltaStore:
     def __init__(self, db_path: Optional[Path] = None):
         self.database_url = settings.database_url if db_path is None else None
         self.db_path = Path(db_path) if db_path else (settings.outputs_dir / "delta_store.db")
+        if not self.database_url and db_path is None and settings.postgres_required:
+            raise RuntimeError("DATABASE_URL is required when JOB_AGENT_ENVIRONMENT is staging/production.")
         if not self.database_url:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
@@ -113,6 +116,7 @@ class DeltaStore:
                     job_url TEXT,
                     company TEXT,
                     title TEXT,
+                    location TEXT,
                     source TEXT,
                     first_seen_at TEXT,
                     status TEXT DEFAULT 'scraped'
@@ -129,6 +133,9 @@ class DeltaStore:
 
             # Migration: track when the status last changed, for stalled-run diagnosis.
             existing = self._columns(conn, "seen_jobs")
+            if "location" not in existing:
+                conn.execute("ALTER TABLE seen_jobs ADD COLUMN location TEXT")
+                existing.add("location")
             if "status_updated_at" not in existing:
                 conn.execute("ALTER TABLE seen_jobs ADD COLUMN status_updated_at TEXT")
                 conn.execute("UPDATE seen_jobs SET status_updated_at = first_seen_at")
@@ -221,9 +228,10 @@ class DeltaStore:
     def filter_unseen(self, jobs: Sequence[JobPosting]) -> List[JobPosting]:
         """Return only the postings that have not been seen in a previous sweep.
 
-        A posting counts as seen when its ID or its company-plus-title
-        fingerprint was recorded before, so the same role reposted on another
-        board, or under a new URL, is not processed a second time.
+        A posting counts as seen when its ID or its processing fingerprint was
+        recorded before. The processing fingerprint includes location evidence
+        for non-remote jobs, so same-title roles in London and Bengaluru are not
+        silently collapsed as the same vacancy.
         """
         if not jobs:
             return []
@@ -232,7 +240,17 @@ class DeltaStore:
                 "SELECT job_id, fingerprint FROM seen_jobs WHERE COALESCE(reopened, 0) = 0").fetchall()
         seen_ids = {row["job_id"] for row in rows}
         seen_prints = {row["fingerprint"] for row in rows if row["fingerprint"]}
-        return [job for job in jobs if job.id not in seen_ids and job.fingerprint() not in seen_prints]
+        return [job for job in jobs if job.id not in seen_ids and self.processing_fingerprint(job) not in seen_prints]
+
+    @staticmethod
+    def processing_fingerprint(job: JobPosting) -> str:
+        """Fingerprint used for destructive/skip decisions, stricter than outreach."""
+        base = job_fingerprint(job.company, job.title)
+        location = clean_text(job.location).casefold()
+        remoteish = job.is_remote or location in {"", "remote", "worldwide", "remote worldwide"}
+        if remoteish:
+            return base
+        return f"{base}|loc:{location}"
 
     # --- Outreach ledger --------------------------------------------------------
 
@@ -298,7 +316,8 @@ class DeltaStore:
             return
         now = datetime.now(timezone.utc).isoformat()
         records = [
-            (job.id, job.job_url, job.company, job.title, job.source, now, status, now, job.fingerprint())
+            (job.id, job.job_url, job.company, job.title, job.location, job.source, now, status, now,
+             self.processing_fingerprint(job))
             for job in jobs
         ]
         with self._connect() as conn:
@@ -307,8 +326,8 @@ class DeltaStore:
                 self._insert_ignore(
                     "seen_jobs", "(job_id)",
                     """
-                    (job_id, job_url, company, title, source, first_seen_at, status, status_updated_at, fingerprint)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (job_id, job_url, company, title, location, source, first_seen_at, status, status_updated_at, fingerprint)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                 ),
                 records,

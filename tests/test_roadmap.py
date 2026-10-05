@@ -166,7 +166,7 @@ def test_hosted_user_isolation_and_revocation(tmp_path):
         assert status == 202 and payload['run']['user_id'] == 'alice'
         assert _request(base+f"/runs/{payload['run']['id']}", token=bob)[0] == 404
         assert _request(base+'/runs', 'POST', token=bob, body=json.dumps({'user_id':'alice','phases':['prep']}).encode())[0] == 403
-        assert _request(base+'/jobs',token=bob)[1] == {'jobs':[]}
+        assert _request(base+'/jobs',token=bob)[1]['jobs'] == []
         assert _request(base+'/jobs',token=alice)[1]['jobs'][0]['title'] == 'Private job'
         identities.revoke(alice.split('.')[0])
         assert _request(base+'/jobs',token=alice)[0] == 401
