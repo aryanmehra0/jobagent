@@ -19,57 +19,73 @@
       </div>
     </div>
 
-    <span class="pill" id="pill-provider"><span class="dot"></span><span>LLM: checking…</span></span>
-    <span class="pill" id="pill-profile"><span class="dot"></span><span>Profile: checking…</span></span>
+    <details class="menu health" id="health-menu">
+      <summary class="pill" id="pill-health" title="System status"><span class="dot"></span><span id="health-text">Checking…</span></summary>
+      <div class="menu-pop" role="group" aria-label="System status">
+        <span class="pill" id="pill-provider"><span class="dot"></span><span>LLM: checking…</span></span>
+        <span class="pill" id="pill-profile"><span class="dot"></span><span>Profile: checking…</span></span>
+      </div>
+    </details>
 
     <div class="topbar-spacer"></div>
 
     <button class="btn" id="jobs-btn">Jobs &amp; downloads</button>
-    <label class="toggle">Resume
-      <select id="resume-mode" aria-label="Resume format" title="Auto keeps your uploaded PDF's exact fonts, colors and one-page layout, only reordering bullets per job.">
-        <option value="auto" selected>Keep my design (recommended)</option>
-        <option value="regional">Generate country-specific ATS format</option>
-      </select>
-    </label>
 
-    <label class="toggle"><input type="checkbox" id="cover-letter">Cover letters</label>
-    <label class="toggle" id="dry-toggle">
-      <input type="checkbox" id="dry-run" checked>
-      <span id="dry-label">Dry run (nothing is submitted)</span>
-    </label>
+    <div class="mode-switch" id="dry-toggle" role="group" aria-label="Run mode">
+      <input type="checkbox" id="dry-run" checked hidden>
+      <button type="button" class="mode-opt" id="mode-dry" aria-pressed="true" title="Nothing is submitted">Dry run</button>
+      <button type="button" class="mode-opt mode-live" id="mode-live" aria-pressed="false" title="Auto-apply submits real applications">LIVE</button>
+    </div>
+
+    <details class="menu" id="options-menu">
+      <summary class="btn" id="options-summary">Run options</summary>
+      <div class="menu-pop">
+        <label class="menu-field">Resume format
+          <select id="resume-mode" aria-label="Resume format" title="Auto keeps your uploaded PDF's exact fonts, colors and one-page layout, only reordering bullets per job.">
+            <option value="auto" selected>Keep my design (recommended)</option>
+            <option value="regional">Generate country-specific ATS format</option>
+          </select>
+        </label>
+        <label class="menu-check"><input type="checkbox" id="cover-letter">Write a cover letter for each job</label>
+        <button class="menu-item" id="run-banner-fresh" type="button" hidden
+                title="Move these results to history; seen jobs and sent-email records are kept">Start fresh<span>Move the previous run's results to history</span></button>
+      </div>
+    </details>
 
     <button class="btn btn-icon" id="theme-btn" title="Toggle light / dark" aria-label="Toggle light or dark theme" data-icon="theme"></button>
     <button class="btn btn-danger" id="cancel-btn" disabled>Stop</button>
     <button class="btn btn-primary" id="run-btn" type="button"><span>Run all phases</span></button>
   </header>
 
-  <div class="banner" id="sample-banner" hidden>
-    <span class="banner-icon" data-icon="alert"></span>
-    <span class="grow" id="sample-banner-text"></span>
-    <button class="btn btn-sm" id="banner-setup">Use my resume</button>
-    <button class="btn btn-sm btn-ghost" id="banner-dismiss" title="Hide until next reload">Dismiss</button>
-  </div>
-
-  <div class="banner banner-info" id="run-banner" hidden>
-    <span class="banner-icon" data-icon="clock"></span>
-    <span class="grow" id="run-banner-text"></span>
-    <button class="btn btn-sm" id="run-banner-fresh" title="Move these results to history; seen jobs and sent-email records are kept">Start fresh</button>
-    <button class="btn btn-sm btn-ghost" id="run-banner-dismiss">Dismiss</button>
-  </div>
-
-  <section class="next-step" id="next-step" aria-live="polite" hidden>
-    <span class="next-step-label">Next step</span>
-    <div class="next-step-body">
-      <strong id="next-step-title"></strong>
-      <span id="next-step-detail"></span>
+  <div class="status-slot" id="status-slot">
+    <div class="live-strip" id="live-strip" role="status" hidden>
+      <strong>LIVE</strong>
+      <span class="grow">Running the apply phase will submit real applications under your name. Dry run is off.</span>
+      <button class="btn btn-sm" id="live-strip-off" type="button">Switch back to dry run</button>
     </div>
-    <button class="btn btn-primary btn-sm" id="next-step-action" type="button"></button>
-  </section>
+
+    <div class="banner" id="sample-banner" hidden>
+      <span class="banner-icon" data-icon="alert"></span>
+      <span class="grow" id="sample-banner-text"></span>
+      <button class="btn btn-sm" id="banner-setup">Use my resume</button>
+      <button class="btn btn-sm btn-ghost" id="banner-dismiss" title="Hide until next reload">Dismiss</button>
+    </div>
+
+    <section class="next-step" id="next-step" aria-live="polite" hidden>
+      <span class="next-step-label">Next step</span>
+      <div class="next-step-body">
+        <strong id="next-step-title"></strong>
+        <span id="next-step-detail"></span>
+        <span class="next-step-meta" id="next-step-meta" hidden></span>
+      </div>
+      <button class="btn btn-primary btn-sm" id="next-step-action" type="button"></button>
+    </section>
+  </div>
 
   <div class="body">
     <main class="canvas">
       <button class="btn btn-sm canvas-fit" id="fit-btn" type="button" aria-pressed="true"
-              title="Scale the pipeline so every phase is visible without scrolling">Fit to view ✓</button>
+              title="Scale the pipeline so every phase is visible without scrolling">Fit to view</button>
       <div class="flow-sizer" id="flow-sizer">
         <div class="flow" id="flow">
           <svg class="flow-edges" id="edges" aria-hidden="true"></svg>
@@ -78,7 +94,9 @@
       </div>
     </main>
 
+    <div class="sheet-backdrop" id="sheet-backdrop"></div>
     <aside class="inspector">
+      <button class="sheet-close" id="sheet-close" type="button">Close details</button>
       <div class="tabs" role="tablist" aria-label="Inspector">
         <button class="tab is-active" data-tab="details" role="tab" aria-selected="true" aria-controls="panel-details">Details</button>
         <button class="tab" data-tab="log" role="tab" aria-selected="false" aria-controls="panel-log" tabindex="-1">Live log</button>
@@ -106,7 +124,7 @@
           <button class="btn btn-icon btn-sm" id="log-copy" type="button" title="Copy visible lines" aria-label="Copy visible log lines" data-icon="copy"></button>
           <button class="btn btn-icon btn-sm" id="log-clear" type="button" title="Clear log" aria-label="Clear log" data-icon="trash"></button>
         </div>
-        <div class="log-body" id="log-body">
+        <div class="log-body" id="log-body" role="log" aria-live="off" aria-label="Run log" tabindex="0">
           <span class="log-empty">No activity yet. Press “Run all phases” to start.</span>
         </div>
         <button class="log-jump" id="log-jump" type="button" hidden>↓ New activity</button>
@@ -119,7 +137,7 @@
   </div>
 </div>
 
-<div class="toasts" id="toasts"></div>
+<div class="toasts" id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
 <div id="modal-root"></div>
 <div id="setup-root"></div>
 <dialog id="jobs-dialog" class="jobs-dialog" aria-labelledby="jobs-title">

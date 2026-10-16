@@ -330,6 +330,18 @@ class FlowConsoleHandler(BaseHTTPRequestHandler):
         elif route == "/api/state":
             from job_agent.runtime import pipeline_busy
             self._json(HTTPStatus.OK, {"state": build_snapshot(), "running": self.server.runner.is_running or pipeline_busy()})
+        elif route == "/api/apply/preview":
+            # Read-only: the exact jobs a live run would submit, shown in the
+            # confirmation so the person approves employers, not a PDF count.
+            from job_agent.automation.pipeline import AutoApplyPipeline
+            try:
+                plan = AutoApplyPipeline.preview_queue()
+            except FileNotFoundError:
+                plan = {"will_submit": [], "manual": [], "already_applied": []}
+            except (ValueError, OSError) as exc:
+                self._error(HTTPStatus.CONFLICT, f"Could not work out what would be submitted: {exc}")
+                return
+            self._json(HTTPStatus.OK, plan)
         elif route == "/api/events":
             self._serve_events()
         elif route == "/api/analytics":

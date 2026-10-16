@@ -168,3 +168,67 @@ def test_auto_apply_pipeline_dry_run_end_to_end(test_profile, test_job, tmp_path
     assert successful[0]["applied"] is False
     assert successful[0]["fit_score"] == 8.5
     assert results_file.exists()
+
+
+# ==============================================================================
+# LIVE-APPLY PREVIEW
+# ==============================================================================
+
+def _preview_inputs(tmp_path: Path, jobs):
+    """Write a manifest + qualified file for `jobs` (qualified) plus one extra, unqualified entry."""
+    manifest = [
+        {"job_id": job.id, "title": job.title, "company": job.company, "score": 8.0,
+         "pdf_path": str(tmp_path / f"{job.id}.pdf")}
+        for job in jobs
+    ]
+    manifest.append({"job_id": "not-qualified", "title": "Other", "company": "Other Co",
+                     "pdf_path": str(tmp_path / "other.pdf")})
+    manifest_file = tmp_path / "manifest.json"
+    manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
+    qualified_file = tmp_path / "qualified_jobs.json"
+    qualified_file.write_text(json.dumps([
+        {"job": job.model_dump(), "evaluation": {"fit_score": 8.0}} for job in jobs
+    ]), encoding="utf-8")
+    return manifest_file, qualified_file
+
+
+def test_preview_queue_lists_only_what_a_live_run_would_submit(tmp_path: Path, monkeypatch):
+    """The confirmation must name real employers: qualified, not yet applied, and automatable."""
+    from job_agent.config.schema import JobPosting
+
+    def posting(job_id: str, company: str, url: str) -> JobPosting:
+        return JobPosting(id=job_id, title="Engineer", company=company, job_url=url, source="test")
+
+    open_form = posting("gh-1", "Acme", "https://boards.greenhouse.io/acme/jobs/123456")
+    login_wall = posting("li-1", "Walled", "https://www.linkedin.com/jobs/view/999")
+    done_already = posting("gh-2", "Repeat", "https://boards.greenhouse.io/repeat/jobs/777")
+    manifest_file, qualified_file = _preview_inputs(tmp_path, [open_form, login_wall, done_already])
+    monkeypatch.setattr(AutoApplyPipeline, "_already_applied", staticmethod(lambda: {"gh-2"}))
+
+    plan = AutoApplyPipeline.preview_queue(manifest_path=manifest_file, qualified_jobs_path=qualified_file)
+
+    assert [row["company"] for row in plan["will_submit"]] == ["Acme"]
+    assert [row["company"] for row in plan["manual"]] == ["Walled"]
+    assert plan["manual"][0]["reason"]
+    assert [row["company"] for row in plan["already_applied"]] == ["Repeat"]
+    # The unqualified manifest entry is for manual use and is never in any list.
+    assert "Other Co" not in {row["company"] for rows in plan.values() for row in rows}
+
+
+def test_preview_queue_honours_limit_like_a_run(tmp_path: Path, monkeypatch):
+    from job_agent.config.schema import JobPosting
+
+    jobs = [JobPosting(id=f"gh-{n}", title="Engineer", company=f"Co{n}", source="test",
+                       job_url=f"https://boards.greenhouse.io/co{n}/jobs/10{n}") for n in range(3)]
+    manifest_file, qualified_file = _preview_inputs(tmp_path, jobs)
+    monkeypatch.setattr(AutoApplyPipeline, "_already_applied", staticmethod(lambda: set()))
+
+    plan = AutoApplyPipeline.preview_queue(manifest_path=manifest_file, qualified_jobs_path=qualified_file, limit=2)
+
+    assert len(plan["will_submit"]) == 2
+
+
+def test_preview_queue_without_tailored_resumes_raises_like_a_run(tmp_path: Path):
+    with pytest.raises(FileNotFoundError):
+        AutoApplyPipeline.preview_queue(manifest_path=tmp_path / "missing.json",
+                                        qualified_jobs_path=tmp_path / "missing_q.json")
