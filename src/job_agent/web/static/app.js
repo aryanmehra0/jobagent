@@ -109,7 +109,7 @@
     flow.style.transform = `scale(${flowScale})`;
     const fitBtn = $("#fit-btn");
     if (fitBtn) {
-      fitBtn.textContent = fitMode ? "Fit to view ✓" : "Actual size";
+      fitBtn.textContent = fitMode ? "Fit to view" : "Actual size";
       fitBtn.setAttribute("aria-pressed", String(fitMode));
     }
     const changed = best !== layoutName;
@@ -278,18 +278,27 @@
     if (document.hidden) return;
     try {
       const data = await api("/api/state");
+      setOffline(false);
       const next = JSON.stringify(data);
       if (next === lastStateJson) return;
       lastStateJson = next;
       state = data.state;
       running = data.running;
       render();
-    } catch { /* the next poll tries again; a toast every few seconds would only be noise */ }
+    } catch { setOffline(true); /* no toast per poll; the health chip says so */ }
+  }
+
+  let offline = false;
+  function setOffline(value) {
+    if (offline === value) return;
+    offline = value;
+    if (state) renderPills();
   }
 
   function startStatePolling() {
-    const tick = () => { syncState(); setTimeout(tick, running ? 6000 : 20000); };
-    setTimeout(tick, 6000);
+    // One poller, and it only redraws when the state actually changed.
+    const tick = () => { syncState(); setTimeout(tick, running ? 5000 : 10000); };
+    setTimeout(tick, 5000);
   }
 
   async function refreshState() {
@@ -305,52 +314,128 @@
 
   /* ---------------- Toasts & modal ---------------- */
 
+  // Errors stay until dismissed: an operator who looked away for ten seconds must
+  // still be able to read what failed. Everything else clears itself. The
+  // container is a polite live region and an error is announced as an alert.
   function toast(message, kind = "") {
-    const node = el("div", `toast ${kind}`, message);
+    const node = el("div", `toast ${kind}`);
+    node.append(el("span", "toast-text", message));
+    if (kind === "err") {
+      node.setAttribute("role", "alert");
+      const dismiss = el("button", "toast-dismiss", "Dismiss");
+      dismiss.type = "button";
+      dismiss.addEventListener("click", () => node.remove());
+      node.append(dismiss);
+    } else {
+      setTimeout(() => node.remove(), 6000);
+    }
     $("#toasts").append(node);
-    setTimeout(() => node.remove(), 6000);
   }
 
-  function confirmLive(count) {
-    return new Promise((resolve) => {
-      const root = $("#modal-root");
+  /**
+   * Shared modal plumbing: dialog semantics, Escape, a Tab trap, and focus
+   * returned to whatever opened it. Returns the function that tears it down.
+   */
+  function mountModal(backdrop, modal, labelId, onCancel, initialFocus) {
+    const root = $("#modal-root");
+    const opener = document.activeElement;
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", labelId);
+    const onKey = (e) => {
+      if (e.key === "Escape") { e.preventDefault(); onCancel(); return; }
+      if (e.key !== "Tab") return;
+      const items = [...modal.querySelectorAll("button:not(:disabled), input, a[href]")];
+      if (!items.length) return;
+      const first = items[0];
+      const last = items[items.length - 1];
+      if (!modal.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+      else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onKey);
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) onCancel(); });
+    backdrop.append(modal);
+    root.innerHTML = "";
+    root.append(backdrop);
+    (initialFocus || modal).focus();
+    return () => {
+      document.removeEventListener("keydown", onKey);
       root.innerHTML = "";
+      if (opener && opener.isConnected && opener.focus) opener.focus();
+    };
+  }
 
-      const backdrop = el("div", "modal-backdrop");
-      const modal = el("div", "modal");
-      modal.append(el("h3", null, "Submit real job applications?"));
+  /**
+   * The gate in front of real submissions.
+   *
+   * It lists the employers a live run would reach, taken from the same filters the
+   * run itself applies (`/api/apply/preview`), so the person approves names, not a
+   * count of PDFs. `upstream` is true when the run also refreshes earlier phases:
+   * the list is then what is queued now, and the final set can differ.
+   */
+  function confirmLive(plan, upstream) {
+    return new Promise((resolve) => {
+      const queue = plan.will_submit || [];
+      const manual = plan.manual || [];
+      const modal = el("div", "modal modal-live");
+      const heading = el("h3", null, "Submit real job applications?");
+      heading.id = "live-title";
+      modal.append(heading);
 
-      const warn = el("div", "callout warn");
-      warn.textContent =
-        `This will open a browser and submit ${count} real application(s) under your name. ` +
-        `It cannot be undone. Type APPLY to confirm.`;
+      const count = queue.length;
+      const warn = el("div", "callout err");
+      warn.append(el("strong", null, upstream && count
+        ? `Up to ${count} application${count === 1 ? "" : "s"} will be sent under your name. `
+        : count
+          ? `${count} application${count === 1 ? "" : "s"} will be sent under your name. `
+          : "No job is queued yet. "));
+      warn.append(document.createTextNode(
+        upstream
+          ? "This run searches, scores and tailors first, so the final list can differ from the one below. Submissions cannot be undone."
+          : "Each one opens a browser and puts your resume in front of a real employer. Submissions cannot be undone."));
       modal.append(warn);
 
-      const input = el("input");
+      if (queue.length) {
+        const list = el("ul", "live-queue");
+        queue.slice(0, 8).forEach((job) => {
+          const li = el("li");
+          li.append(el("span", "live-queue-name", `${job.company || "Unknown company"} — ${job.title || "Untitled role"}`));
+          if (job.channel) li.append(el("span", "live-queue-channel", String(job.channel).replace(/_/g, " ")));
+          list.append(li);
+        });
+        if (queue.length > 8) list.append(el("li", "live-queue-more", `+ ${queue.length - 8} more`));
+        modal.append(list);
+      }
+      if (manual.length) {
+        modal.append(el("p", "hint",
+          `${manual.length} more need${manual.length === 1 ? "s" : ""} you to apply by hand (sign-in or account required). They will not be submitted.`));
+      }
+
+      const label = el("label", "live-label", "Type APPLY to confirm");
+      label.htmlFor = "live-confirm";
+      const input = el("input", "live-input");
+      input.id = "live-confirm";
       input.type = "text";
-      input.placeholder = "Type APPLY";
-      input.style.cssText = "width:100%;padding:9px 11px;background:var(--bg);border:1px solid var(--border);border-radius:8px;";
-      modal.append(input);
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      modal.append(label, input);
 
       const actions = el("div", "modal-actions");
       const cancel = el("button", "btn", "Cancel");
-      const go = el("button", "btn btn-primary", "Submit applications");
+      const go = el("button", "btn btn-primary is-live", count && !upstream ? `Submit ${count} application${count === 1 ? "" : "s"}` : "Submit applications");
+      cancel.type = "button"; go.type = "button";
       go.disabled = true;
       actions.append(cancel, go);
       modal.append(actions);
 
+      let teardown = () => {};
+      const close = (value) => { teardown(); resolve(value); };
       input.addEventListener("input", () => { go.disabled = input.value.trim() !== "APPLY"; });
-      const close = (value) => { root.innerHTML = ""; resolve(value); };
+      input.addEventListener("keydown", (e) => { if (e.key === "Enter" && !go.disabled) { e.preventDefault(); close(true); } });
       cancel.addEventListener("click", () => close(false));
       go.addEventListener("click", () => close(true));
-      backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(false); });
-      document.addEventListener("keydown", function esc(e) {
-        if (e.key === "Escape") { document.removeEventListener("keydown", esc); close(false); }
-      });
-
-      backdrop.append(modal);
-      root.append(backdrop);
-      input.focus();
+      teardown = mountModal(el("div", "modal-backdrop"), modal, "live-title", () => close(false), input);
     });
   }
 
@@ -362,31 +447,24 @@
    */
   function askConfirm({ title, body, confirmLabel = "Continue", cancelLabel = "Cancel", tone = "" }) {
     return new Promise((resolve) => {
-      const root = $("#modal-root");
-      root.innerHTML = "";
-
-      const backdrop = el("div", "modal-backdrop");
       const modal = el("div", "modal");
-      modal.append(el("h3", null, title));
+      const heading = el("h3", null, title);
+      heading.id = "confirm-title";
+      modal.append(heading);
       modal.append(el("div", `callout ${tone}`, body));
 
       const actions = el("div", "modal-actions");
       const cancel = el("button", "btn", cancelLabel);
       const confirm = el("button", "btn btn-primary", confirmLabel);
+      cancel.type = "button"; confirm.type = "button";
       actions.append(cancel, confirm);
       modal.append(actions);
 
-      const close = (value) => { root.innerHTML = ""; document.removeEventListener("keydown", onKey); resolve(value); };
-      function onKey(e) { if (e.key === "Escape") close(false); }
-
+      let teardown = () => {};
+      const close = (value) => { teardown(); resolve(value); };
       cancel.addEventListener("click", () => close(false));
       confirm.addEventListener("click", () => close(true));
-      backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(false); });
-      document.addEventListener("keydown", onKey);
-
-      backdrop.append(modal);
-      root.append(backdrop);
-      cancel.focus();
+      teardown = mountModal(el("div", "modal-backdrop"), modal, "confirm-title", () => close(false), cancel);
     });
   }
 
@@ -455,6 +533,7 @@
     const picker = el("input");
     picker.type = "file"; picker.accept = acceptedFormats(); picker.hidden = true;
     drop.addEventListener("click", () => picker.click());
+    makeActivatable(drop, "Choose a resume file to upload");
     picker.addEventListener("change", () => { if (picker.files[0]) uploadResume(picker.files[0], true); });
     drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("is-over"); });
     drop.addEventListener("dragleave", () => drop.classList.remove("is-over"));
@@ -468,12 +547,22 @@
       body.append(el("h4", null, "Already in data/raw_resumes/"));
       state.resumes.forEach((resume) => {
         const row = el("div", `resume-row${setup.picked === resume.name ? " is-selected" : ""}`);
-        row.append(el("span", null, resume.is_sample ? "🧪" : "📄"));
-        row.append(el("span", "grow", `${resume.name} — ${formatBytes(resume.size)}`));
-        if (resume.is_sample) row.append(el("span", "tag-sample", "DEMO"));
+        // The pick target and the delete button are siblings: a button may not
+        // contain another interactive control.
+        const pick = el("button", "resume-pick");
+        pick.type = "button";
+        pick.setAttribute("aria-pressed", String(setup.picked === resume.name));
+        pick.setAttribute("aria-label", `Use ${resume.name}${resume.is_sample ? " (demo resume)" : ""}`);
+        pick.append(el("span", null, resume.is_sample ? "🧪" : "📄"));
+        pick.append(el("span", "grow", `${resume.name} — ${formatBytes(resume.size)}`));
+        if (resume.is_sample) pick.append(el("span", "tag-sample", "DEMO"));
+        pick.addEventListener("click", () => { setup.picked = resume.name; renderSetup(); });
+        row.append(pick);
 
         const remove = el("button", "remove", "✕");
+        remove.type = "button";
         remove.title = `Remove ${resume.name}`;
+        remove.setAttribute("aria-label", `Delete ${resume.name}`);
         remove.addEventListener("click", async (e) => {
           e.stopPropagation();
           const ok = await askConfirm({
@@ -485,8 +574,6 @@
           if (ok) deleteResume(resume.name);
         });
         row.append(remove);
-
-        row.addEventListener("click", () => { setup.picked = resume.name; renderSetup(); });
         body.append(row);
       });
     }
@@ -704,8 +791,21 @@
 
     const dryRun = $("#dry-run").checked;
     if (phases.includes("apply") && !dryRun) {
-      const pending = (state?.phases?.tailor?.metrics?.["PDFs"]) || 0;
-      if (!(await confirmLive(pending))) return;
+      let plan;
+      try {
+        plan = await api("/api/apply/preview");
+      } catch (err) {
+        toast(`Nothing was submitted. Could not check what a live run would send: ${err.message}`, "err");
+        return;
+      }
+      // A run that also searches, scores or tailors will rebuild the queue, so an
+      // empty list now is not a reason to refuse it. Applying on its own is.
+      const upstream = phases.some((phase) => ["source", "evaluate", "tailor"].includes(phase));
+      if (!(plan.will_submit || []).length && !upstream) {
+        toast("Nothing would be submitted: no qualified job with a tailored resume has a public application form. Apply by hand from the shortlist, or run tailoring first.", "warn");
+        return;
+      }
+      if (!(await confirmLive(plan, upstream))) return;
     }
 
     for (const phase of phases) { runStatus[phase] = "pending"; }
@@ -730,7 +830,10 @@
           },
         }),
       });
-      switchTab("log");
+      // Follow the run in the log, but never pull someone out of the Settings
+      // form or History they are in the middle of reading.
+      if (document.querySelector('.tab[data-tab="details"]').classList.contains("is-active")) switchTab("log");
+      else toast("Run started. Open the Live log to follow it.");
     } catch (err) {
       for (const phase of phases) { delete runStatus[phase]; }
       render();
@@ -897,8 +1000,15 @@
         // The server replays the previous run's events when the page connects;
         // announcing those would pop a stale "Run warning." on every reload.
         if (!replaying) {
+          const sent = Number(runSummary.apply?.submitted) || 0;
+          const liveRun = runSummary.apply && runSummary.apply.dry_run === false;
+          if (liveRun && sent > 0) {
+            // The one irreversible outcome gets its own receipt, not a toast.
+            selected = "apply";
+            switchTab("details");
+          }
           toast(
-            evt.status === "ok" ? "Run finished."
+            evt.status === "ok" ? (liveRun ? `Run finished. ${sent} application${sent === 1 ? "" : "s"} submitted. The receipt is under Auto-apply.` : "Run finished.")
               : evt.status === "warning" ? "Run finished with warnings. Check the Live log."
               : `Run ${evt.status}.`,
             evt.status === "ok" ? "ok" : evt.status === "warning" ? "warn" : "err"
@@ -987,55 +1097,70 @@
         + "parsed from the bundled sample resume. Upload your own resume before applying.";
   }
 
-  let runBannerDismissed = false;
   let ranThisSession = false;
 
-  function renderRunBanner() {
-    const banner = $("#run-banner");
+  // The previous-run note lives inside the next-step card (one message in the
+  // status slot, not a second banner); "Start fresh" lives in Run options.
+  function staleRunNote() {
     const last = state?.last_run;
-    if (!last || running || ranThisSession || runBannerDismissed) {
-      banner.hidden = true;
-      return;
-    }
+    if (!last || running || ranThisSession) return "";
     const when = new Date(last.at);
     const age = last.age_hours < 1 ? "less than an hour ago"
       : last.age_hours < 48 ? `${Math.round(last.age_hours)} hours ago`
       : `${Math.round(last.age_hours / 24)} days ago`;
-    banner.hidden = false;
-    const full =
-      `These are results from your previous run (${when.toLocaleString()}, ${age}), not a new search. ` +
-      "Press Run all phases to refresh the search. Previously seen listings can appear in the latest CSV; processed applications are not repeated. " +
-      "Start fresh clears this view first.";
-    // One line in the banner; the full explanation stays available on hover and
-    // to screen readers instead of eating three lines of canvas.
-    const text = $("#run-banner-text");
-    text.textContent = `Showing your previous run — ${when.toLocaleString()} (${age}), not a new search. Press Run all phases to refresh.`;
-    text.title = full;
+    return `Showing your previous run (${when.toLocaleString()}, ${age}), not a new search.`;
   }
 
   function render() {
     renderBanner();
-    renderRunBanner();
     renderPills();
     renderNextStep();
     renderNodes();
     // Deferred a frame: edge anchors are measured from the DOM, which only has
     // real geometry once the browser has laid the new nodes out.
     requestAnimationFrame(renderEdges);
+    // The panel is rebuilt; keep the reader where they were.
+    const detailPanel = $("#panel-details");
+    const keepScroll = detailPanel.scrollTop;
     renderPanel();
+    detailPanel.scrollTop = keepScroll;
     // With the log on its own tab, a pulsing dot says a run is producing output.
     document.querySelector('.tab[data-tab="log"]')?.classList.toggle("is-live", running);
     $("#run-btn").disabled = running;
     $("#cancel-btn").disabled = !running;
-    $("#run-btn").replaceChildren(icon("play"), el("span", null, running ? "Running…" : "Run all phases"));
-    $("#run-btn").setAttribute("aria-label", running ? "Running, please wait" : "Run all phases");
-
     const dry = $("#dry-run").checked;
+    // Live mode is a different mode, not a different checkbox: the Run button
+    // itself changes, and a strip stays up for as long as it is on.
+    const runLabel = running ? "Running…" : dry ? "Run all phases" : "Run all phases (LIVE)";
+    $("#run-btn").replaceChildren(icon("play"), el("span", null, runLabel));
+    $("#run-btn").setAttribute("aria-label", running ? "Running, please wait" : dry ? "Run all phases" : "Run all phases, live: submits real applications");
+    $("#run-btn").classList.toggle("is-live", !dry);
+    $("#live-strip").hidden = dry;
+
     $("#dry-toggle").classList.toggle("is-live", !dry);
-    $("#dry-label").textContent = dry ? "Dry run" : "LIVE — submits real applications";
-    $("#dry-toggle").title = dry
-      ? "Dry run is on: nothing is submitted. Untick to submit real applications."
-      : "Live mode: auto-apply will submit real applications.";
+    $("#mode-dry").setAttribute("aria-pressed", String(dry));
+    $("#mode-live").setAttribute("aria-pressed", String(!dry));
+
+    const picked = [];
+    if ($("#cover-letter").checked) picked.push("cover letters");
+    if ($("#resume-mode").value !== "auto") picked.push("ATS format");
+    $("#options-summary").textContent = picked.length ? `Options · ${picked.join(", ")}` : "Run options";
+    $("#run-banner-fresh").hidden = !(state?.last_run && !running);
+
+    settleStatusSlot();
+  }
+
+  /**
+   * The status slot shows exactly one message, most important first: live mode,
+   * then a missing/sample profile, then the next step. Everything else waits.
+   */
+  function settleStatusSlot() {
+    let taken = false;
+    for (const id of ["live-strip", "sample-banner", "next-step"]) {
+      const node = $(`#${id}`);
+      if (node.hidden) continue;
+      if (taken) node.hidden = true; else taken = true;
+    }
   }
 
   /**
@@ -1124,6 +1249,9 @@
     if (!step) return;
     $("#next-step-title").textContent = step.title;
     $("#next-step-detail").textContent = step.detail;
+    const note = step.action && !running ? staleRunNote() : "";
+    $("#next-step-meta").hidden = !note;
+    $("#next-step-meta").textContent = note;
     const button = $("#next-step-action");
     button.hidden = !step.action;
     button.textContent = step.action || "";
@@ -1146,6 +1274,14 @@
     profile.lastElementChild.textContent = sealed
       ? `Profile: ${intake.summary}`
       : "Profile: not ready";
+
+    // One chip for the bar; the two detail pills sit in its popover.
+    const health = $("#pill-health");
+    health.className = `pill ${sealed && !offline ? "ok" : "warn"}`;
+    $("#health-text").textContent = offline ? "Disconnected · retrying"
+      : !sealed ? "Profile not ready"
+      : hasLLM ? "Ready" : "Ready · offline mode";
+    health.title = `${provider.textContent.trim()} · ${profile.textContent.trim()}`;
   }
 
   function renderNodes() {
@@ -1207,7 +1343,7 @@
     head.append(tile, el("div", "node-title", label));
     node.append(head, el("div", "node-sub", sub));
 
-    node.addEventListener("click", () => { selected = id; switchTab("settings"); render(); });
+    node.addEventListener("click", () => { selected = id; switchTab("settings"); render(); openSheet(); });
     return node;
   }
 
@@ -1216,6 +1352,21 @@
   // may not contain another button, and assistive tech hides the children of
   // anything with role="button", so a Run button inside the card was unreachable
   // by name. Mouse users can still click anywhere on the card to select it.
+  // The one number that says what a phase produced, shown large; the three
+  // supporting rows below it skip whichever metric it already used.
+  const HEADLINE = {
+    source: ["This sweep", "found"], evaluate: ["Qualified", "qualified"], tailor: ["PDFs", "tailored"],
+    apply: ["Submitted", "sent"], track: ["Rows", "logged"], prep: ["Guides", "guides"],
+  };
+
+  function nodeHeadline(id, phase, status) {
+    const spec = HEADLINE[id];
+    if (!spec || status === "empty") return null;
+    const raw = phase.metrics?.[spec[0]];
+    if (raw === undefined || raw === null || raw === "") return null;
+    return { key: spec[0], value: String(raw), word: spec[1] };
+  }
+
   function phaseNode(id, index) {
     const phase = state.phases[id];
     const status = nodeStatus(id);
@@ -1244,13 +1395,27 @@
     if (status === "running" && activePhaseId === id) {
       badge.append(el("span", "node-elapsed", formatElapsed(Date.now() - phaseStartedAt)));
     }
-    select.append(badge, el("span", "node-summary", phase.summary));
+    select.append(badge);
+    const headline = nodeHeadline(id, phase, status);
+    if (headline) {
+      node.classList.add("has-headline");
+      const big = el("span", "node-headline");
+      big.append(el("b", null, headline.value), el("small", null, headline.word));
+      select.append(big);
+      // Verification belongs on the card, not behind a click: it is the promise.
+      if (id === "tailor" && phase.resumes?.length) {
+        const bad = phase.resumes.filter((item) => !item.check_passed).length;
+        select.append(el("span", `node-verified ${bad ? "is-bad" : "is-ok"}`,
+          bad ? `${bad} failed fact check` : "all fact-checked"));
+      }
+    }
+    select.append(el("span", "node-summary", phase.summary));
     node.append(select);
 
     // Label/value rows rather than boxed chips: three numbers read as a column
     // you can scan, where chips read as decoration.
     const metrics = el("dl", "node-metrics");
-    Object.entries(phase.metrics || {}).slice(0, 3).forEach(([key, value]) => {
+    Object.entries(phase.metrics || {}).filter(([key]) => !headline || key !== headline.key).slice(0, 3).forEach(([key, value]) => {
       const row = el("div", "metric");
       row.append(el("dt", null, key), el("dd", null, String(value)));
       metrics.append(row);
@@ -1265,7 +1430,7 @@
     run.addEventListener("click", (e) => { e.stopPropagation(); startRun([id]); });
     node.append(run);
 
-    node.addEventListener("click", () => { selected = id; switchTab("details"); render(); });
+    node.addEventListener("click", () => { selected = id; switchTab("details"); render(); openSheet(); });
     return node;
   }
 
@@ -1342,6 +1507,28 @@
   }
 
   /* ---------------- Inspector ---------------- */
+
+  // On a phone the inspector sits under a long vertical stepper, off screen.
+  // Tapping a node lifts it into a bottom sheet instead.
+  const phoneQuery = window.matchMedia("(max-width: 640px)");
+  let sheetOpenerNode = "";
+  function openSheet() {
+    if (!phoneQuery.matches) return;
+    sheetOpenerNode = selected;
+    $(".inspector").classList.add("is-sheet");
+    $("#sheet-backdrop").classList.add("is-open");
+    // After renderNodes' own deferred focus-restore, which would otherwise win.
+    requestAnimationFrame(() => $("#sheet-close").focus({ preventScroll: true }));
+  }
+  function closeSheet() {
+    const inspector = $(".inspector");
+    if (!inspector.classList.contains("is-sheet")) return;
+    inspector.classList.remove("is-sheet");
+    $("#sheet-backdrop").classList.remove("is-open");
+    const card = document.querySelector(`.node[data-node="${sheetOpenerNode}"]`);
+    sheetOpenerNode = "";
+    (card?.querySelector(".node-body") || card)?.focus?.({ preventScroll: true });
+  }
 
   function switchTab(name) {
     document.querySelectorAll(".tab").forEach((tab) => {
@@ -1578,6 +1765,21 @@
     }
 
     if (id === "tailor" && phase.resumes?.length) {
+      // The product's promise, stated where the work is shown: every figure on a
+      // tailored resume is checked against the sealed profile, and what could not
+      // be supported is removed. Counts first, evidence one disclosure away.
+      const total = phase.resumes.length;
+      const passed = phase.resumes.filter((item) => item.check_passed).length;
+      const restoredCount = phase.resumes.reduce((n, item) => n + (item.restored?.length || 0), 0);
+      const blockedCount = phase.resumes.reduce((n, item) => n + (item.blocked?.length || 0), 0);
+      panel.append(el("h4", null, "Verified against your resume"));
+      const verdict = el("div", `callout ${passed === total && !blockedCount ? "ok" : "warn"}`);
+      verdict.append(el("strong", null, `${passed} of ${total} resume${total === 1 ? "" : "s"} passed the fact check. `));
+      verdict.append(document.createTextNode(
+        `${restoredCount} figure${restoredCount === 1 ? "" : "s"} restored to your original wording; ` +
+        `${blockedCount} unsupported claim${blockedCount === 1 ? "" : "s"} removed before the PDF was made.`));
+      panel.append(verdict);
+
       panel.append(el("h4", null, "Compiled resumes"));
       const list = el("ul", "list");
       phase.resumes.forEach((item) => {
@@ -1585,9 +1787,7 @@
         li.append(el("span", "score", Number(item.score).toFixed(1)));
         li.append(el("span", "grow", `${item.company} — ${item.title}`));
         if (item.check) {
-          const badge = el("span", "metric", item.check_passed ? "✓ validated" : "✗ check failed");
-          badge.title = [item.check, ...(item.changes || [])].join("\n");
-          li.append(badge);
+          li.append(el("span", `metric ${item.check_passed ? "metric-ok" : "metric-bad"}`, item.check_passed ? "Verified" : "Check failed"));
         }
         if (item.pdf_path) {
           const open = el("a", "link", "Open PDF");
@@ -1596,10 +1796,54 @@
           open.rel = "noopener";
           li.append(open);
         }
-        if (item.blocked?.length) {
-          const flag = el("span", "metric", `${item.blocked.length} blocked`);
-          flag.title = `Fabricated metrics removed: ${item.blocked.join(", ")}`;
-          li.append(flag);
+        const notes = [];
+        if (item.check) notes.push(["Check", [item.check]]);
+        if (item.blocked?.length) notes.push(["Removed: not supported by your resume", item.blocked]);
+        if (item.restored?.length) notes.push(["Restored to your wording", item.restored]);
+        if (item.changes?.length) notes.push(["What changed for this role", item.changes]);
+        if (notes.length) {
+          const detail = el("details", `verify${item.blocked?.length ? " has-blocked" : ""}`);
+          const summary = el("summary", null,
+            item.blocked?.length
+              ? `${item.blocked.length} claim${item.blocked.length === 1 ? "" : "s"} removed — see what and why`
+              : "How this was checked");
+          detail.append(summary);
+          notes.forEach(([heading, lines]) => {
+            detail.append(el("p", "verify-head", heading));
+            const ul = el("ul", "verify-list");
+            lines.forEach((line) => ul.append(el("li", null, String(line))));
+            detail.append(ul);
+          });
+          li.append(detail);
+        }
+        list.append(li);
+      });
+      panel.append(list);
+    }
+
+    if (id === "apply" && phase.results?.length) {
+      // What actually happened, one row per job, so the person is never left with
+      // only a count after the one action that cannot be undone.
+      const OUTCOME = {
+        submitted: ["Submitted", "ok"], simulated: ["Simulated", ""],
+        manual: ["Apply by hand", "warn"], failed: ["Failed", "err"],
+      };
+      panel.append(el("h4", null, "Receipt"));
+      const list = el("ul", "list receipt");
+      phase.results.forEach((item) => {
+        const [label, tone] = OUTCOME[item.outcome] || [item.outcome, ""];
+        const li = el("li");
+        li.append(el("span", `receipt-outcome ${tone}`, label));
+        const name = `${item.company || "Unknown company"} — ${item.title || "Untitled role"}`;
+        if (item.url && /^https?:/i.test(item.url)) {
+          const link = el("a", "link grow", name);
+          link.href = item.url; link.target = "_blank"; link.rel = "noopener noreferrer";
+          li.append(link);
+        } else {
+          li.append(el("span", "grow", name));
+        }
+        if (item.reason && item.outcome !== "submitted" && item.outcome !== "simulated") {
+          li.append(el("span", "receipt-reason", item.reason));
         }
         list.append(li);
       });
@@ -1742,6 +1986,7 @@
     const picker = el("input");
     picker.type = "file"; picker.accept = acceptedFormats(); picker.hidden = true;
     drop.addEventListener("click", () => picker.click());
+    makeActivatable(drop, "Choose a resume file to upload");
     picker.addEventListener("change", () => { if (picker.files[0]) uploadResume(picker.files[0]); });
     drop.addEventListener("dragover", (e) => { e.preventDefault(); drop.classList.add("is-over"); });
     drop.addEventListener("dragleave", () => drop.classList.remove("is-over"));
@@ -2296,6 +2541,28 @@
     return badge;
   }
 
+  function fitBar(row) {
+    const n = Number(row["Fit Score"]);
+    const tone = fitTone(row["Fit Score"]);
+    const bar = el("span", `fit-bar fit-bar-${tone}`);
+    bar.setAttribute("aria-hidden", "true");
+    const fill = el("i");
+    fill.style.width = `${Number.isFinite(n) && tone !== "none" ? Math.max(0, Math.min(10, n)) * 10 : 0}%`;
+    bar.append(fill);
+    return bar;
+  }
+
+  // Verified is only claimed when this job's PDF is in the tailoring results and
+  // its fact check ran; a job we cannot match gets no chip rather than a guess.
+  function verifiedFor(row) {
+    const list = state?.phases?.tailor?.resumes;
+    const path = row["Tailored Resume Path"];
+    if (!list?.length || !path) return null;
+    const hit = list.find((r) => r.pdf_path === path)
+      || list.find((r) => r.company === row.Company && r.title === row.Title);
+    return hit?.check ? Boolean(hit.check_passed) : null;
+  }
+
   function chipList(text, cls) {
     const wrap = el("div", "chips");
     String(text || "").split(/[,;]\s*/).map((s) => s.trim()).filter(Boolean)
@@ -2369,7 +2636,7 @@
     if (row["Email Draft File"] && outreachDirectory) {
       files.append(safeLink("Open unsent email draft", `/api/file?path=${encodeURIComponent(outreachDirectory + "/" + row["Email Draft File"])}`));
     }
-    drawer.append(drawerSection("Documents", el("p", "hint", row["Resume Check"] || "Resume not yet generated"), files));
+    drawer.append(drawerSection("Documents", el("p", row["Resume Check"] ? "verify-line" : "hint", row["Resume Check"] || "Resume not yet generated"), files));
 
     const actions = el("div", "drawer-actions");
 
@@ -2465,9 +2732,18 @@
       const tr = el("tr", `job-row${openJobId === id ? " is-open" : ""}${skippedJobs.has(id) ? " is-skipped" : ""}`);
       tr.tabIndex = 0;
       tr.setAttribute("aria-label", `${row.Title}, ${row.Company}. Open details.`);
-      const fit = el("td", "col-fit"); fit.append(fitBadge(row));
+      const fit = el("td", "col-fit"); fit.append(fitBadge(row), fitBar(row));
       const role = el("td", "col-role");
       role.append(el("strong", null, row.Title), el("span", "sub", row.Company), el("span", "sub faint", row.Source || ""));
+      const verified = verifiedFor(row);
+      if (verified !== null) {
+        const chip = el("span", `metric ${verified ? "metric-ok" : "metric-bad"} verified-chip`, verified ? "Verified" : "Fact check failed");
+        chip.title = verified ? "Every figure in this tailored resume was checked against your sealed profile." : "This tailored resume did not pass the fact check. Open it before using it.";
+        role.append(chip);
+      }
+      // Contact and place are separate columns on a wide screen; on a phone they fold under the role.
+      role.append(el("span", "sub faint inline-meta",
+        `${row.Location || "Unknown"}${row["Work Mode"] ? ` · ${row["Work Mode"]}` : ""} · ${row["HR / Careers Email"] ? "Email found" : "No email"}`));
       const place = el("td", null, `${row.Location || "Unknown"}${row["Work Mode"] ? ` · ${row["Work Mode"]}` : ""}`);
       const contact = el("td", row["HR / Careers Email"] ? "" : "faint", row["HR / Careers Email"] ? "Email found" : "No email");
       const status = el("td"); status.append(el("span", `status-chip${manuallyApplied.has(id) ? " is-done" : row["Application Readiness"] === "Ready for your review" ? " is-ready" : ""}`, jobStatusText(row)));
@@ -2479,9 +2755,21 @@
     }
     if (!rows.length) {
       const tr = el("tr");
-      const td = el("td", "jobs-empty", jobRows.length
-        ? "No jobs match these filters. Clear a filter to see more."
-        : "No jobs yet. Run sourcing from the pipeline to find some.");
+      const td = el("td", "jobs-empty");
+      td.append(el("p", null, jobRows.length
+        ? "No jobs match these filters."
+        : "No jobs yet. Sourcing searches your configured boards for matching roles."));
+      const act = el("button", "btn btn-primary btn-sm", jobRows.length ? "Clear filters" : "Run sourcing");
+      act.type = "button";
+      act.addEventListener("click", () => {
+        if (jobRows.length) {
+          $("#jobs-query").value = ""; $("#jobs-mode").value = "";
+          for (const id of ["#jobs-email", "#jobs-ready", "#jobs-skipped"]) $(id).checked = false;
+          if (!jobsRun) $("#jobs-current").checked = false;
+          visibleJobs = 50; renderJobRows();
+        } else { $("#jobs-dialog").close(); startRun(["source"]); }
+      });
+      td.append(act);
       td.colSpan = 5; tr.append(td); body.append(tr);
     }
     // A job that no longer exists (e.g. archived) must not leave a stale drawer.
@@ -2936,6 +3224,25 @@
     });
 
     $("#dry-run").addEventListener("change", render);
+    $("#sheet-close").addEventListener("click", closeSheet);
+    $("#sheet-backdrop").addEventListener("click", closeSheet);
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && $(".inspector").classList.contains("is-sheet") && !document.querySelector("dialog[open], #modal-root > *")) closeSheet();
+    });
+    phoneQuery.addEventListener("change", (e) => { if (!e.matches) closeSheet(); });
+    // The mode switch drives the (hidden) checkbox so every reader of
+    // #dry-run, including startRun's live gate, keeps one source of truth.
+    $("#mode-dry").addEventListener("click", () => { $("#dry-run").checked = true; render(); });
+    $("#mode-live").addEventListener("click", () => { $("#dry-run").checked = false; render(); });
+    $("#cover-letter").addEventListener("change", render);
+    $("#resume-mode").addEventListener("change", render);
+    for (const menu of [$("#health-menu"), $("#options-menu")]) {
+      document.addEventListener("click", (e) => { if (!menu.contains(e.target)) menu.open = false; });
+      menu.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && menu.open) { e.stopPropagation(); e.preventDefault(); menu.open = false; menu.querySelector("summary").focus(); }
+      });
+    }
+    $("#live-strip-off").addEventListener("click", () => { $("#dry-run").checked = true; render(); $("#run-btn").focus(); });
 
     $("#fit-btn").addEventListener("click", () => {
       fitMode = !fitMode;
@@ -2970,17 +3277,22 @@
     try {
       const saved = localStorage.getItem("job-agent-theme");
       if (saved) document.documentElement.dataset.theme = saved;
+      else if (window.matchMedia("(prefers-color-scheme: light)").matches) document.documentElement.dataset.theme = "light";
     } catch { /* private mode */ }
 
     $("#banner-setup").addEventListener("click", () => openSetup(0));
-    $("#banner-dismiss").addEventListener("click", () => { bannerDismissed = true; renderBanner(); });
-    $("#run-banner-dismiss").addEventListener("click", () => { runBannerDismissed = true; renderRunBanner(); });
+    $("#banner-dismiss").addEventListener("click", () => { bannerDismissed = true; render(); });
     $("#run-banner-fresh").addEventListener("click", async () => {
-      if (!confirm("Move the previous run's results to history? Seen jobs, the jobs CSV and the outreach log are kept, so nothing will be repeated.")) return;
+      const ok = await askConfirm({
+        title: "Move the previous run's results to history?",
+        body: "Seen jobs, the jobs CSV and the outreach log are kept, so nothing will be repeated. The shortlist and phase results are cleared until the next run.",
+        confirmLabel: "Move to history",
+      });
+      if (!ok) return;
       try {
         const result = await api("/api/outputs/archive", { method: "POST", body: "{}" });
         state = result.state;
-        runBannerDismissed = true;
+        ranThisSession = false;
         render();
         toast("Previous results moved to history. Run all phases to search again.", "ok");
       } catch (err) {
@@ -2999,7 +3311,6 @@
       startStatePolling();
     });
     // A CLI run uses the same artifacts but has no dashboard SSE connection.
-    setInterval(() => { if (!document.hidden) refreshState(); }, 10000);
     setInterval(() => { if (!document.hidden) tickRunningTimer(); }, 1000);
   }
 

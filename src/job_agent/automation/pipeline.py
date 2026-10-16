@@ -79,7 +79,7 @@ class AutoApplyPipeline:
         # The manifest also holds resumes made for jobs that did not qualify (so any
         # job can be applied to by hand). Only qualified jobs are ever applied to
         # automatically, and the live-apply confirmation must count only those.
-        eligible = [entry for entry in manifest if entry.get("job_id") in job_lookup]
+        eligible = self._eligible_entries(manifest, job_lookup)
         if len(eligible) != len(manifest):
             console.print(f"[dim]{len(manifest) - len(eligible)} resume(s) are for jobs that did not qualify; "
                           "they are for manual applications and are not submitted automatically.[/dim]")
@@ -120,9 +120,7 @@ class AutoApplyPipeline:
 
         console.print(f"Targeting [bold green]{len(manifest)}[/bold green] tailored application(s).\n")
 
-        from job_agent.tracking.export import JobsCsvExporter
-        already_applied = {key for key, row in JobsCsvExporter().load().items()
-                           if row.get('Status') == 'applied' or row.get('Status', '').startswith('replied_')}
+        already_applied = self._already_applied()
         successful: List[Dict[str, Any]] = []
         failed: List[Dict[str, Any]] = []
 
@@ -181,7 +179,63 @@ class AutoApplyPipeline:
         self._render_summary(successful, failed, dry_run)
         return successful, failed
 
+    # --- Preview --------------------------------------------------------------
+
+    @classmethod
+    def preview_queue(
+        cls,
+        manifest_path: Optional[Path] = None,
+        qualified_jobs_path: Optional[Path] = None,
+        limit: Optional[int] = None,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """What a live run would do, without claiming, browsing or writing anything.
+
+        Applies the same filters as `run_applications` (qualified jobs only, `limit`,
+        nothing already applied or replied to, and the same routing decision), so the
+        dashboard's live-apply confirmation can name the real employers instead of
+        quoting a PDF count. Raises FileNotFoundError when there is nothing tailored
+        yet, exactly as a run would.
+        """
+        manifest_file = manifest_path or (settings.outputs_dir / "tailored_resumes" / "manifest.json")
+        qualified_file = qualified_jobs_path or (settings.outputs_dir / "qualified_jobs.json")
+        manifest = cls._load_manifest(manifest_file)
+        job_lookup, score_lookup = cls._load_qualified(qualified_file)
+        manifest = cls._eligible_entries(manifest, job_lookup)
+        if limit is not None:
+            manifest = manifest[:limit]
+
+        already_applied = cls._already_applied()
+        plan: Dict[str, List[Dict[str, Any]]] = {"will_submit": [], "manual": [], "already_applied": []}
+        for entry in manifest:
+            job = job_lookup[entry["job_id"]]
+            row = {"job_id": job.id, "title": job.title, "company": job.company,
+                   "fit_score": score_lookup.get(job.id)}
+            if job.id in already_applied:
+                plan["already_applied"].append(row)
+                continue
+            route = route_application(job)
+            row["channel"] = route.channel
+            if route.automatable:
+                plan["will_submit"].append(row)
+            else:
+                row["reason"] = route.reason
+                plan["manual"].append(row)
+        return plan
+
     # --- Helpers --------------------------------------------------------------
+
+    @staticmethod
+    def _eligible_entries(manifest: List[Dict[str, Any]], job_lookup: Dict[str, JobPosting]) -> List[Dict[str, Any]]:
+        """Manifest entries for qualified jobs; the rest are for manual applications."""
+        return [entry for entry in manifest if entry.get("job_id") in job_lookup]
+
+    @staticmethod
+    def _already_applied() -> set:
+        """Job keys that were applied to, or that an employer has replied to."""
+        from job_agent.tracking.export import JobsCsvExporter
+
+        return {key for key, row in JobsCsvExporter().load().items()
+                if row.get('Status') == 'applied' or row.get('Status', '').startswith('replied_')}
 
     @staticmethod
     def _write_results(results_file: Path, successful: list, failed: list) -> None:

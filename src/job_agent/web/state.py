@@ -307,6 +307,25 @@ def _apply_state() -> Dict[str, Any]:
             else "Not run yet"
         ),
         "hint": "A dry run never opens a browser and never submits.",
+        # The receipt: one row per attempt, so what went out is never a bare count.
+        "results": [
+            {
+                "company": item.get("company", ""),
+                "title": item.get("title", ""),
+                "outcome": "simulated" if item.get("status") == "dry_run" else "submitted",
+                "url": item.get("job_url", ""),
+            }
+            for item in successful if isinstance(item, dict)
+        ] + [
+            {
+                "company": item.get("company", ""),
+                "title": item.get("title", ""),
+                "outcome": "manual" if item.get("status") == "skipped" else "failed",
+                "url": item.get("apply_url") or item.get("job_url", ""),
+                "reason": item.get("error", ""),
+            }
+            for item in failed if isinstance(item, dict)
+        ],
         "metrics": {
             "Submitted": len(successful) - dry_runs if path.exists() else (db_stats or {}).get("submitted", 0),
             "Dry runs": dry_runs if path.exists() else (db_stats or {}).get("dry_runs", 0),

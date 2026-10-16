@@ -788,3 +788,72 @@ def test_a_pdf_with_too_many_pages_is_refused(console):
                             headers={"X-Filename": "long.pdf"})
     assert status == 400
     assert "pages" in json.loads(body)["error"]
+
+
+# ==============================================================================
+# LIVE-APPLY GATE, RECEIPT AND STATIC CONTRACT
+# ==============================================================================
+
+def test_apply_preview_is_read_only_and_always_well_formed(console):
+    """The live-apply confirmation reads this; it must answer even with nothing tailored."""
+    base, token = console
+    status, body = _request(f"{base}/api/apply/preview", token=token)
+    assert status == 200
+    plan = json.loads(body)
+    assert set(plan) == {"will_submit", "manual", "already_applied"}
+    assert all(isinstance(rows, list) for rows in plan.values())
+
+
+def test_apply_state_exposes_a_per_job_receipt(tmp_path, monkeypatch):
+    from job_agent.config.settings import settings
+    from job_agent.web import state as state_module
+
+    monkeypatch.setattr(settings, "outputs_dir", tmp_path)
+    (tmp_path / "application_results.json").write_text(json.dumps({
+        "successful": [
+            {"job_id": "a", "company": "Acme", "title": "Engineer", "status": "applied", "job_url": "https://x.test/a"},
+            {"job_id": "b", "company": "Beta", "title": "Analyst", "status": "dry_run", "job_url": "https://x.test/b"},
+        ],
+        "failed": [
+            {"job_id": "c", "company": "Gamma", "title": "Lead", "status": "skipped",
+             "apply_url": "https://x.test/c", "error": "Sign-in required"},
+            {"job_id": "d", "company": "Delta", "title": "Dev", "status": "error", "error": "Form changed"},
+        ],
+    }), encoding="utf-8")
+
+    results = state_module._apply_state()["results"]
+
+    assert [(r["company"], r["outcome"]) for r in results] == [
+        ("Acme", "submitted"), ("Beta", "simulated"), ("Gamma", "manual"), ("Delta", "failed"),
+    ]
+    assert results[2]["reason"] == "Sign-in required"
+
+
+def test_console_static_assets_keep_the_safety_and_a11y_contract():
+    """Cheap tripwires for the parts of the UI that guard irreversible actions."""
+    from pathlib import Path
+
+    static = Path(runner_module.__file__).parent / "static"
+    html = (static / "index.html").read_text(encoding="utf-8")
+    script = (static / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="live-strip"' in html and 'id="live-strip-off"' in html
+    assert 'id="toasts"' in html and 'aria-live="polite"' in html
+    assert "/api/apply/preview" in script, "the live gate must name real jobs, not a PDF count"
+    assert "confirm(" not in script.replace("askConfirm(", "").replace("confirmLive(", "").replace("confirm_live", ""), \
+        "native confirm() must not come back; use askConfirm"
+    assert 'setAttribute("aria-modal", "true")' in script
+
+    # Top bar: the run mode is always visible (never inside the options popover),
+    # and the status slot is one container so banners cannot stack again.
+    top = html.split("</header>")[0]
+    assert 'id="mode-dry"' in top and 'id="mode-live"' in top
+    options = top.split('id="options-menu"')[1].split("</details>")[0]
+    assert 'id="dry-run"' not in options, "dry-run/LIVE must stay outside the Run options popover"
+    assert 'id="resume-mode"' in options and 'id="cover-letter"' in options
+    assert 'id="status-slot"' in html and "settleStatusSlot" in script
+    # Phase 2-4: the phone sheet, the single poller, and the split resume row
+    assert 'id="sheet-close"' in html and 'id="sheet-backdrop"' in html
+    assert "setInterval(() => { if (!document.hidden) refreshState()" not in script,         "the 10s full re-render must not come back; syncState only redraws on change"
+    assert "Disconnected" in script, "a failed poll must be visible"
+    assert 'el("button", "resume-pick")' in script, "the resume pick target must not wrap the delete button"
